@@ -146,6 +146,26 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
             }
         }
 
+        "edit_file" => {
+            let path_str = call.args.get("path").and_then(|v| v.as_str())
+                .ok_or("Missing 'path' argument")?;
+            let old_s = call.args.get("old_string").and_then(|v| v.as_str())
+                .ok_or("Missing 'old_string' argument")?;
+            let new_s = call.args.get("new_string").and_then(|v| v.as_str())
+                .ok_or("Missing 'new_string' argument")?;
+            let path = resolve_path(path_str, cwd);
+            let content = fs::read_to_string(&path)
+                .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
+            if !content.contains(old_s) {
+                return Err(format!("old_string not found in {}", path.display()));
+            }
+            let replaced = content.replace(old_s, new_s);
+            fs::write(&path, &replaced)
+                .map_err(|e| format!("Cannot write {}: {}", path.display(), e))?;
+            let count = content.matches(old_s).count();
+            Ok(format!("Edit {} ({} occurrence{})", path.display(), count, if count == 1 { "" } else { "s" }))
+        }
+
         "delete_file" => {
             let path_str = call.args.get("path").and_then(|v| v.as_str())
                 .ok_or("Missing 'path' argument")?;

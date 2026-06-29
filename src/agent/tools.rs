@@ -16,6 +16,7 @@ pub enum ToolKind {
     SearchFiles,
     AppendFile,
     DeleteFile,
+    EditFile,
 }
 
 impl ToolKind {
@@ -28,6 +29,7 @@ impl ToolKind {
             ToolKind::SearchFiles => "search_files",
             ToolKind::AppendFile  => "append_file",
             ToolKind::DeleteFile  => "delete_file",
+            ToolKind::EditFile    => "edit_file",
         }
     }
 
@@ -40,6 +42,7 @@ impl ToolKind {
             ToolKind::SearchFiles => "Search for text pattern across files",
             ToolKind::AppendFile  => "Append content to an existing file",
             ToolKind::DeleteFile  => "Delete a file permanently",
+            ToolKind::EditFile    => "Edit a file by replacing old_string with new_string (structural edit)",
         }
     }
 
@@ -52,6 +55,7 @@ impl ToolKind {
             ToolKind::SearchFiles => "🔍",
             ToolKind::AppendFile  => "➕",
             ToolKind::DeleteFile  => "🗑️",
+            ToolKind::EditFile    => "🔧",
         }
     }
 
@@ -63,6 +67,7 @@ impl ToolKind {
             ToolKind::SearchFiles => ToolRisk::Low,
             ToolKind::WriteFile   => ToolRisk::Medium,
             ToolKind::AppendFile  => ToolRisk::Medium,
+            ToolKind::EditFile    => ToolRisk::Medium,
             ToolKind::DeleteFile  => ToolRisk::High,
             ToolKind::RunShell    => ToolRisk::High,
         }
@@ -77,6 +82,7 @@ impl ToolKind {
             "search_files" => Some(ToolKind::SearchFiles),
             "append_file"  => Some(ToolKind::AppendFile),
             "delete_file"  => Some(ToolKind::DeleteFile),
+            "edit_file"    => Some(ToolKind::EditFile),
             _ => None,
         }
     }
@@ -87,6 +93,7 @@ impl ToolKind {
             ToolKind::ReadFile,
             ToolKind::ListDir,
             ToolKind::SearchFiles,
+            ToolKind::EditFile,
             ToolKind::WriteFile,
             ToolKind::AppendFile,
             ToolKind::RunShell,
@@ -144,6 +151,10 @@ impl ToolCall {
             "append_file" => {
                 let path = self.args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
                 format!("Append {}", path)
+            }
+            "edit_file" => {
+                let path = self.args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                format!("Edit  {}", path)
             }
             "list_dir" => {
                 let path = self.args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
@@ -247,6 +258,7 @@ Available tools:
 - read_file(path): Read contents of a file. Args: {{"path": "relative/or/absolute/path"}}
 - write_file(path, content): Write content to a file (creates or overwrites). Args: {{"path": "...", "content": "..."}}
 - append_file(path, content): Append content to a file. Args: {{"path": "...", "content": "..."}}
+- edit_file(path, old_string, new_string): Replace old_string with new_string in a file (structural edit). Args: {{"path": "...", "old_string": "...", "new_string": "..."}}
 - list_dir(path): List directory contents. Args: {{"path": "."}}
 - run_shell(command): Run a shell command and return output. Args: {{"command": "ls -la"}}
 - search_files(pattern, path): Search for text pattern in files. Args: {{"pattern": "fn main", "path": "."}}
@@ -293,6 +305,22 @@ pub fn tool_schemas() -> serde_json::Value {
                         "content": {"type": "string"}
                     },
                     "required": ["path", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": "Replace old_string with new_string in a file (structural edit, preserves surrounding code)",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path"},
+                        "old_string": {"type": "string", "description": "The exact existing text to replace"},
+                        "new_string": {"type": "string", "description": "The new text to insert in its place"}
+                    },
+                    "required": ["path", "old_string", "new_string"]
                 }
             }
         },

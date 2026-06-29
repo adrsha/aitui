@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use crate::agent::{Permission, PermissionMemory, ToolCall, ToolKind};
+pub use crate::app::state::list_dir_entries as list_picker_dir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
