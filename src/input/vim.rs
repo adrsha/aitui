@@ -1,5 +1,5 @@
 /// The vim modal editing state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum VimMode {
     /// Normal mode: navigation, operators.
     Normal,
@@ -13,8 +13,22 @@ pub enum VimMode {
     Operator(char),
 }
 
-impl VimMode {
-    pub fn is_command(&self) -> bool {
-        matches!(self, VimMode::Command)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_variants_are_distinct() {
+        use std::collections::HashSet;
+        let modes = vec![
+            VimMode::Normal,
+            VimMode::Insert,
+            VimMode::Visual,
+            VimMode::Command,
+            VimMode::Operator('d'),
+            VimMode::Operator('y'),
+        ];
+        let unique: HashSet<_> = modes.into_iter().collect();
+        assert_eq!(unique.len(), 6);
     }
 }

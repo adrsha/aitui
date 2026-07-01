@@ -31,6 +31,30 @@ fn message_text(m: &ChatMessage) -> String {
 }
 
 impl App {
+    /// Render the active conversation as a plain-markdown document for `$EDITOR`.
+    /// This is what Ctrl-O opens, so you can read/search history with real vim.
+    pub fn conversation_markdown(&self) -> String {
+        let session = self.sessions.active();
+        let mut out = format!("# {}\n", session.name);
+        if let Some(prompt) = &session.system_prompt {
+            out.push_str(&format!("\n## system\n\n{}\n", prompt));
+        }
+        for m in &session.messages {
+            let role = match m.role.as_str() {
+                "user" => "You",
+                "assistant" => "Assistant",
+                "tool" => "Tool",
+                "system" => "System",
+                other => other,
+            };
+            out.push_str(&format!("\n## {}\n\n{}\n", role, message_text(m)));
+        }
+        if let Some(partial) = session.streaming_display() {
+            out.push_str(&format!("\n## Assistant\n\n{}\n", partial));
+        }
+        out
+    }
+
     /// Rebuild the chat document if the cache is stale, then keep the cursor valid.
     pub fn sync_chat_doc(&mut self, width: usize, viewport_h: usize) {
         if self.chat.needs_rebuild(self.content_rev, width) {
@@ -42,6 +66,19 @@ impl App {
     // ── Submission ──────────────────────────────────────────────────────────
 
     pub fn submit(&mut self) -> Option<Action> {
+        // No parallel turns yet: block a new send while the assistant is working,
+        // but keep the composed text in the input so it's ready to fire once idle.
+        if self.is_busy() {
+            self.overlay = Overlay::Notice {
+                title: " Busy ".into(),
+                body: "The assistant is still working.\n\nYour message is kept in the input — \
+                       press Enter again once the reply finishes.\n\n(Ctrl-C cancels the current turn.)"
+                    .into(),
+            };
+            self.set_status("Can't send yet — assistant is working (Ctrl-C to cancel)");
+            return None;
+        }
+
         self.agent_iterations = 0;
         self.mention.reset();
         let text = self.input.take();
@@ -52,6 +89,17 @@ impl App {
             return None;
         }
 
+        // Save to input history (shell-style up/down recall).
+        let trimmed = text.trim().to_string();
+        if !trimmed.is_empty() && self.input_history.last().map(|s| s.as_str()) != Some(&trimmed) {
+            self.input_history.push(trimmed);
+            if self.input_history.len() > 100 {
+                self.input_history.remove(0);
+            }
+        }
+        self.input_history_idx = None;
+        self.input_draft.clear();
+
         let mention_ctx = expand_mentions(&text);
         let text = if mention_ctx.is_empty() { text } else { format!("{}\n\n{}", mention_ctx, text) };
 
@@ -60,7 +108,8 @@ impl App {
         self.auto_name_session();
         self.touch();
 
-        self.begin_stream()
+        let sid = self.sessions.active_id();
+        self.begin_stream_for(sid)
     }
 
     fn auto_name_session(&mut self) {
@@ -77,25 +126,46 @@ impl App {
         }
     }
 
-    fn begin_stream(&mut self) -> Option<Action> {
-        self.sessions.active_mut().begin_assistant_stream();
-        self.set_status("Generating…");
-        self.chat.stick_bottom = true;
+    fn begin_stream_for(&mut self, sid: usize) -> Option<Action> {
+        let Some(session) = self.sessions.by_id_mut(sid) else { return None };
+        session.begin_assistant_stream();
+        // The animated status-bar spinner ("working") is the generating indicator
+        // now — don't set a free-text "Generating…" that later messages clobber.
+        self.status = None;
+        if sid == self.sessions.active_id() {
+            self.chat.stick_bottom = true;
+        }
         self.touch();
 
-        let messages = self.sessions.active().api_messages();
-        let request = ChatRequest::new(self.current_model(), messages);
+        // Prepend active skills as system messages (personas / house styles).
+        let mut messages = self.sessions.by_id(sid).map(|s| s.api_messages()).unwrap_or_default();
+        for skill in self.skills.iter().rev().filter(|s| s.active) {
+            messages.insert(0, ChatMessage::system(skill.body.clone()));
+        }
+        // The global system prompt from config.toml sits at the very front.
+        let sys = self.config.api.system_prompt.trim();
+        if !sys.is_empty() {
+            messages.insert(0, ChatMessage::system(sys.to_string()));
+        }
+        let request = ChatRequest::new(self.current_model(), messages)
+            .with_reasoning_effort(self.reasoning_effort.clone());
+
+        // Offline mock backend: scripted, tool-driving reply, no network.
+        if self.mock {
+            return Some(Action::AttachStream(sid, crate::api::mock::stream(&request)));
+        }
+
         match self.api.as_ref() {
             Some(client) => match client.stream(request) {
-                Ok(rx) => Some(Action::AttachStream(rx)),
+                Ok(rx) => Some(Action::AttachStream(sid, rx)),
                 Err(e) => {
-                    self.sessions.active_mut().finalize_assistant_stream();
+                    if let Some(s) = self.sessions.by_id_mut(sid) { s.finalize_assistant_stream(); }
                     self.set_status(format!("Request failed: {}", e));
                     None
                 }
             },
             None => {
-                self.sessions.active_mut().finalize_assistant_stream();
+                if let Some(s) = self.sessions.by_id_mut(sid) { s.finalize_assistant_stream(); }
                 self.set_status("No API client");
                 None
             }
@@ -104,23 +174,67 @@ impl App {
 
     // ── Agent tool loop ─────────────────────────────────────────────────────
 
-    pub fn start_agent_round(&mut self) -> Option<Action> {
-        let calls = self.tool_calls_in_last_assistant();
-        if calls.is_empty() {
+    /// A stream for `sid` finished. If that session is in agent mode and emitted
+    /// tool calls, start (or queue) its tool round. Rounds are serialized: only one
+    /// session runs tools at a time, so parallel sessions share one permission UI.
+    pub fn maybe_start_agent_round(&mut self, sid: usize) -> Option<Action> {
+        let has_tools = !self.tool_calls_in(sid).is_empty();
+        if !has_tools {
+            // Nothing to run for this session; let a queued session take over.
+            return self.start_next_queued_round();
+        }
+        let agent = self.sessions.by_id(sid).map(|s| s.agent_mode).unwrap_or(false);
+        if !agent {
+            let n = self.tool_calls_in(sid).len();
+            self.set_status(format!("⚠ {} tool call(s) not run — agent mode OFF (Ctrl-A)", n));
             return None;
+        }
+        if self.agent_session.is_some() && self.agent_session != Some(sid) {
+            // Another session is mid-round; wait our turn.
+            if !self.agent_queue.contains(&sid) {
+                self.agent_queue.push_back(sid);
+            }
+            return None;
+        }
+        self.start_agent_round_for(sid)
+    }
+
+    fn start_agent_round_for(&mut self, sid: usize) -> Option<Action> {
+        let calls = self.tool_calls_in(sid);
+        if calls.is_empty() {
+            self.agent_session = None;
+            return self.start_next_queued_round();
         }
         self.agent_iterations += 1;
         if self.agent_iterations > MAX_AGENT_ITERATIONS {
             self.agent_iterations = 0;
+            self.agent_session = None;
             self.set_status(format!("⚠ Agent stopped after {} rounds (loop guard).", MAX_AGENT_ITERATIONS));
-            return None;
+            return self.start_next_queued_round();
         }
+        self.agent_session = Some(sid);
         self.pending_tools = calls.into();
         self.process_next_tool()
     }
 
-    fn tool_calls_in_last_assistant(&self) -> Vec<ToolCall> {
-        let last = self.sessions.active().messages.iter().rev().find(|m| m.role == "assistant");
+    fn start_next_queued_round(&mut self) -> Option<Action> {
+        while let Some(sid) = self.agent_queue.pop_front() {
+            if self.sessions.has_id(sid) {
+                self.agent_iterations = 0;
+                return self.start_agent_round_for(sid);
+            }
+        }
+        None
+    }
+
+    /// The session the current tool round belongs to (falls back to active).
+    fn agent_sid(&self) -> usize {
+        self.agent_session.unwrap_or_else(|| self.sessions.active_id())
+    }
+
+    pub(super) fn tool_calls_in(&self, sid: usize) -> Vec<ToolCall> {
+        let Some(session) = self.sessions.by_id(sid) else { return Vec::new() };
+        let last = session.messages.iter().rev().find(|m| m.role == "assistant");
         match last {
             Some(m) => parse_blocks(&message_text(m))
                 .into_iter()
@@ -194,7 +308,15 @@ impl App {
 
     fn execute_tool(&mut self, call: ToolCall) -> Option<Action> {
         self.set_status(format!("⚙ Running: {}", call.summary()));
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // Run in the owning session's working directory (the process cwd tracks the
+        // active session, which may differ when a background session runs tools).
+        let sid = self.agent_sid();
+        let cwd = self
+            .sessions
+            .by_id(sid)
+            .and_then(|s| s.cwd.clone())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
         let (tx, rx) = mpsc::channel(1);
         self.agent_tool_rx = Some(rx);
         tokio::task::spawn_blocking(move || {
@@ -204,16 +326,46 @@ impl App {
     }
 
     pub fn record_tool_result(&mut self, result: ToolResult) {
+        if result.is_ok() {
+            self.track_edited_file(&result.call);
+        }
         let icon = result.call.kind().map(|k| k.icon()).unwrap_or("⚙");
         let status = if result.is_ok() { "ok" } else { "error" };
         let body = format!("[tool-result] {} {} ({})\n{}", icon, result.call.summary(), status, result.text());
-        self.sessions.active_mut().push_message(ChatMessage::tool(body));
-        self.chat.stick_bottom = true;
+        let sid = self.agent_sid();
+        if let Some(s) = self.sessions.by_id_mut(sid) {
+            s.push_message(ChatMessage::tool(body));
+        }
+        if sid == self.sessions.active_id() {
+            self.chat.stick_bottom = true;
+        }
         self.touch();
     }
 
+    /// Maintain the recently-edited-files list (most recent first) from a
+    /// successful mutating tool call, so the user can jump back into them.
+    fn track_edited_file(&mut self, call: &ToolCall) {
+        let mutates = matches!(call.name.as_str(), "write_file" | "edit_file" | "append_file" | "delete_file");
+        if !mutates {
+            return;
+        }
+        let Some(path) = call.args.get("path").and_then(|v| v.as_str()) else { return };
+        let path = path.trim_start_matches("./").to_string();
+        self.edited_files.retain(|p| p != &path);
+        if call.name == "delete_file" {
+            return; // removed from the list, nothing to add back
+        }
+        self.edited_files.insert(0, path);
+        self.edited_files.truncate(50);
+    }
+
+    /// All queued tools for the current round ran; hand back to the model with a
+    /// fresh streaming turn for the same session. The round is over, so clear the
+    /// agent slot (the new stream will re-enter via `StreamDone`).
     fn continue_after_tools(&mut self) -> Option<Action> {
-        self.begin_stream()
+        let sid = self.agent_sid();
+        self.agent_session = None;
+        self.begin_stream_for(sid)
     }
 }
 
@@ -267,7 +419,8 @@ fn build_chat_doc(app: &App, width: usize, theme: &Theme, _rev: u64) -> Vec<Rend
     if docs.is_empty() {
         return welcome_doc(theme);
     }
-    build(&docs, width, theme, &app.chat.toggled)
+    let streaming = session.is_streaming();
+    build(&docs, width, theme, &app.chat.toggled, app.show_output, streaming)
 }
 
 /// The empty-state splash, shown when there are no messages.
@@ -282,7 +435,7 @@ fn welcome_doc(theme: &Theme) -> Vec<RenderedLine> {
         },
     ];
     // Build with an empty toggle set; reuse the normal builder for consistent styling.
-    let mut rows = build(&intro, 70, theme, &std::collections::HashSet::new());
+    let mut rows = build(&intro, 70, theme, &std::collections::HashSet::new(), false, false);
     // Drop the role header for a cleaner splash.
     if !rows.is_empty() {
         rows.remove(0);

@@ -17,6 +17,13 @@ pub enum ToolKind {
     AppendFile,
     DeleteFile,
     EditFile,
+    MakeDir,
+    MovePath,
+    CopyPath,
+    DeleteDir,
+    WebSearch,
+    WebFetch,
+    DownloadFile,
 }
 
 impl ToolKind {
@@ -30,6 +37,13 @@ impl ToolKind {
             ToolKind::AppendFile  => "append_file",
             ToolKind::DeleteFile  => "delete_file",
             ToolKind::EditFile    => "edit_file",
+            ToolKind::MakeDir     => "make_dir",
+            ToolKind::MovePath    => "move_path",
+            ToolKind::CopyPath    => "copy_path",
+            ToolKind::DeleteDir   => "delete_dir",
+            ToolKind::WebSearch   => "web_search",
+            ToolKind::WebFetch    => "web_fetch",
+            ToolKind::DownloadFile => "download_file",
         }
     }
 
@@ -43,6 +57,13 @@ impl ToolKind {
             ToolKind::AppendFile  => "Append content to an existing file",
             ToolKind::DeleteFile  => "Delete a file permanently",
             ToolKind::EditFile    => "Edit a file by replacing old_string with new_string (structural edit)",
+            ToolKind::MakeDir     => "Create a directory (and any missing parents)",
+            ToolKind::MovePath    => "Move or rename a file or directory",
+            ToolKind::CopyPath    => "Copy a file or directory (recursive)",
+            ToolKind::DeleteDir   => "Delete a directory and all its contents",
+            ToolKind::WebSearch   => "Search the web and return top results",
+            ToolKind::WebFetch    => "Fetch the text content of a URL",
+            ToolKind::DownloadFile => "Download a URL to a local file (images, assets, …)",
         }
     }
 
@@ -56,6 +77,13 @@ impl ToolKind {
             ToolKind::AppendFile  => "➕",
             ToolKind::DeleteFile  => "🗑️",
             ToolKind::EditFile    => "🔧",
+            ToolKind::MakeDir     => "📂",
+            ToolKind::MovePath    => "🚚",
+            ToolKind::CopyPath    => "⧉",
+            ToolKind::DeleteDir   => "🗑️",
+            ToolKind::WebSearch   => "🌐",
+            ToolKind::WebFetch    => "🔗",
+            ToolKind::DownloadFile => "⬇️",
         }
     }
 
@@ -65,10 +93,17 @@ impl ToolKind {
             ToolKind::ReadFile    => ToolRisk::Low,
             ToolKind::ListDir     => ToolRisk::Low,
             ToolKind::SearchFiles => ToolRisk::Low,
+            ToolKind::WebSearch   => ToolRisk::Low,
+            ToolKind::WebFetch    => ToolRisk::Low,
             ToolKind::WriteFile   => ToolRisk::Medium,
             ToolKind::AppendFile  => ToolRisk::Medium,
             ToolKind::EditFile    => ToolRisk::Medium,
+            ToolKind::MakeDir     => ToolRisk::Medium,
+            ToolKind::MovePath    => ToolRisk::Medium,
+            ToolKind::CopyPath    => ToolRisk::Medium,
+            ToolKind::DownloadFile => ToolRisk::Medium,
             ToolKind::DeleteFile  => ToolRisk::High,
+            ToolKind::DeleteDir   => ToolRisk::High,
             ToolKind::RunShell    => ToolRisk::High,
         }
     }
@@ -83,6 +118,13 @@ impl ToolKind {
             "append_file"  => Some(ToolKind::AppendFile),
             "delete_file"  => Some(ToolKind::DeleteFile),
             "edit_file"    => Some(ToolKind::EditFile),
+            "make_dir"     => Some(ToolKind::MakeDir),
+            "move_path"    => Some(ToolKind::MovePath),
+            "copy_path"    => Some(ToolKind::CopyPath),
+            "delete_dir"   => Some(ToolKind::DeleteDir),
+            "web_search"   => Some(ToolKind::WebSearch),
+            "web_fetch"    => Some(ToolKind::WebFetch),
+            "download_file" => Some(ToolKind::DownloadFile),
             _ => None,
         }
     }
@@ -96,8 +138,15 @@ impl ToolKind {
             ToolKind::EditFile,
             ToolKind::WriteFile,
             ToolKind::AppendFile,
+            ToolKind::MakeDir,
+            ToolKind::MovePath,
+            ToolKind::CopyPath,
             ToolKind::RunShell,
+            ToolKind::WebSearch,
+            ToolKind::WebFetch,
+            ToolKind::DownloadFile,
             ToolKind::DeleteFile,
+            ToolKind::DeleteDir,
         ]
     }
 }
@@ -173,6 +222,38 @@ impl ToolCall {
                 let path = self.args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
                 format!("DELETE {}", path)
             }
+            "make_dir" => {
+                let path = self.args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                format!("Mkdir {}", path)
+            }
+            "move_path" => {
+                let from = self.args.get("from").and_then(|v| v.as_str()).unwrap_or("?");
+                let to = self.args.get("to").and_then(|v| v.as_str()).unwrap_or("?");
+                format!("Move  {} → {}", from, to)
+            }
+            "copy_path" => {
+                let from = self.args.get("from").and_then(|v| v.as_str()).unwrap_or("?");
+                let to = self.args.get("to").and_then(|v| v.as_str()).unwrap_or("?");
+                format!("Copy  {} → {}", from, to)
+            }
+            "delete_dir" => {
+                let path = self.args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                format!("DELETE DIR {}", path)
+            }
+            "web_search" => {
+                let q = self.args.get("query").or_else(|| self.args.get("q"))
+                    .and_then(|v| v.as_str()).unwrap_or("?");
+                format!("Search web '{}'", q)
+            }
+            "web_fetch" => {
+                let url = self.args.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+                format!("Fetch {}", url)
+            }
+            "download_file" => {
+                let url = self.args.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+                let path = self.args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                format!("Download {} → {}", url, path)
+            }
             _ => format!("{} {:?}", self.name, self.args),
         }
     }
@@ -246,31 +327,57 @@ impl PermissionMemory {
 /// Build the system prompt for agent mode.
 pub fn agent_system_prompt(cwd: &PathBuf) -> String {
     format!(
-        r#"You are an agentic coding assistant with access to the local filesystem.
+        r#"You are an agentic coding assistant running INSIDE a terminal app that
+executes your tool calls directly on this machine. You have REAL, working access
+to the local filesystem and shell through the tools below. This is not a sandbox
+and not a chat-only session.
+
 Current working directory: {}
 
-You have the following tools available. To call a tool, output a JSON block:
+## How to use a tool
+Emit a fenced JSON block EXACTLY like this (the app parses it and runs it for you):
 ```tool
-{{"name": "<tool_name>", "args": {{<arguments>}}, "id": "<unique_id>"}}
+{{"name": "list_dir", "args": {{"path": "."}}}}
 ```
+The app runs the tool and feeds the result back to you as a new message. Then you
+continue. You may call multiple tools across turns until the task is done.
 
-Available tools:
-- read_file(path): Read contents of a file. Args: {{"path": "relative/or/absolute/path"}}
-- write_file(path, content): Write content to a file (creates or overwrites). Args: {{"path": "...", "content": "..."}}
-- append_file(path, content): Append content to a file. Args: {{"path": "...", "content": "..."}}
-- edit_file(path, old_string, new_string): Replace old_string with new_string in a file (structural edit). Args: {{"path": "...", "old_string": "...", "new_string": "..."}}
-- list_dir(path): List directory contents. Args: {{"path": "."}}
-- run_shell(command): Run a shell command and return output. Args: {{"command": "ls -la"}}
-- search_files(pattern, path): Search for text pattern in files. Args: {{"pattern": "fn main", "path": "."}}
-- delete_file(path): Permanently delete a file. Args: {{"path": "..."}}
+CRITICAL — do NOT do any of these:
+- Do NOT say you "don't have access" to files, the shell, or the internet. You do.
+- Do NOT ask the user to paste file contents, directory listings, or command
+  output. Call read_file / list_dir / run_shell yourself and wait for the result.
+- Do NOT invent tools that aren't listed (there is no "image tool"). Use only the
+  tools below, with the exact names and argument keys shown.
+- Do NOT print a tool call as an example and then stop — if you want it run, emit
+  it as a real ```tool block and nothing after it.
 
-Rules:
-- Always plan before acting. Briefly state what you will do and why.
-- When writing code, prefer writing complete, working files.
-- After every tool result you receive, reflect on it before taking the next action.
-- When you have finished a task, summarize what you did.
-- If a tool fails, diagnose the error and try a corrective approach.
-- Only call tools when necessary. Prefer reading before writing.
+## Tools (exact names + argument keys)
+- read_file(path) — Read a file's contents.
+- write_file(path, content) — Create or OVERWRITE a whole file (parent dirs auto-created).
+- edit_file(path, old_string, new_string) — Replace an exact snippet in a file. PREFERRED for changing existing files.
+- append_file(path, content) — Append to a file.
+- list_dir(path) — List a directory. Use "." for the current dir.
+- search_files(pattern, path) — Search text across files (grep-like).
+- make_dir(path) — Create a directory (and parents).
+- move_path(from, to) — Move/rename a file or directory.
+- copy_path(from, to) — Copy a file or directory (recursive).
+- delete_file(path) — Delete one file.  delete_dir(path) — Delete a directory tree.
+- run_shell(command) — Run a shell command. Use for BUILDING/TESTING/RUNNING only
+  (e.g. "cargo test", "npm run build", "git status"). Do NOT use it to read or
+  edit files — use read_file/edit_file/write_file, which are safer and previewable.
+- web_search(query) — Search the web. Args: {{"query": "your question in plain words"}}.
+  Returns a summary + top links. Use it for anything you're unsure about or that
+  may have changed. Follow up with web_fetch(url) to read a specific page.
+- web_fetch(url) — Fetch the readable text of a page. Args: {{"url": "https://..."}}.
+- download_file(url, path) — Save a URL (e.g. an image) to a local file.
+
+## Rules
+1. Act, don't ask. If you need information that a tool can get, call the tool.
+2. To CHANGE a file: read_file first, then edit_file (surgical) or write_file (full
+   rewrite). Never shell out to sed/echo/cat to edit files — use the file tools.
+3. To learn the project: list_dir and read_file; search_files to locate things.
+4. After each tool result, briefly reflect, then take the next action or finish.
+5. When done, summarize what you changed and why. Keep tool calls purposeful.
 "#,
         cwd.display()
     )
@@ -393,6 +500,90 @@ pub fn tool_schemas() -> serde_json::Value {
                         "path": {"type": "string"}
                     },
                     "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "make_dir",
+                "description": "Create a directory and any missing parents",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": {"type": "string"} },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "move_path",
+                "description": "Move or rename a file or directory",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "from": {"type": "string"}, "to": {"type": "string"} },
+                    "required": ["from", "to"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "copy_path",
+                "description": "Copy a file or directory (recursive)",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "from": {"type": "string"}, "to": {"type": "string"} },
+                    "required": ["from", "to"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "delete_dir",
+                "description": "Delete a directory and all its contents",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": {"type": "string"} },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web and return top results",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "query": {"type": "string"} },
+                    "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "description": "Fetch the readable text content of a URL",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "url": {"type": "string"} },
+                    "required": ["url"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "download_file",
+                "description": "Download a URL to a local file (images, assets, …)",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "url": {"type": "string"}, "path": {"type": "string"} },
+                    "required": ["url", "path"]
                 }
             }
         }

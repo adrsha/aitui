@@ -87,6 +87,19 @@ pub struct ChatRequest {
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Ask the endpoint to append a final usage frame to the stream so we can
+    /// report token counts. Ignored by servers that don't support it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+    /// Reasoning effort for reasoning-capable models (e.g. "low"/"medium"/"high"
+    /// for GPT-5 / o-series). Omitted when None so non-reasoning models are fine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StreamOptions {
+    pub include_usage: bool,
 }
 
 impl ChatRequest {
@@ -96,14 +109,37 @@ impl ChatRequest {
             messages,
             stream: true,
             max_tokens: None,
+            stream_options: Some(StreamOptions { include_usage: true }),
+            reasoning_effort: None,
         }
     }
+
+    /// Set the reasoning effort ("low"/"medium"/"high"); None clears it.
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+}
+
+/// Token accounting reported by the endpoint at the end of a stream.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u32,
+    #[serde(default)]
+    pub completion_tokens: u32,
+    #[serde(default)]
+    pub total_tokens: u32,
 }
 
 /// A single SSE data line decoded from the stream.
 #[derive(Debug, Deserialize)]
 pub struct StreamChunk {
+    #[serde(default)]
     pub choices: Vec<StreamChoice>,
+    /// Present only on the final usage frame (when `stream_options.include_usage`).
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]

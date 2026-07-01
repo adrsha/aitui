@@ -8,19 +8,17 @@ pub struct InputBuffer {
     pub lines: Vec<String>,
     pub row: usize,
     pub col: usize,
+    /// Anchor of a visual-mode selection (row, col), or None when not selecting.
+    pub visual_anchor: Option<(usize, usize)>,
 }
 
 impl Default for InputBuffer {
     fn default() -> Self {
-        Self { lines: vec![String::new()], row: 0, col: 0 }
+        Self { lines: vec![String::new()], row: 0, col: 0, visual_anchor: None }
     }
 }
 
 impl InputBuffer {
-    pub fn is_empty(&self) -> bool {
-        self.lines.len() == 1 && self.lines[0].is_empty()
-    }
-
     pub fn text(&self) -> String {
         self.lines.join("\n")
     }
@@ -35,6 +33,93 @@ impl InputBuffer {
 
     pub fn current_line(&self) -> &str {
         self.lines.get(self.row).map(|s| s.as_str()).unwrap_or("")
+    }
+
+    /// Replace the whole buffer with `text`, placing the cursor at the end.
+    pub fn set_text(&mut self, text: &str) {
+        self.lines = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.split('\n').map(|s| s.to_string()).collect()
+        };
+        self.row = self.lines.len() - 1;
+        self.col = self.lines[self.row].chars().count();
+    }
+
+    // ── Visual-mode selection ────────────────────────────────────────────────
+
+    /// Start a character-wise selection anchored at the cursor.
+    pub fn begin_visual(&mut self) {
+        self.visual_anchor = Some((self.row, self.col));
+    }
+
+    pub fn end_visual(&mut self) {
+        self.visual_anchor = None;
+    }
+
+    /// Ordered inclusive selection bounds `((r0,c0),(r1,c1))` from anchor→cursor.
+    pub fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (ar, ac) = self.visual_anchor?;
+        let a = (ar, ac);
+        let b = (self.row, self.col);
+        Some(if a <= b { (a, b) } else { (b, a) })
+    }
+
+    /// Whether the character cell at (row, col) is within the selection.
+    pub fn is_selected(&self, row: usize, col: usize) -> bool {
+        match self.selection_bounds() {
+            Some((a, b)) => (row, col) >= a && (row, col) <= b,
+            None => false,
+        }
+    }
+
+    pub fn selection_text(&self) -> String {
+        let Some(((r0, c0), (r1, c1))) = self.selection_bounds() else { return String::new() };
+        if r0 == r1 {
+            let chars: Vec<char> = self.lines[r0].chars().collect();
+            let end = (c1 + 1).min(chars.len());
+            return chars.get(c0..end).map(|s| s.iter().collect()).unwrap_or_default();
+        }
+        let mut out = String::new();
+        for r in r0..=r1 {
+            let chars: Vec<char> = self.lines[r].chars().collect();
+            let (s, e) = if r == r0 { (c0, chars.len()) }
+                else if r == r1 { (0, (c1 + 1).min(chars.len())) }
+                else { (0, chars.len()) };
+            out.extend(chars.get(s..e).unwrap_or(&[]).iter());
+            if r != r1 { out.push('\n'); }
+        }
+        out
+    }
+
+    /// Delete the selection (inclusive), return its text, place the cursor at the
+    /// start, and clear the anchor.
+    pub fn delete_selection(&mut self) -> String {
+        let Some(((r0, c0), (r1, c1))) = self.selection_bounds() else { return String::new() };
+        let text = self.selection_text();
+        if r0 == r1 {
+            let from = Self::byte_idx(&self.lines[r0], c0);
+            let to = Self::byte_idx(&self.lines[r0], (c1 + 1).min(self.line_chars(r0)));
+            self.lines[r0].replace_range(from..to, "");
+        } else {
+            let head = {
+                let b = Self::byte_idx(&self.lines[r0], c0);
+                self.lines[r0][..b].to_string()
+            };
+            let tail = {
+                let b = Self::byte_idx(&self.lines[r1], (c1 + 1).min(self.line_chars(r1)));
+                self.lines[r1][b..].to_string()
+            };
+            self.lines.drain(r0..=r1);
+            self.lines.insert(r0, format!("{}{}", head, tail));
+        }
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.row = r0.min(self.lines.len() - 1);
+        self.col = c0.min(self.line_chars(self.row));
+        self.visual_anchor = None;
+        text
     }
 
     fn line_chars(&self, row: usize) -> usize {
@@ -73,6 +158,48 @@ impl InputBuffer {
         }
     }
 
+    /// Delete the word (and preceding whitespace) before the cursor — Ctrl-W /
+    /// Ctrl-Backspace. Falls back to a plain backspace across a line boundary.
+    pub fn delete_word_back(&mut self) {
+        if self.col == 0 {
+            self.backspace();
+            return;
+        }
+        let start = {
+            let chars: Vec<char> = self.lines[self.row].chars().collect();
+            let mut c = self.col;
+            while c > 0 && chars[c - 1].is_whitespace() {
+                c -= 1;
+            }
+            while c > 0 && !chars[c - 1].is_whitespace() {
+                c -= 1;
+            }
+            c
+        };
+        let from = Self::byte_idx(&self.lines[self.row], start);
+        let to = Self::byte_idx(&self.lines[self.row], self.col);
+        self.lines[self.row].replace_range(from..to, "");
+        self.col = start;
+    }
+
+    /// Delete the word after the cursor — Ctrl-Delete.
+    pub fn delete_word_forward(&mut self) {
+        let end = {
+            let chars: Vec<char> = self.lines[self.row].chars().collect();
+            let mut c = self.col;
+            while c < chars.len() && !chars[c].is_whitespace() {
+                c += 1;
+            }
+            while c < chars.len() && chars[c].is_whitespace() {
+                c += 1;
+            }
+            c
+        };
+        let from = Self::byte_idx(&self.lines[self.row], self.col);
+        let to = Self::byte_idx(&self.lines[self.row], end);
+        self.lines[self.row].replace_range(from..to, "");
+    }
+
     pub fn delete_at(&mut self) {
         if self.col < self.line_chars(self.row) {
             let b = Self::byte_idx(&self.lines[self.row], self.col);
@@ -90,19 +217,6 @@ impl InputBuffer {
             self.lines[0].clear();
         }
         self.col = self.col.min(self.line_chars(self.row).saturating_sub(1));
-    }
-
-    pub fn delete_word_forward(&mut self) {
-        let chars: Vec<char> = self.lines[self.row].chars().collect();
-        let mut end = self.col;
-        while end < chars.len() && !chars[end].is_whitespace() {
-            end += 1;
-        }
-        while end < chars.len() && chars[end].is_whitespace() {
-            end += 1;
-        }
-        let new: String = chars[..self.col].iter().chain(chars[end..].iter()).collect();
-        self.lines[self.row] = new;
     }
 
     pub fn yank_line(&self) -> String {
@@ -152,9 +266,6 @@ impl InputBuffer {
     }
     pub fn line_end(&mut self) {
         self.col = self.line_chars(self.row).saturating_sub(1);
-    }
-    pub fn line_end_insert(&mut self) {
-        self.col = self.line_chars(self.row);
     }
 
     pub fn word_forward(&mut self) {
@@ -209,6 +320,55 @@ mod tests {
     }
 
     #[test]
+    fn delete_word_back_removes_word_and_space() {
+        let mut b = InputBuffer::default();
+        b.set_text("hello world");
+        b.delete_word_back();
+        assert_eq!(b.text(), "hello ");
+        assert_eq!(b.col, 6);
+    }
+
+    #[test]
+    fn delete_word_forward_removes_next_word() {
+        let mut b = InputBuffer::default();
+        b.set_text("hello world");
+        b.col = 0;
+        b.delete_word_forward();
+        assert_eq!(b.text(), "world");
+    }
+
+    #[test]
+    fn visual_selection_yank_and_delete() {
+        let mut b = InputBuffer::default();
+        b.set_text("hello world");
+        b.col = 0;
+        b.begin_visual();
+        b.col = 4; // select "hello" (0..=4 inclusive)
+        assert_eq!(b.selection_text(), "hello");
+        assert!(b.is_selected(0, 0));
+        assert!(b.is_selected(0, 4));
+        assert!(!b.is_selected(0, 5));
+        let removed = b.delete_selection();
+        assert_eq!(removed, "hello");
+        assert_eq!(b.text(), " world");
+        assert!(b.visual_anchor.is_none());
+    }
+
+    #[test]
+    fn visual_selection_spans_lines() {
+        let mut b = InputBuffer::default();
+        b.set_text("ab\ncd");
+        b.row = 0;
+        b.col = 1;
+        b.begin_visual();
+        b.row = 1;
+        b.col = 0; // select "b\nc"
+        assert_eq!(b.selection_text(), "b\nc");
+        b.delete_selection();
+        assert_eq!(b.text(), "ad");
+    }
+
+    #[test]
     fn newline_splits() {
         let mut b = InputBuffer::default();
         b.paste("abcd");
@@ -234,7 +394,8 @@ mod tests {
         let mut b = InputBuffer::default();
         b.paste("hello");
         assert_eq!(b.take(), "hello");
-        assert!(b.is_empty());
+        assert_eq!(b.text(), "");
+        assert_eq!((b.row, b.col), (0, 0));
     }
 
     #[test]

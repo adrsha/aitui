@@ -26,15 +26,21 @@ pub enum Action {
     EnterVisual,
     EnterCommand,
     EnterOperator(char),
-    SetPendingEscape(char),
 
     // Input editing
     InsertChar(char),
     Newline,
     Backspace,
-    DeleteAt,
-    DeleteLine,
+    DeleteWordBack,
     DeleteWordForward,
+    DeleteAt,
+    /// Visual-mode: yank the selection and return to normal.
+    VisualYank,
+    /// Visual-mode: delete the selection (→ normal).
+    VisualDelete,
+    /// Visual-mode: delete the selection and enter insert.
+    VisualChange,
+    DeleteLine,
     YankLine,
     Paste,
     Move(Dir),
@@ -48,46 +54,77 @@ pub enum Action {
     CommandHistoryPrev,
     CommandHistoryNext,
 
+    // Sent-message history (shell-style up/down in the composer)
+    InputHistoryPrev,
+    InputHistoryNext,
+
     // Submission / streaming
     Submit,
+    /// Cancel the active session's in-flight stream.
     CancelStream,
-    AttachStream(mpsc::Receiver<StreamEvent>),
-    StreamToken(String),
-    StreamReasoning(String),
-    StreamDone,
-    StreamError(String),
+    /// Attach a new stream for the given session id.
+    AttachStream(usize, mpsc::Receiver<StreamEvent>),
+    /// Stream events, each tagged with the session id they belong to.
+    StreamToken(usize, String),
+    StreamReasoning(usize, String),
+    StreamUsage(usize, crate::api::Usage),
+    StreamDone(usize),
+    StreamError(usize, String),
 
-    // Chat navigation
-    ChatDown,
-    ChatUp,
-    ChatLeft,
-    ChatRight,
-    ChatWordForward,
-    ChatWordBackward,
-    ChatLineStart,
-    ChatLineEnd,
+    // Transcript scrolling (no cursor — read it in $EDITOR for motions)
     ChatTop,
     ChatBottom,
     ChatPageDown,
     ChatPageUp,
+    ChatHalfDown,
+    ChatHalfUp,
     ChatScroll(i32),
-    ChatToggle,
-    ChatYank,
-    ChatOpenLink,
+    /// Expand / collapse the full output of executed tools.
+    ToggleOutput,
+    /// A left-click in the transcript at (column, row) — toggles the individual
+    /// tool output whose collapsible header sits on that row.
+    ChatClick(u16, u16),
+    /// Dismiss the transient `Notice` dialog.
+    DismissNotice,
 
-    // Focus
-    FocusChat,
-    FocusSidebar,
-    FocusInput,
-    CycleFocus,
+    // Open the current conversation in $EDITOR (read/search with real vim)
+    OpenEditor,
+    /// Toggle the file browser (open in $EDITOR), with edited files pre-selected.
+    OpenEditPicker,
+    /// Open one or more files in $EDITOR.
+    OpenFilesInEditor(Vec<PathBuf>),
+    /// Drop into an interactive shell, then return.
+    OpenShell,
+
+    // File browser (vim navigation + multi-select)
+    BrowserDown,
+    BrowserUp,
+    BrowserParent,
+    BrowserOpen,
+    BrowserSelect,
+    BrowserClose,
+
+    // Startup launcher (resume a session or start new)
+    StartupUp,
+    StartupDown,
+    StartupNew,
+    StartupConfirm,
 
     // Sessions
     NewSession,
+    /// Duplicate the active session into a new one and switch to it (branch the
+    /// conversation to explore in parallel).
+    ForkSession,
     DeleteSession,
     NextSession,
     PrevSession,
+    OpenSessionPicker,
     SelectSession(usize),
     RenameSession(String),
+
+    // Skills (toggleable instruction snippets)
+    OpenSkillPicker,
+    ToggleSkill(usize),
 
     // Models
     OpenModelPicker,
@@ -133,9 +170,6 @@ pub enum Action {
 
     // UI / misc
     ToggleHelp,
-    ToggleSidebar,
-    ClearStatus,
-    MouseClick(u16, u16),
     Resize,
     Quit,
 }

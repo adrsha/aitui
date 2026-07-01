@@ -154,3 +154,129 @@ pub fn strip_tool_blocks(text: &str) -> String {
     result.push_str(remaining);
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_tool_call_parses_valid_json() {
+        let text = r#"Some prose
+```tool
+{"name": "read_file", "args": {"path": "src/main.rs"}, "id": "1"}
+```
+more text"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].args["path"], "src/main.rs");
+        assert_eq!(calls[0].id.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn extract_tool_call_with_arguments_key() {
+        let text = r#"```tool
+{"name": "write_file", "arguments": {"path": "foo.txt", "content": "hello"}}
+```"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+    }
+
+    #[test]
+    fn extract_multiple_tool_calls() {
+        let text = r#"First call:
+```tool
+{"name": "read_file", "args": {"path": "a.txt"}, "id": "1"}
+```
+Second call:
+```tool
+{"name": "read_file", "args": {"path": "b.txt"}, "id": "2"}
+```"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].args["path"], "b.txt");
+    }
+
+    #[test]
+    fn extract_no_tool_calls_returns_empty() {
+        assert!(extract_tool_calls("just plain text").is_empty());
+        assert!(extract_tool_calls("").is_empty());
+    }
+
+    #[test]
+    fn strip_tool_blocks_removes_tool_fences() {
+        let text = r#"before
+```tool
+{"name": "read_file", "args": {"path": "x"}}
+```
+after"#;
+        let stripped = strip_tool_blocks(text);
+        assert_eq!(stripped, "before\nafter");
+    }
+
+    #[test]
+    fn strip_tool_blocks_preserves_non_tool_fences() {
+        let text = r#"before ```tool
+{"x": "y"}
+```
+after"#;
+        let stripped = strip_tool_blocks(text);
+        assert_eq!(stripped, "before after");
+    }
+
+    #[test]
+    fn strip_tool_blocks_handles_unclosed_block() {
+        let text = r#"before
+```tool
+{"name": "read_file", "args": {"path": "x"}}"#;
+        let stripped = strip_tool_blocks(text);
+        // Unclosed blocks retain everything before the marker plus the marker content
+        assert!(stripped.contains("before"));
+        assert!(stripped.contains("read_file"));
+    }
+
+    #[test]
+    fn streaming_parser_accumulates_and_extracts() {
+        let mut p = StreamingParser::new();
+        let (text, calls) = p.push("hello ");
+        assert_eq!(text, "hello ");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn streaming_parser_extracts_tool_call() {
+        let mut p = StreamingParser::new();
+        let (display, calls) = p.push("```tool\n{\"name\": \"read_file\", \"args\": {\"path\": \"x\"}}\n``` rest");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(display, " rest");
+    }
+
+    #[test]
+    fn streaming_parser_tool_json_with_id() {
+        let mut p = StreamingParser::new();
+        let mut all_calls = Vec::new();
+        let (_, c) = p.push(r#"before ```tool {"name":"list_dir","args":{"path":"."},"id":"call_1"} ``` after"#);
+        all_calls.extend(c);
+        assert_eq!(all_calls.len(), 1);
+        assert_eq!(all_calls[0].name, "list_dir");
+        assert_eq!(all_calls[0].id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn streaming_parser_tool_without_newline_after_marker() {
+        let mut p = StreamingParser::new();
+        let (text, calls) = p.push(r#">>> ```tool {"name":"read_file","args":{"path":"x"}} ``` <<<"#);
+        assert_eq!(text, ">>>  <<<");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+    }
+
+    #[test]
+    fn safe_flush_point_holds_back_partial_marker() {
+        assert_eq!(safe_flush_point("hello ```"), 6);
+        assert_eq!(safe_flush_point("no marker here"), 14);
+        assert_eq!(safe_flush_point(""), 0);
+    }
+}

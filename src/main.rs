@@ -6,6 +6,7 @@ mod domain;
 mod files;
 mod input;
 mod render;
+mod skills;
 mod tui;
 mod ui;
 
@@ -34,34 +35,19 @@ fn main() -> anyhow::Result<()> {
 fn run(
     terminal: &mut tui::Tui,
     app: &mut app::App,
-    rt: &tokio::runtime::Runtime,
+    _rt: &tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
-    let mut last_rebuild = 0u64;
-
     loop {
-        // ── 1. Render ────────────────────────────────────────────────────
-        terminal.draw(|f| {
-            // Rebuild layout cache
-            let total_w = f.area().width;
-            let sidebar_w = if app.sidebar_collapsed { 0 } else { app.config.ui.sidebar_width };
-            let fits = total_w >= sidebar_w + 24;
-            let effective_sidebar = if fits && !app.sidebar_collapsed { sidebar_w } else { 0 };
+        // ── 1. Render (ui::render owns layout + chat-doc sync) ───────────
+        terminal.draw(|f| ui::render(f, app))?;
 
-            let layout = ui::layout::compute(f.area(), effective_sidebar, app.config.ui.input_height);
-            app.layout = app::state::PanelLayout {
-                sidebar: layout.sidebar,
-                chat: layout.chat,
-                input: layout.input,
-                statusbar: layout.statusbar,
-                toggle: ratatui::layout::Rect::default(),
-            };
-
-            // Rebuild chat doc if stale, then render everything
-            let viewport_h = layout.chat.height.saturating_sub(2) as usize;
-            app.sync_chat_doc(layout.chat.width as usize, viewport_h);
-
-            ui::render(f, app);
-        })?;
+        // ── 1b. Pending external program: suspend TUI, run it, restore ───
+        if let Some(ext) = app.pending_external.take() {
+            run_external(terminal, ext)?;
+            app.set_status("Back in AiTUI");
+            app.touch();
+            continue;
+        }
 
         // ── 2. Poll crossterm events ────────────────────────────────────
         if crossterm::event::poll(Duration::from_millis(16))? {
@@ -82,30 +68,28 @@ fn run(
             }
         }
 
-        // ── 4. Drain stream channel ─────────────────────────────────────
-        while app.stream_rx.is_some() {
+        // ── 4. Drain all session streams (parallel-safe) ────────────────
+        // Collect this pass's events per stream, then dispatch — draining every
+        // active stream each loop so background sessions keep progressing.
+        {
             use tokio::sync::mpsc::error::TryRecvError;
-            let rx = app.stream_rx.as_mut().unwrap();
-            match rx.try_recv() {
-                Ok(api::StreamEvent::Token(t)) => {
-                    dispatch(app, vec![Action::StreamToken(t)]);
+            let mut actions: Vec<Action> = Vec::new();
+            for h in app.streams.iter_mut() {
+                let sid = h.session_id;
+                loop {
+                    match h.rx.try_recv() {
+                        Ok(api::StreamEvent::Token(t)) => actions.push(Action::StreamToken(sid, t)),
+                        Ok(api::StreamEvent::Reasoning(r)) => actions.push(Action::StreamReasoning(sid, r)),
+                        Ok(api::StreamEvent::Usage(u)) => actions.push(Action::StreamUsage(sid, u)),
+                        Ok(api::StreamEvent::Done) => { actions.push(Action::StreamDone(sid)); break; }
+                        Ok(api::StreamEvent::Error(e)) => { actions.push(Action::StreamError(sid, e)); break; }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => { actions.push(Action::StreamDone(sid)); break; }
+                    }
                 }
-                Ok(api::StreamEvent::Reasoning(r)) => {
-                    dispatch(app, vec![Action::StreamReasoning(r)]);
-                }
-                Ok(api::StreamEvent::Done) => {
-                    dispatch(app, vec![Action::StreamDone]);
-                    break;
-                }
-                Ok(api::StreamEvent::Error(e)) => {
-                    dispatch(app, vec![Action::StreamError(e)]);
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    dispatch(app, vec![Action::StreamDone]);
-                    break;
-                }
+            }
+            if !actions.is_empty() {
+                dispatch(app, actions);
             }
         }
 
@@ -136,4 +120,70 @@ fn dispatch(app: &mut app::App, actions: Vec<Action>) {
             queue.push_back(follow_up);
         }
     }
+}
+
+/// Suspend the TUI, run an external program (editor or shell), then restore the
+/// terminal. The TUI is always re-entered afterwards, even if the program failed.
+fn run_external(terminal: &mut tui::Tui, ext: app::state::PendingExternal) -> anyhow::Result<()> {
+    // Leave our alternate screen / raw mode so the child owns the terminal.
+    tui::restore()?;
+    let result = run_external_inner(ext);
+    // Re-enter the TUI regardless of how the child exited.
+    *terminal = tui::init()?;
+    terminal.clear()?;
+    result
+}
+
+fn run_external_inner(ext: app::state::PendingExternal) -> anyhow::Result<()> {
+    use app::state::PendingExternal;
+    use std::io::Write;
+    use std::process::Command;
+
+    let editor = || {
+        std::env::var("EDITOR")
+            .or_else(|_| std::env::var("VISUAL"))
+            .unwrap_or_else(|_| "nvim".to_string())
+    };
+    // vim/nvim/vi accept a bare `+` to open on the last line; other editors
+    // would treat `+` as a filename, so only pass it to the vim family.
+    let jumps_to_end = |ed: &str| {
+        let base = ed.rsplit('/').next().unwrap_or(ed);
+        matches!(base, "vim" | "nvim" | "vi" | "view" | "gvim")
+    };
+
+    match ext {
+        PendingExternal::EditorFiles(paths) => {
+            if paths.is_empty() {
+                return Ok(());
+            }
+            let ed = editor();
+            let mut cmd = Command::new(&ed);
+            if jumps_to_end(&ed) {
+                cmd.arg("+"); // open on the last line
+            }
+            cmd.args(&paths)
+                .status()
+                .map_err(|e| anyhow::anyhow!("Failed to launch {ed}: {e}"))?;
+        }
+        PendingExternal::EditorText(text) => {
+            let ed = editor();
+            let path = std::env::temp_dir().join(format!("aitui-conversation-{}.md", std::process::id()));
+            std::fs::File::create(&path)?.write_all(text.as_bytes())?;
+            let mut cmd = Command::new(&ed);
+            if jumps_to_end(&ed) {
+                cmd.arg("+"); // open on the last line (latest turn)
+            }
+            let status = cmd.arg(&path).status();
+            let _ = std::fs::remove_file(&path);
+            status.map_err(|e| anyhow::anyhow!("Failed to launch {ed}: {e}"))?;
+        }
+        PendingExternal::Shell => {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
+            println!("\n[AiTUI] Shell — type 'exit' to return.\n");
+            Command::new(&shell)
+                .status()
+                .map_err(|e| anyhow::anyhow!("Failed to launch {shell}: {e}"))?;
+        }
+    }
+    Ok(())
 }

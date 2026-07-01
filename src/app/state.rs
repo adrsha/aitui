@@ -11,38 +11,55 @@ use crate::app::input_buffer::InputBuffer;
 use crate::app::overlay::{sync_auto_approvals, Mention, Overlay};
 use crate::config::Config;
 use crate::domain::session::SessionManager;
+use crate::input::keymap::Keymap;
 use crate::input::vim::VimMode;
 use crate::render::chat::ChatState;
 use crate::render::theme::Theme;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Focus {
-    Sidebar,
-    Chat,
-    Input,
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PanelLayout {
-    pub sidebar: ratatui::layout::Rect,
+    /// The transcript rect, cached so the reducer can compute page heights.
     pub chat: ratatui::layout::Rect,
-    pub input: ratatui::layout::Rect,
-    pub statusbar: ratatui::layout::Rect,
-    pub toggle: ratatui::layout::Rect,
+}
+
+/// A model stream tagged with the session it belongs to, so several sessions can
+/// generate concurrently and events route to the right one regardless of which is
+/// currently on screen.
+pub struct StreamHandle {
+    pub session_id: usize,
+    pub rx: mpsc::Receiver<StreamEvent>,
+}
+
+/// A request to leave the TUI, run an external program, then return. Handled by
+/// the main loop (suspend terminal → run → restore).
+#[derive(Debug, Clone)]
+pub enum PendingExternal {
+    /// Open one or more existing files in `$EDITOR`.
+    EditorFiles(Vec<PathBuf>),
+    /// Write text to a temp file and open it in `$EDITOR` (e.g. the conversation).
+    EditorText(String),
+    /// Drop into an interactive `$SHELL`.
+    Shell,
 }
 
 pub struct App {
     pub config: Config,
+    pub keymap: Keymap,
     pub sessions: SessionManager,
     pub chat: ChatState,
-    pub focus: Focus,
     pub vim: VimMode,
 
     pub input: InputBuffer,
     pub command: String,
     pub command_history: Vec<String>,
     pub command_history_idx: Option<usize>,
-    pub pending_escape: Option<char>,
+
+    /// Previously sent messages (oldest first) for shell-style up/down recall.
+    pub input_history: Vec<String>,
+    /// Position while browsing `input_history`; None means editing the live draft.
+    pub input_history_idx: Option<usize>,
+    /// The in-progress text saved when history browsing begins, restored on exit.
+    pub input_draft: String,
 
     pub overlay: Overlay,
     pub mention: Mention,
@@ -53,9 +70,33 @@ pub struct App {
     pub attachment: Option<PathBuf>,
     pub status: Option<String>,
     pub show_help: bool,
-    pub sidebar_collapsed: bool,
     pub should_quit: bool,
     pub yank: Option<String>,
+    /// The character just typed in insert mode (for the `jk`-style escape chord).
+    /// Reset by any edit/navigation that isn't a consecutive insert.
+    pub last_insert: Option<char>,
+    /// Show the full output of executed tools (off by default; toggled at runtime).
+    pub show_output: bool,
+    /// Offline mock backend: drive the agent tools without a live API.
+    pub mock: bool,
+    /// Files the agent has created/edited this session (relative paths, most
+    /// recent first) — for quick "jump into the edited file" access.
+    pub edited_files: Vec<String>,
+    /// When set, the main loop suspends the TUI, runs the external program, then
+    /// restores. Used to open files/the conversation in `$EDITOR` or a shell.
+    pub pending_external: Option<PendingExternal>,
+
+    /// Token usage from the most recent completed response, shown top-right.
+    /// `None` until the endpoint reports usage (some servers never do).
+    pub usage: Option<crate::api::Usage>,
+
+    /// Toggleable instruction snippets loaded from `~/.config/aitui/skills/`.
+    /// Active skills are injected as system messages on each request.
+    pub skills: Vec<crate::skills::Skill>,
+
+    /// Current reasoning effort ("low"/"medium"/"high"), or None to omit it.
+    /// Cycled with `:effort`; sent to reasoning-capable models.
+    pub reasoning_effort: Option<String>,
 
     /// Bumped whenever chat content/collapse changes, to invalidate the doc cache.
     pub content_rev: u64,
@@ -63,8 +104,16 @@ pub struct App {
     pub permissions: PermissionMemory,
     pub pending_tools: VecDeque<ToolCall>,
     pub agent_iterations: usize,
+    /// Which session the in-progress agent tool round belongs to (rounds are
+    /// serialized; a background session that finishes needing tools waits its turn).
+    pub agent_session: Option<usize>,
+    /// Sessions whose finished stream has tool calls to run, waiting for the
+    /// current agent round to free up (parallel sessions share one tool loop).
+    pub agent_queue: std::collections::VecDeque<usize>,
 
-    pub stream_rx: Option<mpsc::Receiver<StreamEvent>>,
+    /// Concurrent model streams, each tagged with the session it writes to, so a
+    /// background session keeps generating while you work in another (parallel).
+    pub streams: Vec<StreamHandle>,
     pub agent_tool_rx: Option<mpsc::Receiver<ToolResult>>,
     pub models_rx: Option<oneshot::Receiver<anyhow::Result<Vec<String>>>>,
 
@@ -76,45 +125,80 @@ pub const MAX_AGENT_ITERATIONS: usize = 25;
 
 impl App {
     pub fn new(config: Config) -> anyhow::Result<Self> {
+        // Mock mode: explicit config flag, the AITUI_MOCK env var, or an empty
+        // endpoint (nothing to talk to). Lets every agent feature be tested offline.
+        let mock = config.api.mock
+            || std::env::var("AITUI_MOCK").map(|v| !v.is_empty() && v != "0").unwrap_or(false)
+            || config.api.endpoint.trim().is_empty();
+
         let api = ApiClient::new(&config.api.endpoint, &config.api.api_key)?;
 
+        // Only fetch the model list from a real endpoint.
         let (models_tx, models_rx) = oneshot::channel();
-        {
+        if !mock {
             let fetch = ApiClient::new(&config.api.endpoint, &config.api.api_key)?;
             tokio::spawn(async move {
                 let _ = models_tx.send(fetch.fetch_models().await);
             });
+        } else {
+            drop(models_tx); // no fetch; receiver resolves to Closed and is ignored
         }
 
-        let models = default_models();
+        // Seed the model list with the configured default so it is selected and
+        // shown even before the real `/v1/models` list arrives (or if the default
+        // isn't in the built-in fallback list).
+        let mut models = default_models();
+        if !config.api.default_model.is_empty() && !models.contains(&config.api.default_model) {
+            models.insert(0, config.api.default_model.clone());
+        }
         let model_idx = models.iter().position(|m| m == &config.api.default_model).unwrap_or(0);
 
+        let keymap = Keymap::from_config(&config.keybinds);
+        let reasoning_effort = match config.api.reasoning_effort.trim() {
+            "" => None,
+            e => Some(e.to_string()),
+        };
         let mut app = Self {
             config,
+            keymap,
             sessions: SessionManager::load(),
             chat: ChatState::new(),
-            focus: Focus::Input,
             vim: VimMode::Normal,
             input: InputBuffer::default(),
             command: String::new(),
             command_history: Vec::new(),
             command_history_idx: None,
-            pending_escape: None,
+            input_history: Vec::new(),
+            input_history_idx: None,
+            input_draft: String::new(),
             overlay: Overlay::None,
             mention: Mention::default(),
             models,
             model_idx,
             attachment: None,
-            status: Some("i = insert  ·  @ = file  ·  / = commands  ·  :w = send  ·  ? = help".into()),
+            status: Some(if mock {
+                "⚗ MOCK mode — type 'help' then :w to drive the agent offline  ·  ? = keys".into()
+            } else {
+                "i = insert  ·  @ = file  ·  / = commands  ·  :w = send  ·  ? = help".into()
+            }),
             show_help: false,
-            sidebar_collapsed: false,
             should_quit: false,
             yank: None,
+            last_insert: None,
+            show_output: false,
+            mock,
+            edited_files: Vec::new(),
+            pending_external: None,
+            usage: None,
+            skills: crate::skills::load(),
+            reasoning_effort,
             content_rev: 0,
             permissions: PermissionMemory::default(),
             pending_tools: VecDeque::new(),
             agent_iterations: 0,
-            stream_rx: None,
+            streams: Vec::new(),
+            agent_session: None,
+            agent_queue: std::collections::VecDeque::new(),
             agent_tool_rx: None,
             models_rx: Some(models_rx),
             layout: PanelLayout::default(),
@@ -122,9 +206,20 @@ impl App {
         };
 
         if app.config.ui.agent_default {
-            app.sessions.active_mut().agent_mode = true;
+            // Apply to all sessions, not just the active one — loaded sessions
+            // default to agent-off, which would silently ignore tool calls.
+            app.sessions.set_agent_mode_all(true);
         }
         sync_auto_approvals(&mut app.permissions, app.config.ui.auto_approve_reads);
+
+        // Show the launch screen when there is any non-empty session to resume,
+        // so the user can pick up a past conversation (and `cd` to its folder) or
+        // start fresh. A clean first run drops straight into an empty session.
+        let resumable = app.sessions.all().iter().any(|s| !s.messages.is_empty());
+        if resumable {
+            let n = app.sessions.all().len();
+            app.overlay = Overlay::Startup(crate::app::overlay::Startup::new(n));
+        }
         Ok(app)
     }
 
@@ -134,6 +229,26 @@ impl App {
 
     pub fn current_model(&self) -> &str {
         self.models.get(self.model_idx).map(|s| s.as_str()).unwrap_or("unknown")
+    }
+
+    /// Whether the **active** session is mid-turn: streaming a reply, running its
+    /// agent tool round, or waiting on a permission prompt. Blocks a second send
+    /// *in that session* — but other sessions can stream in parallel, and the input
+    /// box stays editable so a follow-up can be composed ahead of time.
+    pub fn is_busy(&self) -> bool {
+        let active = self.sessions.active_id();
+        self.sessions.active().is_streaming()
+            || self.streams.iter().any(|s| s.session_id == active)
+            || (self.agent_session == Some(active)
+                && (self.agent_tool_rx.is_some() || !self.pending_tools.is_empty()))
+            || matches!(self.overlay, Overlay::Permission(_))
+    }
+
+    /// Whether *any* session is currently generating (used for the busy spinner).
+    pub fn any_busy(&self) -> bool {
+        !self.streams.is_empty()
+            || self.agent_tool_rx.is_some()
+            || !self.pending_tools.is_empty()
     }
 
     /// Invalidate the chat document cache (content or collapse changed).
@@ -149,7 +264,7 @@ impl App {
 
     /// Re-evaluate whether the cursor sits inside an `@token` and refresh matches.
     pub fn update_mention(&mut self) {
-        if self.focus != Focus::Input || self.vim != VimMode::Insert {
+        if self.vim != VimMode::Insert {
             self.mention.reset();
             return;
         }
@@ -333,28 +448,6 @@ pub fn find_project_files(max: usize) -> Vec<String> {
     }
     out.sort();
     out
-}
-
-/// List entries of a directory for the file picker (dirs first, with `../`).
-pub fn list_dir_entries(dir: &PathBuf) -> Vec<String> {
-    let mut entries: Vec<String> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            if e.path().is_dir() {
-                format!("{}/", name)
-            } else {
-                name
-            }
-        })
-        .collect();
-    entries.sort_by(|a, b| b.ends_with('/').cmp(&a.ends_with('/')).then(a.cmp(b)));
-    if dir.parent().is_some() {
-        entries.insert(0, "../".into());
-    }
-    entries
 }
 
 #[cfg(test)]

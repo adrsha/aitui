@@ -13,4 +13,3 @@ pub use tools::{ToolKind, tool_schemas};
 #[allow(unused_imports)]
 pub use parser::{StreamingParser, strip_tool_blocks};
 pub use executor::execute;
-pub use parser::extract_tool_calls;

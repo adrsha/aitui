@@ -4,27 +4,6 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::api::ChatMessage;
-use crate::agent::{ToolCall, ToolResult};
-
-/// One tool call + result entry tracked for the session timeline.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct ToolEvent {
-    pub call: ToolCall,
-    /// None while waiting for permission / executing.
-    pub result: Option<ToolResult>,
-    /// Display state
-    pub state: ToolEventState,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub enum ToolEventState {
-    Pending,   // awaiting permission
-    Running,   // executing
-    Done,      // finished (success or fail)
-    Denied,    // user denied
-}
 
 /// A single named conversation session.
 #[derive(Debug, Clone)]
@@ -40,8 +19,9 @@ pub struct Session {
     pub pending_reasoning: Option<String>,
     /// Agent mode: when true the session uses tool-calling prompts.
     pub agent_mode: bool,
-    /// Timeline of tool calls for this session (displayed inline in chat).
-    pub tool_events: Vec<ToolEvent>,
+    /// The working directory this session belongs to. Resuming a session `cd`s
+    /// back here so file tools and `@`-mentions resolve against the same project.
+    pub cwd: Option<PathBuf>,
 }
 
 impl Session {
@@ -54,7 +34,7 @@ impl Session {
             pending_assistant_text: None,
             pending_reasoning: None,
             agent_mode: false,
-            tool_events: Vec::new(),
+            cwd: std::env::current_dir().ok(),
         }
     }
 
@@ -140,11 +120,6 @@ impl Session {
         out
     }
 
-    /// The display text of the streaming message, or None when idle.
-    pub fn streaming_text(&self) -> Option<&str> {
-        self.pending_assistant_text.as_deref()
-    }
-
     pub fn is_streaming(&self) -> bool {
         self.pending_assistant_text.is_some()
     }
@@ -180,6 +155,8 @@ struct SavedSession {
     name: String,
     messages: Vec<ChatMessage>,
     system_prompt: Option<String>,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -196,6 +173,7 @@ impl From<&Session> for SavedSession {
             name: s.name.clone(),
             messages: s.messages.clone(),
             system_prompt: s.system_prompt.clone(),
+            cwd: s.cwd.clone(),
         }
     }
 }
@@ -210,7 +188,7 @@ impl From<SavedSession> for Session {
             pending_assistant_text: None,
             pending_reasoning: None,
             agent_mode: false,
-            tool_events: Vec::new(),
+            cwd: s.cwd,
         }
     }
 }
@@ -286,11 +264,52 @@ impl SessionManager {
         self.active_idx
     }
 
+    /// Set agent mode on every session (used to apply `agent_default` at startup,
+    /// since agent mode isn't persisted and loaded sessions default to off).
+    pub fn set_agent_mode_all(&mut self, on: bool) {
+        for s in &mut self.sessions {
+            s.agent_mode = on;
+        }
+    }
+
     pub fn new_session(&mut self) {
         let session = Session::new(self.next_id);
         self.next_id += 1;
         self.sessions.push(session);
         self.active_idx = self.sessions.len() - 1;
+    }
+
+    /// Duplicate the active session (messages, prompt, agent mode, cwd) into a new
+    /// session and select it, so the conversation can branch in parallel.
+    pub fn fork_active(&mut self) {
+        let mut copy = self.sessions[self.active_idx].clone();
+        copy.id = self.next_id;
+        self.next_id += 1;
+        copy.name = format!("{} (fork)", copy.name);
+        // A fork starts idle — never inherit the source's in-flight stream state.
+        copy.pending_assistant_text = None;
+        copy.pending_reasoning = None;
+        self.sessions.push(copy);
+        self.active_idx = self.sessions.len() - 1;
+    }
+
+    /// The active session's stable id.
+    pub fn active_id(&self) -> usize {
+        self.sessions[self.active_idx].id
+    }
+
+    pub fn by_id(&self, id: usize) -> Option<&Session> {
+        self.sessions.iter().find(|s| s.id == id)
+    }
+
+    pub fn by_id_mut(&mut self, id: usize) -> Option<&mut Session> {
+        self.sessions.iter_mut().find(|s| s.id == id)
+    }
+
+    /// Whether the session with `id` still exists (streams outlive session switches
+    /// but not deletions).
+    pub fn has_id(&self, id: usize) -> bool {
+        self.sessions.iter().any(|s| s.id == id)
     }
 
     pub fn select(&mut self, idx: usize) {
@@ -332,5 +351,235 @@ fn sessions_path() -> PathBuf {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             PathBuf::from(home).join(".config")
         });
-    base.join("aichat-tui").join("sessions.json")
+    base.join("aitui").join("sessions.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Session ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn new_session_has_default_name() {
+        let s = Session::new(1);
+        assert_eq!(s.name, "Session 1");
+        assert!(!s.agent_mode);
+        assert!(s.messages.is_empty());
+    }
+
+    #[test]
+    fn begin_and_append_stream_accumulates_text() {
+        let mut s = Session::new(1);
+        s.begin_assistant_stream();
+        assert!(s.is_streaming());
+        s.append_stream_token("Hello ");
+        s.append_stream_token("world");
+        assert_eq!(s.streaming_display().unwrap(), "Hello world");
+    }
+
+    #[test]
+    fn append_reasoning_works_without_stream() {
+        let mut s = Session::new(1);
+        s.append_reasoning("reasoning"); // no-op if no stream active
+        assert!(s.pending_reasoning.is_none());
+    }
+
+    #[test]
+    fn append_reasoning_with_stream() {
+        let mut s = Session::new(1);
+        s.begin_assistant_stream();
+        s.append_reasoning("step 1 ");
+        s.append_reasoning("step 2");
+        s.append_stream_token("result");
+        let display = s.streaming_display().unwrap();
+        assert!(display.contains("step 1 step 2"));
+        assert!(display.contains("result"));
+    }
+
+    #[test]
+    fn finalize_stream_pushes_assistant_message() {
+        let mut s = Session::new(1);
+        s.begin_assistant_stream();
+        s.append_stream_token("final text");
+        s.finalize_assistant_stream();
+        assert!(!s.is_streaming());
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.messages[0].role, "assistant");
+    }
+
+    #[test]
+    fn finalize_stream_with_thinking_wraps_reasoning() {
+        let mut s = Session::new(1);
+        s.begin_assistant_stream();
+        s.append_reasoning("thinks deeply");
+        s.append_stream_token("answer");
+        s.finalize_assistant_stream();
+        let text = content_text(&s.messages[0].content);
+        assert!(text.contains("<think>"));
+        assert!(text.contains("thinks deeply"));
+        assert!(text.contains("answer"));
+    }
+
+    #[test]
+    fn finalize_empty_stream_does_not_push() {
+        let mut s = Session::new(1);
+        s.begin_assistant_stream();
+        s.finalize_assistant_stream();
+        assert!(s.messages.is_empty());
+    }
+
+    #[test]
+    fn push_message_appends() {
+        let mut s = Session::new(1);
+        s.push_message(ChatMessage::user("hello"));
+        assert_eq!(s.messages.len(), 1);
+    }
+
+    #[test]
+    fn first_message_preview_finds_first_user() {
+        let mut s = Session::new(1);
+        s.push_message(ChatMessage::assistant("hi"));
+        s.push_message(ChatMessage::user("hello world"));
+        assert_eq!(s.first_message_preview(100).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn first_message_preview_none_if_no_user() {
+        let s = Session::new(1);
+        assert!(s.first_message_preview(10).is_none());
+    }
+
+    #[test]
+    fn first_message_preview_truncates() {
+        let mut s = Session::new(1);
+        s.push_message(ChatMessage::user("hello world foo bar"));
+        let preview = s.first_message_preview(5).unwrap();
+        assert!(preview.chars().count() <= 6);
+        assert!(preview.contains("…"));
+    }
+
+    #[test]
+    fn is_streaming_false_by_default() {
+        let s = Session::new(1);
+        assert!(!s.is_streaming());
+    }
+
+    fn content_text(c: &crate::api::models::MessageContent) -> &str {
+        match c {
+            crate::api::models::MessageContent::Text(t) => t.as_str(),
+            _ => "",
+        }
+    }
+
+    #[test]
+    fn api_messages_includes_system_prompt() {
+        let mut s = Session::new(1);
+        s.system_prompt = Some("Be helpful".into());
+        let msgs = s.api_messages();
+        assert!(msgs.iter().any(|m| m.role == "system" && content_text(&m.content).contains("Be helpful")));
+    }
+
+    #[test]
+    fn api_messages_agent_mode_adds_tool_prompt() {
+        let mut s = Session::new(1);
+        s.agent_mode = true;
+        let msgs = s.api_messages();
+        let sys_msgs: Vec<_> = msgs.iter().filter(|m| m.role == "system").collect();
+        assert_eq!(sys_msgs.len(), 1);
+        assert!(content_text(&sys_msgs[0].content).contains("tool"));
+    }
+
+    #[test]
+    fn api_messages_remaps_tool_role_to_user() {
+        let mut s = Session::new(1);
+        s.push_message(ChatMessage::tool("tool output"));
+        let msgs = s.api_messages();
+        let tool_msg = msgs.iter().find(|m| content_text(&m.content) == "tool output").unwrap();
+        assert_eq!(tool_msg.role, "user");
+    }
+
+    // ── SessionManager ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn manager_new_creates_one_session() {
+        let m = SessionManager::new();
+        assert_eq!(m.all().len(), 1);
+        assert_eq!(m.active_idx(), 0);
+    }
+
+    #[test]
+    fn manager_new_session_adds_and_selects() {
+        let mut m = SessionManager::new();
+        m.new_session();
+        assert_eq!(m.all().len(), 2);
+        assert_eq!(m.active_idx(), 1);
+    }
+
+    #[test]
+    fn manager_select_next_cycles_within_bounds() {
+        let mut m = SessionManager::new();
+        m.new_session();
+        m.new_session();
+        // idx = 2 (last of 3), select_next stays at 2
+        m.select_next();
+        assert_eq!(m.active_idx(), 2);
+        // go back to 0 then forward
+        m.select_prev();
+        m.select_prev();
+        assert_eq!(m.active_idx(), 0);
+        m.select_next();
+        assert_eq!(m.active_idx(), 1);
+        m.select_next();
+        assert_eq!(m.active_idx(), 2);
+    }
+
+    #[test]
+    fn manager_select_prev_cycles_within_bounds() {
+        let mut m = SessionManager::new();
+        assert_eq!(m.active_idx(), 0);
+        m.select_prev(); // stays at 0
+        assert_eq!(m.active_idx(), 0);
+    }
+
+    #[test]
+    fn manager_remove_active_resets_when_last() {
+        let mut m = SessionManager::new();
+        m.remove_active();
+        assert_eq!(m.all().len(), 1);
+        assert_eq!(m.active_idx(), 0);
+    }
+
+    #[test]
+    fn manager_remove_active_switches_previous() {
+        let mut m = SessionManager::new();
+        m.new_session();
+        m.new_session();
+        m.select_prev();
+        assert_eq!(m.active_idx(), 1);
+        m.remove_active();
+        assert_eq!(m.all().len(), 2);
+    }
+
+    #[test]
+    fn manager_select_updates_active() {
+        let mut m = SessionManager::new();
+        m.new_session();
+        m.select(0);
+        assert_eq!(m.active_idx(), 0);
+    }
+
+    #[test]
+    fn manager_select_out_of_bounds_noop() {
+        let mut m = SessionManager::new();
+        m.select(100);
+        assert_eq!(m.active_idx(), 0);
+    }
+
+    #[test]
+    fn manager_active_mut_modifies_active() {
+        let mut m = SessionManager::new();
+        m.active_mut().name = "Custom".into();
+        assert_eq!(m.active().name, "Custom");
+    }
 }

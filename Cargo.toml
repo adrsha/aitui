@@ -38,6 +38,20 @@ futures-util = "0.3"
 # Unicode width for correct wrapping / cursor math
 unicode-width = "0.1"
 
+# Syntax highlighting for code / file previews (tree-sitter grammars).
+tree-sitter            = "0.25"
+tree-sitter-highlight  = "0.25"
+tree-sitter-rust       = "0.24"
+tree-sitter-python     = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-json       = "0.24"
+tree-sitter-bash       = "0.23"
+tree-sitter-go         = "0.23"
+tree-sitter-c          = "0.23"
+tree-sitter-css        = "0.23"
+tree-sitter-html       = "0.23"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

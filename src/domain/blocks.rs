@@ -117,12 +117,18 @@ fn next_marker(s: &str) -> Option<(usize, Marker)> {
 }
 
 /// Find a fenced-code opener (```), preferring one anchored at line start.
+///
+/// A ` ```tool ` opener is accepted **wherever** it appears, even glued to the
+/// end of a prose line (e.g. `…and commands.```tool`). Models frequently emit
+/// tool fences mid-line, and without this the scan would skip the real (mid-line)
+/// opener and latch onto the line-anchored *closing* fence instead — swallowing
+/// the whole tool call into prose and silently running nothing.
 fn find_fence(s: &str) -> Option<usize> {
     let mut search_from = 0;
     while let Some(rel) = s[search_from..].find("```") {
         let pos = search_from + rel;
-        let at_line_start = pos == 0 || s.as_bytes()[pos - 1] == b'\n';
-        if at_line_start {
+        let is_tool = s[pos + 3..].trim_start_matches([' ', '\t']).starts_with("tool");
+        if line_anchored(s, pos) || is_tool {
             return Some(pos);
         }
         search_from = pos + 3;
@@ -131,20 +137,46 @@ fn find_fence(s: &str) -> Option<usize> {
     s.find("```")
 }
 
+/// A fence is "line-anchored" if only whitespace precedes it on its line, so
+/// **indented** fences (e.g. a ```bash block nested under a list item) are still
+/// recognised — not rendered as literal prose.
+fn line_anchored(s: &str, pos: usize) -> bool {
+    let line_start = s[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    s[line_start..pos].chars().all(|c| c == ' ' || c == '\t')
+}
+
 /// Parse a fenced block starting at `s` (which begins with ```). Returns the
 /// block and how many bytes were consumed (including the closing fence).
 fn parse_fence(s: &str) -> (Option<Block>, usize) {
     debug_assert!(s.starts_with("```"));
     let after_ticks = &s[3..];
-    // Info string runs to end of line.
-    let (info, body_start_rel) = match after_ticks.find('\n') {
-        Some(nl) => (after_ticks[..nl].trim().to_string(), 3 + nl + 1),
-        None => (after_ticks.trim().to_string(), s.len()),
+    // The info string (lang + attrs) normally runs to the end of the opener line,
+    // with the body starting on the next line. But models also emit fences inline
+    // on a single line (`…issues.```tool {json}``` more`); there the lang is just
+    // the first token and the body is whatever follows it on the same line.
+    let (lang, body_start_rel) = match after_ticks.find('\n') {
+        Some(nl) => {
+            let info = after_ticks[..nl].trim();
+            let lang = info.split_whitespace().next().unwrap_or("").to_string();
+            (lang, 3 + nl + 1)
+        }
+        None => {
+            let lang_end = after_ticks
+                .find(char::is_whitespace)
+                .unwrap_or(after_ticks.len());
+            let lang = after_ticks[..lang_end].trim().to_string();
+            // Skip a single separating space so the body begins at the payload.
+            let ws = after_ticks[lang_end..].len() - after_ticks[lang_end..].trim_start().len();
+            (lang, 3 + lang_end + ws)
+        }
     };
     let body = &s[body_start_rel..];
+    let is_tool = lang == "tool";
 
-    // Closing fence: ``` at a line start (or end of string when streaming).
-    let (inner, consumed) = match find_closing_fence(body) {
+    // Closing fence: ``` at a line start (or end of string when streaming). For a
+    // tool fence we also accept a mid-line closer so a call emitted entirely on
+    // one line still closes cleanly instead of parsing as prose.
+    let (inner, consumed) = match find_closing_fence(body, is_tool) {
         Some(end) => {
             let after_close = end + 3;
             // Swallow a trailing newline after the close fence.
@@ -155,8 +187,7 @@ fn parse_fence(s: &str) -> (Option<Block>, usize) {
     };
     let inner = inner.strip_suffix('\n').unwrap_or(inner);
 
-    let lang = info.split_whitespace().next().unwrap_or("").to_string();
-    if lang == "tool" {
+    if is_tool {
         if let Some(call) = parse_tool_json(inner) {
             return (Some(Block::ToolCall(call)), consumed);
         }
@@ -165,17 +196,20 @@ fn parse_fence(s: &str) -> (Option<Block>, usize) {
     (Some(Block::Code { lang, code: inner.to_string() }), consumed)
 }
 
-fn find_closing_fence(body: &str) -> Option<usize> {
+fn find_closing_fence(body: &str, allow_midline: bool) -> Option<usize> {
     let mut from = 0;
     while let Some(rel) = body[from..].find("```") {
         let pos = from + rel;
-        let at_line_start = pos == 0 || body.as_bytes()[pos - 1] == b'\n';
-        if at_line_start {
+        if line_anchored(body, pos) {
             return Some(pos);
         }
         from = pos + 3;
     }
-    None
+    // No line-anchored closer. For tool fences, fall back to the first ``` anywhere
+    // so a call emitted entirely on one line (`…issues.```tool {json}``` more`)
+    // still closes instead of dragging trailing prose into the block. Regular code
+    // blocks keep the strict rule so streaming/partial content isn't cut short.
+    if allow_midline { body.find("```") } else { None }
 }
 
 /// Parse the JSON inside a ```tool fence into a [`ToolCall`], accepting both
@@ -303,6 +337,51 @@ mod tests {
     }
 
     #[test]
+    fn tool_fence_glued_to_prose_line_still_parses() {
+        // Model glued the opener to the end of a prose line (not line-anchored),
+        // with a line-anchored closing fence after. Must still yield a ToolCall,
+        // not swallow it into prose + an empty code block.
+        let text = "…verify the docs match the code and commands.```tool\n{\"name\":\"run_shell\",\"args\":{\"command\":\"find . -name '*.md' | sort\"}}\n```";
+        let blocks = parse_blocks(text);
+        let call = blocks.iter().find_map(|b| match b {
+            Block::ToolCall(c) => Some(c),
+            _ => None,
+        });
+        assert!(call.is_some(), "expected a ToolCall, got {:?}", blocks);
+        assert_eq!(call.unwrap().name, "run_shell");
+    }
+
+    #[test]
+    fn tool_fence_fully_inline_still_parses() {
+        // Opener and closer both glued on one line, with trailing prose after.
+        let text = "…concrete issues.```tool {\"name\":\"read_file\",\"args\":{\"path\":\"Cargo.toml\"}}``` I need the result.";
+        let blocks = parse_blocks(text);
+        let call = blocks.iter().find_map(|b| match b {
+            Block::ToolCall(c) => Some(c),
+            _ => None,
+        });
+        assert!(call.is_some(), "expected a ToolCall, got {:?}", blocks);
+        assert_eq!(call.unwrap().name, "read_file");
+        // Trailing prose after the closer is preserved.
+        assert!(blocks.iter().any(|b| matches!(b, Block::Markdown(m) if m.contains("I need the result"))));
+    }
+
+    #[test]
+    fn indented_code_fence_is_recognised() {
+        // A ```bash block indented under a list item must parse as a Code block,
+        // not literal prose.
+        let text = "1. Run this:\n   ```bash\n   find . -type f\n   ```\ndone";
+        let blocks = parse_blocks(text);
+        let code = blocks.iter().find_map(|b| match b {
+            Block::Code { lang, code } => Some((lang.clone(), code.clone())),
+            _ => None,
+        });
+        assert!(code.is_some(), "indented fence should be a Code block, got {:?}", blocks);
+        assert_eq!(code.as_ref().unwrap().0, "bash");
+        assert!(code.unwrap().1.contains("find"));
+    }
+
+    #[test]
     fn tool_fence_accepts_arguments_key() {
         let text = "```tool\n{\"name\":\"run_shell\",\"arguments\":{\"command\":\"ls\"}}\n```";
         let blocks = parse_blocks(text);
@@ -365,3 +444,5 @@ mod tests {
         assert_eq!(blocks, vec![Block::Code { lang: "".into(), code: "a\nb".into() }]);
     }
 }
+
+

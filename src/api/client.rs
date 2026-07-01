@@ -12,6 +12,8 @@ pub enum StreamEvent {
     Token(String),
     /// A reasoning ("thinking") delta, when the endpoint streams it separately.
     Reasoning(String),
+    /// Final token accounting, when the endpoint reports it.
+    Usage(super::models::Usage),
     /// The stream finished cleanly.
     Done,
     /// A network or protocol error occurred.
@@ -30,9 +32,13 @@ impl ApiClient {
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
 
+        // Trim trailing slashes so `{endpoint}/v1/...` never doubles up (a `//`
+        // path 404s / returns empty on many gateways).
+        let endpoint = endpoint.into().trim_end_matches('/').to_string();
+
         Ok(Self {
             client,
-            endpoint: endpoint.into(),
+            endpoint,
             api_key: api_key.into(),
         })
     }
@@ -156,6 +162,9 @@ async fn stream_inner(
                     return Ok(());
                 }
                 Some(SseParsed::Chunk(chunk)) => {
+                    if let Some(usage) = chunk.usage {
+                        let _ = tx.send(StreamEvent::Usage(usage)).await;
+                    }
                     for choice in chunk.choices {
                         if let Some(content) = choice.delta.content {
                             if !content.is_empty() {
