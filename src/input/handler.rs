@@ -12,6 +12,8 @@ pub fn handle_event(app: &App, event: Event) -> Vec<Action> {
         Event::Key(k) if k.kind != KeyEventKind::Release => handle_key(app, k),
         Event::Mouse(m) => handle_mouse(m),
         Event::Resize(_, _) => vec![Action::Resize],
+        // A bracketed paste arrives as one blob — smart-paste decides file vs chip.
+        Event::Paste(s) => vec![Action::PasteText(s)],
         _ => vec![],
     }
 }
@@ -57,6 +59,7 @@ fn handle_key(app: &App, key: KeyEvent) -> Vec<Action> {
         Overlay::Palette(_) => return handle_palette(&key),
         Overlay::Settings(_) => return handle_settings(&key),
         Overlay::Permission(_) => return handle_permission(&key),
+        Overlay::ApiSetup(_) => return handle_api_setup(&key),
         // A notice is a plain "OK" dialog: any key dismisses it.
         Overlay::Notice { .. } => return vec![Action::DismissNotice],
         Overlay::None => {}
@@ -146,6 +149,18 @@ fn handle_settings(key: &KeyEvent) -> Vec<Action> {
         KeyCode::Down => vec![Action::PickerDown],
         KeyCode::Left => vec![Action::SettingsLeft],
         KeyCode::Right => vec![Action::SettingsRight],
+        KeyCode::Char(c) => vec![Action::PickerChar(c)],
+        KeyCode::Backspace => vec![Action::PickerBackspace],
+        _ => vec![],
+    }
+}
+
+fn handle_api_setup(key: &KeyEvent) -> Vec<Action> {
+    match key.code {
+        KeyCode::Esc => vec![Action::PickerCancel],
+        KeyCode::Enter => vec![Action::PickerConfirm],
+        // Tab / arrows switch between the URL and key fields.
+        KeyCode::Tab | KeyCode::Up | KeyCode::Down => vec![Action::PickerDown],
         KeyCode::Char(c) => vec![Action::PickerChar(c)],
         KeyCode::Backspace => vec![Action::PickerBackspace],
         _ => vec![],

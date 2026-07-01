@@ -32,20 +32,26 @@ pure function of state.
 
 ## The event loop (`main.rs`)
 
-A single synchronous loop, ticking at ~16 ms (`event::poll` timeout):
+A single synchronous loop, but **event-driven**: it only redraws when something
+changed rather than spinning at a fixed frame rate.
 
-1. **Draw** — recompute layout, rebuild the chat document if stale, render.
-2. **Poll input** — translate one crossterm event into actions, dispatch.
-3. **Drain channels** — model list, stream tokens, agent tool results → actions.
+1. **Draw (conditional)** — render only when `dirty` (an event or channel activity
+   this pass) or `animating` (a stream/tool is in flight and the spinner needs to
+   tick). Layout + the chat document are recomputed here (doc rebuilt only if stale).
+2. **Poll input** — `event::poll` blocks up to **33 ms while animating** (smooth
+   spinner) or **250 ms when idle** (near-zero idle CPU); one crossterm event →
+   actions → dispatch, and marks `dirty`.
+3. **Drain channels** — model list, stream tokens, agent tool results, and
+   **speculative read-only tool results** → actions / caches. Any activity marks `dirty`.
 4. **Quit check.**
 
 `dispatch()` runs a small work-queue: it applies each action and pushes any
 follow-up action returned by the reducer, so one keystroke can fan out into a
 short deterministic chain (e.g. `Submit → AttachStream`).
 
-> ⚠️ The tokio runtime is entered via `_guard` but the loop itself is blocking.
-> Async work is offloaded to spawned tasks. This is fine today; revisit if the
-> draw/poll cadence ever needs to be event-driven (see ROADMAP Phase 6).
+> The tokio runtime is entered via `_guard`; the loop stays synchronous and
+> offloads async work to spawned tasks. The redraw is gated on change, so idle
+> CPU is negligible and streaming still animates (ROADMAP Phase 6).
 
 ## Module map
 
@@ -103,19 +109,50 @@ Each result is recorded as a `tool` message; when the queue drains,
 `continue_after_tools` streams the model's next turn. A loop guard caps rounds at
 `MAX_AGENT_ITERATIONS = 25`.
 
-> Tool results are stored as `role: "tool"` messages but **remapped to `"user"`**
-> in `Session::api_messages()` so plain completion endpoints accept them. Native
-> function-calling (Phase 2) will replace this with proper `tool` role + `tool_call_id`.
+**Stream cut on tool detection:** the fenced protocol is "emit a tool block and
+nothing after it." In agent mode, each `StreamToken` checks `should_cut_stream` —
+if the partial already holds a *complete* tool call, the stream is finalized
+immediately, its handle dropped (which aborts the backend generation), and
+`cut_stream` is set. The main loop then dispatches `StartAgentRound` on a **clean
+pass** (after the batch's leftover tokens have drained and no-op'd on the finalized
+session), so the round starts without stale tokens bleeding into the next stream.
+This stops a model that expects inline tool results from spiralling into a whole
+turn of redundant calls — the dominant source of wasted tokens / perceived slowness.
+
+**Speculative pre-execution:** while the reply is still streaming, each
+`StreamToken` runs `effects::speculate_read_tools`, which scans the partial with
+`agent::parser::extract_tool_calls` and pre-runs any *complete, side-effect-free
+read-only* call (`read_file`/`list_dir`/`search_files`) in the background, keyed by
+`hash(name,args)` in `App.spec_results`. When the round reaches that call,
+`execute_tool` uses the cached result instantly instead of re-running it. Writes,
+edits, deletes, shell, and network tools are never speculated. (With the cut above,
+the speculated read is typically already done the instant the round starts.)
+
+> **Native function-calling (D-017):** with `api.native_tools` on, the request
+> carries `tools` schemas and the model returns structured `tool_calls`; the client
+> accumulates the deltas and synthesizes an internal ```tool fence, so the pipeline
+> above is unchanged. `Session::api_messages(native)` translates stored turns to
+> `assistant.tool_calls` + `role:"tool"` with `tool_call_id`. In fenced mode (or as
+> the auto-fallback when an endpoint rejects `tools`), tool results are instead
+> **remapped to `"user"`** so plain completion endpoints accept them.
 
 ### Rendering
 State is rebuilt into a cached document only when `content_rev` (bumped by
 `App::touch()`) or the width changes. `ChatState` holds scroll/cursor over the
-rendered rows. This keeps redraws cheap during streaming.
+rendered rows.
+
+The rebuild itself is **per-message incremental** (`App.doc_cache: render::chat::
+DocCache`): each finalized message's rendered rows are cached under a content
+signature (role + text + its collapse toggles), so a streamed token only re-parses,
+re-highlights, and re-wraps **the one streaming message**, not the whole transcript.
+The live streaming partial is always rebuilt fresh; width / show-output changes drop
+the whole cache. This keeps streaming cost flat regardless of conversation length.
 
 ## Known structural debt (tracked in ROADMAP)
 
-- **Dual renderers:** `render/` and `ui/` coexist mid-refactor; several `ui/`
-  functions and `render/chat.rs::render` are dead code today (~24 warnings).
+- **Renderer split settled:** `render/` = document model, `ui/` = widgets. The old
+  dead `render/chat.rs::render` path is gone; the build is down to 2 pre-existing
+  WIP warnings (`Action::InputHistory{Prev,Next}`, `InputBuffer::is_selected`).
 - **Prompt-fenced tools:** the agent depends on the model emitting ```` ```tool ````
   blocks; brittle vs. native function-calling. Schemas exist but are unused.
 - **No request timeout / retry / cancellation mid-tool.**

@@ -11,6 +11,62 @@ use std::collections::HashSet;
 
 use crate::render::document::RenderedLine;
 
+/// Per-message render cache. Building the chat document re-parses markdown, runs
+/// tree-sitter highlighting, and word-wraps every block — expensive to redo for
+/// the *whole* transcript on every streamed token. This caches each finalized
+/// message's rendered rows keyed by a content signature, so only messages that
+/// actually changed (in practice just the streaming one) are rebuilt.
+///
+/// Owned by the renderer (`ChatState`) as pure layout scaffolding — it holds no
+/// domain state, so "rendering is pure" still stands.
+#[derive(Default)]
+pub struct DocCache {
+    /// One slot per stored message, indexed by message position.
+    entries: Vec<Option<CacheEntry>>,
+    width: usize,
+    show_output: bool,
+}
+
+struct CacheEntry {
+    sig: u64,
+    rows: Vec<RenderedLine>,
+}
+
+impl DocCache {
+    /// Drop everything if the viewport width or the global show-output toggle
+    /// changed — both re-wrap / re-collapse every message, so no slot survives.
+    pub fn reset_if_env_changed(&mut self, width: usize, show_output: bool) {
+        if width != self.width || show_output != self.show_output {
+            self.entries.clear();
+            self.width = width;
+            self.show_output = show_output;
+        }
+    }
+
+    /// Forget slots past `len` (e.g. after `:clear` or a session switch).
+    pub fn truncate(&mut self, len: usize) {
+        if self.entries.len() > len {
+            self.entries.truncate(len);
+        }
+    }
+
+    /// Cached rows for message `mi` if its signature still matches.
+    pub fn get(&self, mi: usize, sig: u64) -> Option<&[RenderedLine]> {
+        match self.entries.get(mi) {
+            Some(Some(e)) if e.sig == sig => Some(&e.rows),
+            _ => None,
+        }
+    }
+
+    /// Store freshly built rows for message `mi`.
+    pub fn put(&mut self, mi: usize, sig: u64, rows: Vec<RenderedLine>) {
+        if mi >= self.entries.len() {
+            self.entries.resize_with(mi + 1, || None);
+        }
+        self.entries[mi] = Some(CacheEntry { sig, rows });
+    }
+}
+
 #[derive(Default)]
 pub struct ChatState {
     pub scroll: usize,
@@ -168,5 +224,48 @@ mod tests {
         assert!(!s.needs_rebuild(1, 40));
         assert!(s.needs_rebuild(2, 40));
         assert!(s.needs_rebuild(1, 50));
+    }
+
+    fn one_row(text: &str) -> Vec<RenderedLine> {
+        let msgs = vec![DocMessage { role: "assistant".into(), blocks: vec![Block::Markdown(text.into())] }];
+        build(&msgs, 40, &Theme::default(), &HashSet::new(), false, false)
+    }
+
+    #[test]
+    fn doc_cache_hits_on_matching_sig_and_misses_after_change() {
+        let mut c = DocCache::default();
+        c.reset_if_env_changed(40, false);
+        c.put(0, 111, one_row("hello"));
+        // Same signature → hit.
+        assert!(c.get(0, 111).is_some());
+        // Different signature (content changed) → miss.
+        assert!(c.get(0, 222).is_none());
+        // Different message index → miss.
+        assert!(c.get(1, 111).is_none());
+    }
+
+    #[test]
+    fn doc_cache_clears_when_width_or_show_output_changes() {
+        let mut c = DocCache::default();
+        c.reset_if_env_changed(40, false);
+        c.put(0, 7, one_row("x"));
+        assert!(c.get(0, 7).is_some());
+        c.reset_if_env_changed(50, false); // width changed → drop everything
+        assert!(c.get(0, 7).is_none());
+
+        c.put(0, 7, one_row("x"));
+        c.reset_if_env_changed(50, true); // show_output changed → drop everything
+        assert!(c.get(0, 7).is_none());
+    }
+
+    #[test]
+    fn doc_cache_truncates_removed_messages() {
+        let mut c = DocCache::default();
+        c.reset_if_env_changed(40, false);
+        c.put(0, 1, one_row("a"));
+        c.put(1, 2, one_row("b"));
+        c.truncate(1); // message 1 removed (e.g. :clear)
+        assert!(c.get(0, 1).is_some());
+        assert!(c.get(1, 2).is_none());
     }
 }

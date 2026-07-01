@@ -7,7 +7,8 @@ pub struct AppLayout {
 }
 
 /// Single-column layout: transcript fills the space, a fixed-height input box
-/// sits at the bottom, and a one-line status bar underneath it.
+/// sits at the bottom, and a one-line status bar underneath it. Panels span the
+/// full width; breathing room lives *inside* the input panel (see `ui/input.rs`).
 pub fn compute(area: Rect, input_height: u16) -> AppLayout {
     let chunks = Layout::default()
         .direction(Direction::Vertical)

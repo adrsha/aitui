@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph};
 use ratatui::Frame;
 
-use crate::app::overlay::{BrowsePurpose, FileBrowser, Overlay, Picker, PickerKind, Settings, SettingsRow, Startup};
+use crate::app::overlay::{ApiSetup, BrowsePurpose, FileBrowser, Overlay, Picker, PickerKind, Settings, SettingsRow, Startup};
 use crate::app::state::App;
 use crate::render::theme::Theme;
 
@@ -17,6 +17,7 @@ pub fn render(f: &mut Frame, app: &App, theme: &Theme) {
         Overlay::Palette(p) => render_palette(f, p, theme),
         Overlay::Settings(s) => render_settings(f, app, s, theme),
         Overlay::Permission(p) => render_permission(f, p, theme),
+        Overlay::ApiSetup(s) => render_api_setup(f, s, theme),
         Overlay::Notice { title, body } => render_notice(f, title, body, theme),
     }
 }
@@ -274,6 +275,42 @@ fn render_permission(f: &mut Frame, req: &crate::app::overlay::PermissionRequest
             Rect { x: inner.x, y, width: inner.width, height: 1 },
         );
     }
+}
+
+// ── API setup prompt ──────────────────────────────────────────────────────────
+
+fn render_api_setup(f: &mut Frame, s: &ApiSetup, theme: &Theme) {
+    let area = centered_fixed(64, 9, f.area());
+    let inner = panel(f, area, " API Setup ", theme);
+
+    let field = |focused: bool, label: &str, value: String| {
+        // Focused field shows a block cursor; the key is masked.
+        let marker = if focused { "▸ " } else { "  " };
+        let val_style = if focused {
+            Style::default().fg(theme.text).add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        let shown = if value.is_empty() { "—".to_string() } else { value };
+        vec![
+            Span::styled(format!("{}{}: ", marker, label), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(shown, val_style),
+            if focused { Span::styled("▌", Style::default().fg(theme.accent)) } else { Span::raw("") },
+        ]
+    };
+    let masked_key: String = if s.api_key.is_empty() { String::new() } else { "•".repeat(s.api_key.chars().count().min(24)) };
+
+    let lines = vec![
+        Line::from(field(s.field == 0, "URL", s.endpoint.clone())),
+        Line::from(""),
+        Line::from(field(s.field == 1, "Key", masked_key)),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Tab switch field · ⏎ save · Esc cancel",
+            Style::default().fg(theme.faint).add_modifier(Modifier::ITALIC),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 // ── Helper ────────────────────────────────────────────────────────────────────

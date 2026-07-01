@@ -43,6 +43,9 @@ pub enum Action {
     DeleteLine,
     YankLine,
     Paste,
+    /// A bracketed paste from the terminal. Large → saved to a file and attached;
+    /// medium → stored and shown as a compact `[PASTED#N-…]` chip; small → inserted.
+    PasteText(String),
     Move(Dir),
     LineStart,
     LineEnd,
@@ -70,6 +73,11 @@ pub enum Action {
     StreamUsage(usize, crate::api::Usage),
     StreamDone(usize),
     StreamError(usize, String),
+    /// Start (or queue) the agent tool round for a session whose stream was cut
+    /// early because a complete tool call was detected mid-generation.
+    StartAgentRound(usize),
+    /// Open the API endpoint/key setup prompt (prefilled from config).
+    OpenApiSetup,
 
     // Transcript scrolling (no cursor — read it in $EDITOR for motions)
     ChatTop,

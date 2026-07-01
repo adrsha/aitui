@@ -4,6 +4,22 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::api::ChatMessage;
+use crate::api::models::{ContentPart, MessageContent};
+
+/// Plain display/serialization text of a stored message.
+fn msg_text(m: &ChatMessage) -> String {
+    match &m.content {
+        MessageContent::Text(t) => t.clone(),
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.clone()),
+                ContentPart::ImageUrl { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
 
 /// A single named conversation session.
 #[derive(Debug, Clone)]
@@ -96,9 +112,12 @@ impl Session {
     /// - In agent mode the tool-calling system prompt is prepended so the model
     ///   knows which tools exist and how to call them.
     /// - A user-defined system prompt (if any) is added after it.
-    /// - Internal "tool" role messages are re-mapped to "user" so plain
-    ///   OpenAI-compatible endpoints accept them as context.
-    pub fn api_messages(&self) -> Vec<ChatMessage> {
+    /// - When `native` is on, a stored assistant turn's fenced ```` ```tool ````
+    ///   calls become structured `tool_calls`, and the following "tool" results
+    ///   become native `role:"tool"` messages with matching `tool_call_id`.
+    /// - Otherwise (fenced fallback) "tool" messages are re-mapped to "user" so
+    ///   plain OpenAI-compatible endpoints accept them as context.
+    pub fn api_messages(&self, native: bool) -> Vec<ChatMessage> {
         let mut out = Vec::with_capacity(self.messages.len() + 2);
         if self.agent_mode {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -107,15 +126,69 @@ impl Session {
         if let Some(ref prompt) = self.system_prompt {
             out.push(ChatMessage::system(prompt.clone()));
         }
-        for m in &self.messages {
+
+        let msgs = &self.messages;
+        let mut i = 0;
+        while i < msgs.len() {
+            let m = &msgs[i];
+            // Native: an assistant turn with fenced tool calls, immediately followed
+            // by exactly that many "tool" results, is sent as structured tool_calls.
+            if native && m.role == "assistant" {
+                let text = msg_text(m);
+                let calls = crate::agent::parser::extract_tool_calls(&text);
+                if !calls.is_empty() {
+                    // Gather the run of tool results answering this turn.
+                    let mut n = 0;
+                    while i + 1 + n < msgs.len()
+                        && msgs[i + 1 + n].role == "tool"
+                        && n < calls.len()
+                    {
+                        n += 1;
+                    }
+                    if n == calls.len() {
+                        let prose = crate::agent::parser::strip_tool_blocks(&text).trim().to_string();
+                        let api_calls: Vec<crate::api::models::ApiToolCall> = calls
+                            .iter()
+                            .enumerate()
+                            .map(|(k, c)| {
+                                let id = c.id.clone().unwrap_or_else(|| format!("call_{}", k));
+                                crate::api::models::ApiToolCall::function(id, &c.name, c.args.to_string())
+                            })
+                            .collect();
+                        out.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content: crate::api::models::MessageContent::Text(prose),
+                            tool_calls: Some(api_calls.clone()),
+                            tool_call_id: None,
+                        });
+                        for (k, api_call) in api_calls.iter().enumerate() {
+                            let result = &msgs[i + 1 + k];
+                            out.push(ChatMessage {
+                                role: "tool".to_string(),
+                                content: result.content.clone(),
+                                tool_calls: None,
+                                tool_call_id: Some(api_call.id.clone()),
+                            });
+                        }
+                        i += 1 + n;
+                        continue;
+                    }
+                    // else: orphaned call (e.g. cancelled round) — fall through and
+                    // send it the fenced way so the API never sees an unanswered call.
+                }
+            }
+
             if m.role == "tool" {
                 out.push(ChatMessage {
                     role: "user".to_string(),
                     content: m.content.clone(),
+                    tool_calls: None,
+                    tool_call_id: None,
                 });
             } else {
                 out.push(m.clone());
             }
+            i += 1;
         }
         out
     }
@@ -232,19 +305,30 @@ impl SessionManager {
         Self { sessions, active_idx, next_id }
     }
 
-    /// Persist all sessions to disk (silently ignores errors).
+    /// Persist all sessions to disk (silently ignores errors). Serialization and
+    /// the blocking `fs::write` are moved off the UI thread via `spawn_blocking`
+    /// when a tokio runtime is available (the app), so finishing a turn doesn't
+    /// hitch the render loop; falls back to a synchronous write otherwise (tests).
     pub fn save(&self) {
         let path = sessions_path();
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
+        // Build the owned snapshot on the caller's thread (cheap clones), then hand
+        // the expensive serialize + write to a blocking task.
         let state = SavedState {
             sessions: self.sessions.iter().map(SavedSession::from).collect(),
             active_idx: self.active_idx,
             next_id: self.next_id,
         };
-        if let Ok(json) = serde_json::to_string_pretty(&state) {
-            let _ = fs::write(&path, json);
+        let write = move || {
+            if let Ok(json) = serde_json::to_string_pretty(&state) {
+                let _ = fs::write(&path, json);
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => { tokio::task::spawn_blocking(write); }
+            Err(_) => write(),
         }
     }
 
@@ -476,7 +560,7 @@ mod tests {
     fn api_messages_includes_system_prompt() {
         let mut s = Session::new(1);
         s.system_prompt = Some("Be helpful".into());
-        let msgs = s.api_messages();
+        let msgs = s.api_messages(false);
         assert!(msgs.iter().any(|m| m.role == "system" && content_text(&m.content).contains("Be helpful")));
     }
 
@@ -484,7 +568,7 @@ mod tests {
     fn api_messages_agent_mode_adds_tool_prompt() {
         let mut s = Session::new(1);
         s.agent_mode = true;
-        let msgs = s.api_messages();
+        let msgs = s.api_messages(false);
         let sys_msgs: Vec<_> = msgs.iter().filter(|m| m.role == "system").collect();
         assert_eq!(sys_msgs.len(), 1);
         assert!(content_text(&sys_msgs[0].content).contains("tool"));
@@ -494,9 +578,46 @@ mod tests {
     fn api_messages_remaps_tool_role_to_user() {
         let mut s = Session::new(1);
         s.push_message(ChatMessage::tool("tool output"));
-        let msgs = s.api_messages();
+        let msgs = s.api_messages(false);
         let tool_msg = msgs.iter().find(|m| content_text(&m.content) == "tool output").unwrap();
         assert_eq!(tool_msg.role, "user");
+    }
+
+    #[test]
+    fn api_messages_native_converts_fenced_call_to_tool_calls() {
+        let mut s = Session::new(1);
+        s.agent_mode = true;
+        s.push_message(ChatMessage::user("read it"));
+        s.push_message(ChatMessage::assistant(
+            "sure\n```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"a.rs\"},\"id\":\"call_1\"}\n```",
+        ));
+        s.push_message(ChatMessage::tool("[tool-result] Read a.rs (ok)\ncontents"));
+
+        let msgs = s.api_messages(true);
+        let a = msgs.iter().find(|m| m.role == "assistant" && m.tool_calls.is_some()).expect("native assistant");
+        let calls = a.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].id, "call_1");
+        // The fenced text was stripped from the assistant content.
+        assert!(!content_text(&a.content).contains("```tool"));
+        // The following result is a native tool message referencing the call id.
+        let t = msgs.iter().find(|m| m.role == "tool").expect("native tool message");
+        assert_eq!(t.tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn api_messages_native_orphan_call_stays_fenced() {
+        let mut s = Session::new(1);
+        s.agent_mode = true;
+        // A tool call with no following result (e.g. a cancelled round) must NOT
+        // become a structured tool_calls (the API would 400 on the unanswered call).
+        s.push_message(ChatMessage::assistant(
+            "```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"a.rs\"}}\n```",
+        ));
+        let msgs = s.api_messages(true);
+        let a = msgs.iter().find(|m| m.role == "assistant").unwrap();
+        assert!(a.tool_calls.is_none(), "orphan call must stay fenced");
     }
 
     // ── SessionManager ─────────────────────────────────────────────────────────

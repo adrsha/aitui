@@ -47,6 +47,8 @@ pub struct App {
     pub keymap: Keymap,
     pub sessions: SessionManager,
     pub chat: ChatState,
+    /// Per-message rendered-row cache, so streaming only rebuilds changed messages.
+    pub doc_cache: crate::render::chat::DocCache,
     pub vim: VimMode,
 
     pub input: InputBuffer,
@@ -63,6 +65,10 @@ pub struct App {
 
     pub overlay: Overlay,
     pub mention: Mention,
+
+    /// Stored medium-size pastes, shown in the input as `[PASTED#N-…]` chips and
+    /// expanded back to their full text on submit. Index + 1 = the chip's N.
+    pub pastes: Vec<String>,
 
     pub models: Vec<String>,
     pub model_idx: usize,
@@ -117,6 +123,29 @@ pub struct App {
     pub agent_tool_rx: Option<mpsc::Receiver<ToolResult>>,
     pub models_rx: Option<oneshot::Receiver<anyhow::Result<Vec<String>>>>,
 
+    /// Speculative tool execution: while an agent-mode reply streams, complete
+    /// read-only tool blocks are pre-run in the background so their results are
+    /// ready the instant the turn finishes. Results are keyed by `hash(name,args)`.
+    pub spec_results: std::collections::HashMap<u64, ToolResult>,
+    /// Call signatures already dispatched speculatively this turn (dedup guard).
+    pub spec_dispatched: std::collections::HashSet<u64>,
+    /// Bumped every turn (`begin_stream_for`); tags each speculative task so a
+    /// result that lands after the turn moved on is dropped instead of served stale.
+    pub spec_epoch: u64,
+    /// Set when an agent-mode stream is cut early (a complete tool call appeared
+    /// mid-generation). The main loop drains it *after* the batch so the tool round
+    /// starts on a clean pass — no leftover tokens land in the next stream.
+    pub cut_stream: Option<usize>,
+    /// Sender cloned into each speculative exec task (tagged with its epoch);
+    /// results drained via `spec_rx`.
+    pub spec_tx: mpsc::Sender<(u64, ToolResult)>,
+    pub spec_rx: mpsc::Receiver<(u64, ToolResult)>,
+
+    /// Cached project file list for `@`-mention completion, refreshed lazily so
+    /// typing `@` doesn't walk the filesystem on every keystroke.
+    pub mention_files: Vec<String>,
+    pub mention_files_at: Option<std::time::Instant>,
+
     pub layout: PanelLayout,
     pub(crate) api: Option<ApiClient>,
 }
@@ -158,11 +187,13 @@ impl App {
             "" => None,
             e => Some(e.to_string()),
         };
+        let (spec_tx, spec_rx) = mpsc::channel(64);
         let mut app = Self {
             config,
             keymap,
             sessions: SessionManager::load(),
             chat: ChatState::new(),
+            doc_cache: crate::render::chat::DocCache::default(),
             vim: VimMode::Normal,
             input: InputBuffer::default(),
             command: String::new(),
@@ -173,6 +204,7 @@ impl App {
             input_draft: String::new(),
             overlay: Overlay::None,
             mention: Mention::default(),
+            pastes: Vec::new(),
             models,
             model_idx,
             attachment: None,
@@ -201,6 +233,14 @@ impl App {
             agent_queue: std::collections::VecDeque::new(),
             agent_tool_rx: None,
             models_rx: Some(models_rx),
+            spec_results: std::collections::HashMap::new(),
+            spec_dispatched: std::collections::HashSet::new(),
+            spec_epoch: 0,
+            cut_stream: None,
+            spec_tx,
+            spec_rx,
+            mention_files: Vec::new(),
+            mention_files_at: None,
             layout: PanelLayout::default(),
             api: Some(api),
         };
@@ -299,9 +339,10 @@ impl App {
     }
 
     fn refresh_mention_matches(&mut self) {
-        let files = find_project_files(4000);
+        self.ensure_mention_files();
         let q = self.mention.query.to_lowercase();
-        let mut scored: Vec<(usize, &String)> = files
+        let mut scored: Vec<(usize, &String)> = self
+            .mention_files
             .iter()
             .filter_map(|f| fuzzy_score(&f.to_lowercase(), &q).map(|s| (s, f)))
             .collect();
@@ -309,6 +350,20 @@ impl App {
         self.mention.matches = scored.into_iter().take(50).map(|(_, f)| f.clone()).collect();
         if self.mention.selected >= self.mention.matches.len() {
             self.mention.selected = 0;
+        }
+    }
+
+    /// Refresh the cached project file list if it's missing or older than ~5s, so
+    /// `@`-mention completion filters an in-memory list instead of walking the
+    /// filesystem on every keystroke.
+    fn ensure_mention_files(&mut self) {
+        let stale = self
+            .mention_files_at
+            .map(|t| t.elapsed() > std::time::Duration::from_secs(5))
+            .unwrap_or(true);
+        if stale {
+            self.mention_files = find_project_files(4000);
+            self.mention_files_at = Some(std::time::Instant::now());
         }
     }
 

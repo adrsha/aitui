@@ -37,23 +37,39 @@ fn run(
     app: &mut app::App,
     _rt: &tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
+    // Draw only when something changed, instead of spinning at ~250fps. `dirty`
+    // starts true so the first frame always draws.
+    let mut dirty = true;
     loop {
+        // Animations (streaming spinner, "working" indicator) need periodic
+        // redraws even without new events; a busy state forces a fast repaint.
+        let animating = !app.streams.is_empty() || app.is_busy();
+
         // ── 1. Render (ui::render owns layout + chat-doc sync) ───────────
-        terminal.draw(|f| ui::render(f, app))?;
+        if dirty || animating {
+            terminal.draw(|f| ui::render(f, app))?;
+            dirty = false;
+        }
 
         // ── 1b. Pending external program: suspend TUI, run it, restore ───
         if let Some(ext) = app.pending_external.take() {
             run_external(terminal, ext)?;
             app.set_status("Back in AiTUI");
             app.touch();
+            dirty = true;
             continue;
         }
 
         // ── 2. Poll crossterm events ────────────────────────────────────
-        if crossterm::event::poll(Duration::from_millis(16))? {
+        // Poll fast while animating (smooth spinner), slow when idle (low CPU).
+        let timeout = if animating { 33 } else { 250 };
+        if crossterm::event::poll(Duration::from_millis(timeout))? {
             let event = crossterm::event::read()?;
             let actions = input::handler::handle_event(app, event);
-            dispatch(app, actions);
+            if !actions.is_empty() {
+                dispatch(app, actions);
+            }
+            dirty = true; // an event may move the cursor / selection even with no action
         }
 
         // ── 3. Drain model fetch channel ─────────────────────────────────
@@ -62,6 +78,7 @@ fn run(
                 Ok(Ok(models)) => {
                     dispatch(app, vec![Action::ModelsLoaded(models)]);
                     app.models_rx = None;
+                    dirty = true;
                 }
                 Ok(Err(_)) => { app.models_rx = None; }
                 Err(_) => {}
@@ -90,6 +107,7 @@ fn run(
             }
             if !actions.is_empty() {
                 dispatch(app, actions);
+                dirty = true;
             }
         }
 
@@ -99,9 +117,23 @@ fn run(
                 Ok(result) => {
                     dispatch(app, vec![Action::AgentToolResult(result)]);
                     app.agent_tool_rx = None;
+                    dirty = true;
                 }
                 Err(_) => {}
             }
+        }
+
+        // ── 5b. Drain speculative (pre-run read-only) tool results ──────
+        while let Ok((epoch, result)) = app.spec_rx.try_recv() {
+            app.store_spec_result(epoch, result);
+        }
+
+        // ── 5c. A stream was cut early (tool call detected) — start its round
+        // now, on a clean pass, so any leftover tokens from the cut stream have
+        // already been drained (and no-op'd) before the next stream begins.
+        if let Some(sid) = app.cut_stream.take() {
+            dispatch(app, vec![Action::StartAgentRound(sid)]);
+            dirty = true;
         }
 
         // ── 6. Check quit flag ─────────────────────────────────────────

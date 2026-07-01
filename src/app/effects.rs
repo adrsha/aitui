@@ -5,14 +5,14 @@
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-use crate::agent::{self, Permission, ToolCall, ToolResult};
+use crate::agent::{self, Permission, ToolCall, ToolKind, ToolResult};
 use crate::api::models::MessageContent;
 use crate::api::{ChatMessage, ChatRequest};
 use crate::app::action::Action;
 use crate::app::overlay::{Overlay, PermissionRequest};
 use crate::app::state::{expand_mentions, App, MAX_AGENT_ITERATIONS};
 use crate::domain::blocks::{parse_blocks, parse_tool_result};
-use crate::render::document::{build, DocMessage, RenderedLine};
+use crate::render::document::{build, build_message, DocMessage, RenderedLine};
 use crate::render::theme::Theme;
 
 /// Plain display text for a stored message.
@@ -58,9 +58,141 @@ impl App {
     /// Rebuild the chat document if the cache is stale, then keep the cursor valid.
     pub fn sync_chat_doc(&mut self, width: usize, viewport_h: usize) {
         if self.chat.needs_rebuild(self.content_rev, width) {
-            let doc = build_chat_doc(self, width, &self.theme(), self.content_rev);
+            let doc = self.build_chat_doc(width);
             self.chat.set_doc(doc, self.content_rev, width, viewport_h);
         }
+    }
+
+    /// Assemble the chat document, reusing per-message cached rows for every
+    /// message whose content signature is unchanged. Only cache misses (in
+    /// practice: the streaming message, plus anything just appended or toggled)
+    /// pay the parse + highlight + wrap cost. The in-progress streaming partial is
+    /// always rebuilt fresh and never cached.
+    fn build_chat_doc(&mut self, width: usize) -> Vec<RenderedLine> {
+        let theme = self.theme();
+        let show_output = self.show_output;
+
+        // Disjoint field borrows: cache (mut), toggled + sessions (shared).
+        let cache = &mut self.doc_cache;
+        let toggled = &self.chat.toggled;
+        let session = self.sessions.active();
+
+        cache.reset_if_env_changed(width, show_output);
+        cache.truncate(session.messages.len());
+
+        let mut out: Vec<RenderedLine> = Vec::new();
+        for (mi, m) in session.messages.iter().enumerate() {
+            let text = message_text(m);
+            let sig = message_sig(&m.role, &text, toggled, mi);
+            if let Some(rows) = cache.get(mi, sig) {
+                out.extend_from_slice(rows);
+            } else {
+                let blocks = if m.role == "tool" {
+                    vec![parse_tool_result(&text)]
+                } else {
+                    parse_blocks(&text)
+                };
+                let doc_msg = DocMessage { role: m.role.clone(), blocks };
+                // Finalized messages don't animate — pass streaming=false so a
+                // finished thinking block isn't spinning (and stays cacheable).
+                let rows = build_message(&doc_msg, mi, width, &theme, toggled, show_output, false);
+                out.extend_from_slice(&rows);
+                cache.put(mi, sig, rows);
+            }
+        }
+
+        // The live streaming partial: rebuilt every frame (its text changes each
+        // token), appended after the cached history, with the spinner animating.
+        if let Some(partial) = session.streaming_display() {
+            let mi = session.messages.len();
+            let doc_msg = DocMessage { role: "assistant".into(), blocks: parse_blocks(&partial) };
+            out.extend(build_message(&doc_msg, mi, width, &theme, toggled, show_output, true));
+        }
+
+        if out.is_empty() {
+            return welcome_doc(&theme);
+        }
+        out
+    }
+
+    // ── Smart paste ─────────────────────────────────────────────────────────
+
+    /// Handle a bracketed paste. Big blobs are written to a file and attached so
+    /// they don't flood the composer; medium blobs are stored and shown as a
+    /// compact `[PASTED#N-…]` chip (expanded to full text on submit); small pastes
+    /// are inserted verbatim.
+    pub fn smart_paste(&mut self, text: String) {
+        // Thresholds. A 12k-char paste is a chip; only very large pastes → file.
+        const FILE_CHARS: usize = 50_000;
+        const CHIP_CHARS: usize = 400;
+        const CHIP_LINES: usize = 5;
+
+        // In the `:` command line there are no chips — insert the (newline-stripped) text.
+        if self.vim == crate::input::vim::VimMode::Command {
+            for c in text.chars().filter(|c| *c != '\n') {
+                self.command.push(c);
+            }
+            return;
+        }
+
+        let lines = text.lines().count().max(1);
+        let chars = text.chars().count();
+
+        if chars >= FILE_CHARS {
+            match write_paste_file(&text) {
+                Ok(path) => {
+                    self.attachment = Some(path);
+                    self.set_status(format!("🖇 Large paste attached as file ({} lines, {} chars)", lines, chars));
+                }
+                Err(e) => {
+                    self.set_status(format!("Paste file error: {} — pasted inline", e));
+                    self.input.paste(&text);
+                    self.update_mention();
+                }
+            }
+        } else if chars >= CHIP_CHARS || lines >= CHIP_LINES {
+            self.pastes.push(text);
+            let n = self.pastes.len();
+            let token = format!("[PASTED#{}-{}lines-{}chars]", n, lines, chars);
+            self.input.paste(&token);
+            self.set_status(format!("Pasted {} lines, {} chars — expands on send", lines, chars));
+        } else {
+            self.input.paste(&text);
+            self.update_mention();
+        }
+    }
+
+    /// Replace every `[PASTED#N-…]` chip in `text` with its stored blob, then clear
+    /// the paste store (the turn consumes them). Unknown/edited chips are left as-is.
+    fn expand_pastes(&mut self, text: String) -> String {
+        if self.pastes.is_empty() || !text.contains("[PASTED#") {
+            self.pastes.clear();
+            return text;
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text.as_str();
+        while let Some(start) = rest.find("[PASTED#") {
+            out.push_str(&rest[..start]);
+            let after = &rest[start..];
+            let Some(end) = after.find(']') else {
+                out.push_str(after);
+                rest = "";
+                break;
+            };
+            let token = &after[..=end]; // "[PASTED#N-…]"
+            let n: Option<usize> = token
+                .strip_prefix("[PASTED#")
+                .and_then(|s| s.split('-').next())
+                .and_then(|d| d.parse().ok());
+            match n.and_then(|n| self.pastes.get(n.saturating_sub(1))) {
+                Some(blob) => out.push_str(blob),
+                None => out.push_str(token), // unknown index → leave the chip text
+            }
+            rest = &after[end + 1..];
+        }
+        out.push_str(rest);
+        self.pastes.clear();
+        out
     }
 
     // ── Submission ──────────────────────────────────────────────────────────
@@ -81,7 +213,9 @@ impl App {
 
         self.agent_iterations = 0;
         self.mention.reset();
+        // Restore any `[PASTED#N-…]` chips to their full text before sending.
         let text = self.input.take();
+        let text = self.expand_pastes(text);
         let attachment = self.attachment.take();
 
         if text.trim().is_empty() && attachment.is_none() {
@@ -127,6 +261,11 @@ impl App {
     }
 
     fn begin_stream_for(&mut self, sid: usize) -> Option<Action> {
+        // Fresh turn: bump the epoch (so any speculative result still in flight from
+        // the previous turn is dropped, not served stale) and drop its state.
+        self.spec_epoch = self.spec_epoch.wrapping_add(1);
+        self.spec_dispatched.clear();
+        self.spec_results.clear();
         let Some(session) = self.sessions.by_id_mut(sid) else { return None };
         session.begin_assistant_stream();
         // The animated status-bar spinner ("working") is the generating indicator
@@ -137,8 +276,43 @@ impl App {
         }
         self.touch();
 
+        // Image-generation models use a different endpoint (chat completions 503s
+        // them). Route to /v1/images/generations with the last user message as the
+        // prompt; the result comes back over the same stream channel.
+        let model = self.current_model().to_string();
+        if crate::api::is_image_model(&model) && !self.mock {
+            let prompt = self
+                .sessions
+                .by_id(sid)
+                .and_then(|s| s.messages.iter().rev().find(|m| m.role == "user"))
+                .map(message_text)
+                .unwrap_or_default();
+            if prompt.trim().is_empty() {
+                if let Some(s) = self.sessions.by_id_mut(sid) { s.finalize_assistant_stream(); }
+                self.set_status("Nothing to generate — describe the image first.");
+                return None;
+            }
+            self.set_status("🖼 Generating image…");
+            return match self.api.as_ref() {
+                Some(client) => match client.generate_image(&model, &prompt) {
+                    Ok(rx) => Some(Action::AttachStream(sid, rx)),
+                    Err(e) => {
+                        if let Some(s) = self.sessions.by_id_mut(sid) { s.finalize_assistant_stream(); }
+                        self.set_status(format!("Image request failed: {}", e));
+                        None
+                    }
+                },
+                None => {
+                    if let Some(s) = self.sessions.by_id_mut(sid) { s.finalize_assistant_stream(); }
+                    self.set_status("No API client");
+                    None
+                }
+            };
+        }
+
         // Prepend active skills as system messages (personas / house styles).
-        let mut messages = self.sessions.by_id(sid).map(|s| s.api_messages()).unwrap_or_default();
+        let native = self.config.api.native_tools;
+        let mut messages = self.sessions.by_id(sid).map(|s| s.api_messages(native)).unwrap_or_default();
         for skill in self.skills.iter().rev().filter(|s| s.active) {
             messages.insert(0, ChatMessage::system(skill.body.clone()));
         }
@@ -147,8 +321,16 @@ impl App {
         if !sys.is_empty() {
             messages.insert(0, ChatMessage::system(sys.to_string()));
         }
-        let request = ChatRequest::new(self.current_model(), messages)
+        let mut request = ChatRequest::new(self.current_model(), messages)
             .with_reasoning_effort(self.reasoning_effort.clone());
+        // Native function-calling: send the tool schemas so the model returns
+        // structured tool_calls instead of ```tool fences (agent turns only).
+        if native {
+            let agent = self.sessions.by_id(sid).map(|s| s.agent_mode).unwrap_or(false);
+            if agent {
+                request = request.with_tools(crate::agent::tool_schemas());
+            }
+        }
 
         // Offline mock backend: scripted, tool-driving reply, no network.
         if self.mock {
@@ -306,7 +488,72 @@ impl App {
         }
     }
 
+    /// While an agent reply is streaming, pre-run any *complete*, side-effect-free
+    /// read-only tool block it has emitted so far, in the background, so the result
+    /// is already sitting in `spec_results` the moment the turn finishes and the
+    /// tool round starts. Never touches tools that mutate or run commands.
+    pub fn speculate_read_tools(&mut self, sid: usize) {
+        let (partial, cwd) = {
+            let Some(s) = self.sessions.by_id(sid) else { return };
+            if !s.agent_mode { return; }
+            let Some(p) = s.streaming_display() else { return };
+            (p, s.cwd.clone())
+        };
+        // No runtime (unit tests) → nothing to spawn onto; skip speculation.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let cwd = cwd.or_else(|| std::env::current_dir().ok()).unwrap_or_else(|| PathBuf::from("."));
+        let epoch = self.spec_epoch;
+        for call in crate::agent::parser::extract_tool_calls(&partial) {
+            if !is_speculatable(&call) {
+                continue;
+            }
+            let sig = spec_sig(&call);
+            // insert() returns false if already dispatched this turn → skip dup work.
+            if !self.spec_dispatched.insert(sig) {
+                continue;
+            }
+            let tx = self.spec_tx.clone();
+            let cwd = cwd.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = tx.blocking_send((epoch, agent::execute(call, &cwd)));
+            });
+        }
+    }
+
+    /// Whether the streaming reply for `sid` should be cut now: it's an agent-mode
+    /// session, still streaming, and its partial already contains at least one
+    /// complete `​```tool​```` call. Cutting here stops the model from generating a
+    /// pile of redundant calls it can't get results for until the turn ends.
+    pub fn should_cut_stream(&self, sid: usize) -> bool {
+        let Some(s) = self.sessions.by_id(sid) else { return false };
+        if !s.agent_mode || !s.is_streaming() {
+            return false;
+        }
+        match s.streaming_display() {
+            Some(partial) => !crate::agent::parser::extract_tool_calls(&partial).is_empty(),
+            None => false,
+        }
+    }
+
+    /// Stash a speculative tool result, keyed so `execute_tool` can find it when the
+    /// model's committed tool call matches. Results from a stale turn (epoch no
+    /// longer current) are dropped so a late arrival can't be served as fresh.
+    pub fn store_spec_result(&mut self, epoch: u64, result: ToolResult) {
+        if epoch == self.spec_epoch {
+            self.spec_results.insert(spec_sig(&result.call), result);
+        }
+    }
+
     fn execute_tool(&mut self, call: ToolCall) -> Option<Action> {
+        // If this exact call was pre-run while the reply streamed, use that result
+        // instantly instead of spawning the work again.
+        if let Some(result) = self.spec_results.remove(&spec_sig(&call)) {
+            self.set_status(format!("⚡ {}", call.summary()));
+            self.record_tool_result(result);
+            return self.process_next_tool();
+        }
         self.set_status(format!("⚙ Running: {}", call.summary()));
         // Run in the owning session's working directory (the process cwd tracks the
         // active session, which may differ when a background session runs tools).
@@ -398,29 +645,53 @@ fn build_user_message(text: &str, attachment: Option<&PathBuf>, app: &mut App) -
     }
 }
 
-/// Build the full chat document (blocks → rows) from the current session.
-fn build_chat_doc(app: &App, width: usize, theme: &Theme, _rev: u64) -> Vec<RenderedLine> {
-    let session = app.sessions.active();
-    let mut docs: Vec<DocMessage> = Vec::with_capacity(session.messages.len() + 1);
+/// Write a large paste to `./aitui-pastes/paste-<ts>.txt` and return its path, so
+/// it can be attached instead of flooding the composer.
+fn write_paste_file(text: &str) -> anyhow::Result<PathBuf> {
+    let dir = PathBuf::from("aitui-pastes");
+    std::fs::create_dir_all(&dir)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("paste-{}.txt", stamp));
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
 
-    for m in &session.messages {
-        let blocks = if m.role == "tool" {
-            vec![parse_tool_result(&message_text(m))]
-        } else {
-            parse_blocks(&message_text(m))
-        };
-        docs.push(DocMessage { role: m.role.clone(), blocks });
-    }
+/// Whether a tool call is safe to pre-run speculatively: local, read-only, no
+/// side effects. Deliberately excludes network reads (web fetch/search) and
+/// anything that mutates state or runs commands.
+fn is_speculatable(call: &ToolCall) -> bool {
+    matches!(
+        call.kind(),
+        Some(ToolKind::ReadFile | ToolKind::ListDir | ToolKind::SearchFiles)
+    )
+}
 
-    if let Some(partial) = session.streaming_display() {
-        docs.push(DocMessage { role: "assistant".into(), blocks: parse_blocks(&partial) });
-    }
+/// Signature of a tool call by name + arguments, so a speculatively-run result can
+/// be matched to the model's committed call regardless of any `id` difference.
+fn spec_sig(call: &ToolCall) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    call.name.hash(&mut h);
+    call.args.to_string().hash(&mut h);
+    h.finish()
+}
 
-    if docs.is_empty() {
-        return welcome_doc(theme);
-    }
-    let streaming = session.is_streaming();
-    build(&docs, width, theme, &app.chat.toggled, app.show_output, streaming)
+/// Content signature for one message: role + text + the block indices the user
+/// has toggled for this message. Width and show-output are folded into the cache
+/// key globally (see `DocCache::reset_if_env_changed`), so they're not hashed here.
+fn message_sig(role: &str, text: &str, toggled: &std::collections::HashSet<(usize, usize)>, mi: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    role.hash(&mut h);
+    text.hash(&mut h);
+    // Only this message's toggles matter; hash them in a stable order.
+    let mut bis: Vec<usize> = toggled.iter().filter(|(m, _)| *m == mi).map(|(_, b)| *b).collect();
+    bis.sort_unstable();
+    bis.hash(&mut h);
+    h.finish()
 }
 
 /// The empty-state splash, shown when there are no messages.

@@ -29,8 +29,9 @@ This is the definition of done. A change isn't finished until it meets these.
 ## Performance
 
 - Never block the event loop on I/O. Network and tool execution run on tasks.
-- Keep the streaming path cheap: only rebuild the chat document when
-  `content_rev` or width changes (the existing cache contract).
+- Keep the streaming path cheap: rebuild the chat document only when `content_rev`
+  or width changes, and rebuild it **per message** (`doc_cache`) so a streamed token
+  re-renders only the streaming message, not the whole transcript (D-013).
 - Bounded memory: cap tool output, truncate huge files, don't grow buffers
   unboundedly.
 - Measure before optimizing (Phase 6). Don't trade clarity for speed without a

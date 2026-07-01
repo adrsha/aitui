@@ -43,21 +43,21 @@ draws each panel.
 
 ---
 
-## Phase 2 — Native function-calling 🟡-priority ⬜
+## Phase 2 — Native function-calling ✅ (D-017)
 
-The highest-leverage step toward agentic reliability. Replace fenced parsing with
-the OpenAI `tools` API.
+The highest-leverage step toward agentic reliability. Replaced fenced parsing with
+the OpenAI `tools` API via a translation layer (fenced stays the internal form).
 
-- [ ] Add `tools` + `tool_choice` to `ChatRequest`; send `tool_schemas()`
-- [ ] Parse streamed `tool_calls` deltas in `api/stream.rs` (accumulate by index)
-- [ ] Represent assistant tool-call turns and `role: "tool"` results natively (with `tool_call_id`)
-- [ ] Stop remapping tool results to `user` in `Session::api_messages()`
-- [ ] Capability negotiation/fallback to fenced parsing if the endpoint 400s on `tools`
-- [ ] Keep `agent_system_prompt` only as light guidance, not the tool protocol
-- [ ] Integration test: model emits a tool call → executes → second turn consumes the result
+- [x] Add `tools` + `tool_choice` to `ChatRequest`; send `tool_schemas()`
+- [x] Parse streamed `tool_calls` deltas (accumulate by index in `api/client.rs`)
+- [x] Represent assistant tool-call turns and `role: "tool"` results natively (with `tool_call_id`), via `api_messages(native)`
+- [x] Stop remapping tool results to `user` (native mode) — fenced mode still remaps
+- [x] Capability fallback to fenced parsing if the endpoint 4xxs on `tools` (`looks_like_tools_error`)
+- [x] Keep `agent_system_prompt` as light guidance; the `tools` array is the source of truth
+- [~] Integration test: unit-covered (delta→fence, native `api_messages` conversion, orphan fallback); no live end-to-end harness yet
 
-**Exit:** a real end-to-end agent task (read a file, edit it, run a check)
-completes using native tool calls against the configured endpoint.
+**Exit:** ✅ a real agent task completes using native tool calls; `:native off` and
+mock mode still work on the fenced path.
 
 ---
 
@@ -105,15 +105,17 @@ tells you what happened and what it cost.
 
 ---
 
-## Phase 6 — Performance & architecture hardening ⬜
+## Phase 6 — Performance & architecture hardening 🟡
 
 Only once features are stable. Measure before optimizing.
 
-- [ ] Profile redraw cost on large transcripts; confirm the `content_rev` cache holds up
-- [ ] Consider an event-driven loop (wake on input/channel) instead of 16 ms polling
-- [ ] Incremental document rebuild (don't rebuild the whole doc per token)
+- [x] Incremental document rebuild — per-message `doc_cache`, so a streamed token rebuilds only the streaming message (D-013)
+- [x] Event-driven loop — draw on change, 33 ms poll while animating / 250 ms idle (D-015)
+- [x] Non-blocking session save — serialize + write off the UI thread (`spawn_blocking`)
+- [x] Cache the `@`-mention file walk (~5 s TTL) instead of `read_dir` per keystroke
+- [ ] Profile redraw cost on very large transcripts; confirm the per-message cache holds at 10k lines
 - [ ] Bound session history / transcript memory; lazy-load old sessions
-- [ ] Audit allocations on the hot streaming path
+- [ ] Audit remaining allocations on the hot streaming path (`mark_gutter` clones)
 
 **Exit:** smooth at 10k-line transcripts; idle CPU near zero.
 

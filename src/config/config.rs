@@ -32,6 +32,11 @@ pub struct ApiConfig {
     /// OpenAI `reasoning_effort` request field.
     #[serde(default)]
     pub reasoning_effort: String,
+    /// Use native OpenAI function-calling (`tools`/`tool_calls`) instead of parsing
+    /// ```` ```tool ```` fences from the reply. Toggle at runtime with `:native`;
+    /// auto-disabled if the endpoint rejects the `tools` field. Default on.
+    #[serde(default = "default_true")]
+    pub native_tools: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +218,7 @@ impl Default for Config {
                 mock: false,
                 system_prompt: String::new(),
                 reasoning_effort: String::new(),
+                native_tools: true,
             },
             ui: UiConfig::default(),
             keybinds: KeybindConfig::default(),

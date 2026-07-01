@@ -230,6 +230,7 @@ pub fn slash_commands() -> &'static [SlashCommand] {
         SlashCommand { name: "shell", icon: "▮", desc: "Drop into a shell, then return", run: "shell" },
         SlashCommand { name: "rename", icon: "✎", desc: "Rename the current session", run: "rename " },
         SlashCommand { name: "clear", icon: "⌫", desc: "Clear the conversation", run: "clear" },
+        SlashCommand { name: "setup", icon: "🔑", desc: "Set API endpoint URL + key", run: "setup" },
         SlashCommand { name: "settings", icon: "⚙", desc: "Open settings", run: "settings" },
         SlashCommand { name: "system", icon: "✦", desc: "Edit the system prompt", run: "settings" },
         SlashCommand { name: "help", icon: "?", desc: "Keybinding help", run: "help" },
@@ -356,6 +357,35 @@ impl Startup {
     }
 }
 
+/// Prompt to enter the API endpoint URL + key, shown when a request fails because
+/// the endpoint is missing/relative (or via `:setup`). On confirm, the values are
+/// saved to config and the API client is rebuilt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApiSetup {
+    pub endpoint: String,
+    pub api_key: String,
+    /// Which field is focused: 0 = endpoint, 1 = api key.
+    pub field: usize,
+}
+
+impl ApiSetup {
+    pub fn new(endpoint: String, api_key: String) -> Self {
+        Self { endpoint, api_key, field: 0 }
+    }
+    pub fn next_field(&mut self) {
+        self.field = (self.field + 1) % 2;
+    }
+    fn current_mut(&mut self) -> &mut String {
+        if self.field == 0 { &mut self.endpoint } else { &mut self.api_key }
+    }
+    pub fn push(&mut self, c: char) {
+        self.current_mut().push(c);
+    }
+    pub fn backspace(&mut self) {
+        self.current_mut().pop();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Overlay {
     None,
@@ -365,6 +395,8 @@ pub enum Overlay {
     Palette(Palette),
     Settings(Settings),
     Permission(PermissionRequest),
+    /// Enter API endpoint + key (on a connection/base-URL failure, or `:setup`).
+    ApiSetup(ApiSetup),
     /// A transient informational dialog (title + body). Dismissed by any key.
     Notice { title: String, body: String },
 }

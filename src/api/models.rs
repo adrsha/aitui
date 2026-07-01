@@ -5,6 +5,36 @@ use serde::{Deserialize, Serialize};
 pub struct ChatMessage {
     pub role: String,
     pub content: MessageContent,
+    /// Native function-calling: an assistant turn's structured tool calls. Only
+    /// set on the wire (built by `api_messages` in native mode); stored sessions
+    /// keep tool calls as fenced text, so this defaults to None on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ApiToolCall>>,
+    /// Native function-calling: the id of the call this `role:"tool"` message answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// A structured tool call in the OpenAI `tools` protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String, // always "function"
+    pub function: ApiFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiFunction {
+    pub name: String,
+    /// JSON-encoded arguments **string** (per the OpenAI spec), not an object.
+    pub arguments: String,
+}
+
+impl ApiToolCall {
+    pub fn function(id: impl Into<String>, name: impl Into<String>, arguments: impl Into<String>) -> Self {
+        Self { id: id.into(), kind: "function".into(), function: ApiFunction { name: name.into(), arguments: arguments.into() } }
+    }
 }
 
 /// Content can be a plain string or a list of parts (for multimodal).
@@ -30,35 +60,28 @@ pub struct ImageUrl {
 }
 
 impl ChatMessage {
+    /// A plain text message with no native tool metadata.
+    fn plain(role: &str, content: MessageContent) -> Self {
+        Self { role: role.to_string(), content, tool_calls: None, tool_call_id: None }
+    }
+
     pub fn user(text: impl Into<String>) -> Self {
-        Self {
-            role: "user".to_string(),
-            content: MessageContent::Text(text.into()),
-        }
+        Self::plain("user", MessageContent::Text(text.into()))
     }
 
     pub fn assistant(text: impl Into<String>) -> Self {
-        Self {
-            role: "assistant".to_string(),
-            content: MessageContent::Text(text.into()),
-        }
+        Self::plain("assistant", MessageContent::Text(text.into()))
     }
 
     pub fn system(text: impl Into<String>) -> Self {
-        Self {
-            role: "system".to_string(),
-            content: MessageContent::Text(text.into()),
-        }
+        Self::plain("system", MessageContent::Text(text.into()))
     }
 
     /// A tool-result message. Stored with role "tool" for distinct rendering;
-    /// `Session::api_messages` re-maps it to "user" when sending to the API so
-    /// OpenAI-compatible endpoints accept it.
+    /// `Session::api_messages` re-maps it (to "user" in fenced mode, or to a native
+    /// `role:"tool"` with `tool_call_id` in native mode) when sending to the API.
     pub fn tool(text: impl Into<String>) -> Self {
-        Self {
-            role: "tool".to_string(),
-            content: MessageContent::Text(text.into()),
-        }
+        Self::plain("tool", MessageContent::Text(text.into()))
     }
 
     pub fn user_with_image(text: &str, base64_data: &str, mime_type: &str) -> Self {
@@ -71,12 +94,8 @@ impl ChatMessage {
                 text: text.to_string(),
             },
         ];
-        Self {
-            role: "user".to_string(),
-            content: MessageContent::Parts(parts),
-        }
+        Self::plain("user", MessageContent::Parts(parts))
     }
-
 }
 
 /// The request body sent to the OpenAI-compatible endpoint.
@@ -95,6 +114,12 @@ pub struct ChatRequest {
     /// for GPT-5 / o-series). Omitted when None so non-reasoning models are fine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Native function-calling tool schemas (`agent::tool_schemas()`). Omitted for
+    /// non-agent turns / endpoints without tool support.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -111,6 +136,8 @@ impl ChatRequest {
             max_tokens: None,
             stream_options: Some(StreamOptions { include_usage: true }),
             reasoning_effort: None,
+            tools: None,
+            tool_choice: None,
         }
     }
 
@@ -119,6 +146,53 @@ impl ChatRequest {
         self.reasoning_effort = effort;
         self
     }
+
+    /// Attach native function-calling tool schemas with `tool_choice:"auto"`.
+    pub fn with_tools(mut self, schemas: serde_json::Value) -> Self {
+        self.tools = Some(schemas);
+        self.tool_choice = Some(serde_json::Value::String("auto".to_string()));
+        self
+    }
+}
+
+/// Whether a model id is an image-generation model, which must be sent to
+/// `/v1/images/generations` rather than `/v1/chat/completions`.
+pub fn is_image_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.contains("gpt-image") || m.starts_with("dall-e") || m.contains("image-generation")
+}
+
+/// Request body for `/v1/images/generations`. `response_format` is intentionally
+/// omitted: `gpt-image-*` always returns base64 and rejects the field, while
+/// `dall-e` defaults to a URL — the response parser handles both.
+#[derive(Debug, Serialize)]
+pub struct ImageRequest {
+    pub model: String,
+    pub prompt: String,
+    pub n: u32,
+    pub size: String,
+}
+
+impl ImageRequest {
+    pub fn new(model: &str, prompt: &str) -> Self {
+        Self { model: model.to_string(), prompt: prompt.to_string(), n: 1, size: "1024x1024".to_string() }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImageResponse {
+    #[serde(default)]
+    pub data: Vec<ImageData>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImageData {
+    #[serde(default)]
+    pub b64_json: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub revised_prompt: Option<String>,
 }
 
 /// Token accounting reported by the endpoint at the end of a stream.
@@ -155,4 +229,43 @@ pub struct DeltaContent {
     pub reasoning: Option<String>,
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// Native function-calling: tool-call fragments, streamed and accumulated by index.
+    #[serde(default)]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+/// One streamed fragment of a native tool call. `id`/`function.name` arrive on the
+/// first fragment; `function.arguments` is streamed in pieces to be concatenated.
+#[derive(Debug, Deserialize)]
+pub struct ToolCallDelta {
+    #[serde(default)]
+    pub index: usize,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub function: Option<FnDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FnDelta {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_models_detected_chat_models_not() {
+        assert!(is_image_model("gpt-image-1"));
+        assert!(is_image_model("gpt-image-2"));
+        assert!(is_image_model("dall-e-3"));
+        assert!(is_image_model("DALL-E-2"));
+        assert!(!is_image_model("gpt-4o"));
+        assert!(!is_image_model("claude-sonnet-4-6"));
+        assert!(!is_image_model("gemini-2.5-flash"));
+    }
 }

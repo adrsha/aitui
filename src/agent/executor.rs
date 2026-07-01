@@ -241,7 +241,18 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
             let url = call.args.get("url").and_then(|v| v.as_str())
                 .ok_or("Missing 'url' argument")?;
             let body = http_get_text(url)?;
-            Ok(truncate(strip_html(&body), 8192))
+            let text = truncate(strip_html(&body), 8192);
+            if text.trim().is_empty() {
+                // A blank "(ok)" reads as success to the model and it retries forever.
+                // Say plainly that there was no readable text.
+                Ok(format!(
+                    "Fetched {} but found no readable text — likely a JavaScript-rendered \
+                     page. Use web_search to find a direct article URL, or try a different page.",
+                    url
+                ))
+            } else {
+                Ok(text)
+            }
         }
 
         "download_file" => {
@@ -340,44 +351,169 @@ fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
     })
 }
 
-/// Web search via DuckDuckGo's keyless Instant-Answer JSON API. Returns the
-/// abstract plus related-topic snippets. (No API key required.)
+/// Web search via DuckDuckGo's keyless HTML endpoint, which returns real result
+/// links + snippets (the Instant-Answer JSON API only has encyclopedia-style
+/// abstracts, so it returns nothing for news / most queries). No API key needed.
 fn web_search(query: &str) -> Result<String, String> {
     let client = http_client()?;
-    let url = format!(
-        "https://api.duckduckgo.com/?q={}&format=json&no_html=1&no_redirect=1",
-        urlencode(query)
-    );
-    let json: serde_json::Value = block_on(async move {
-        let resp = client.get(&url).send().await.map_err(|e| format!("Search failed: {}", e))?;
-        resp.json().await.map_err(|e| format!("Parse failed: {}", e))
+    let url = format!("https://html.duckduckgo.com/html/?q={}", urlencode(query));
+    let html = block_on(async move {
+        // A browser-ish UA + Accept-Language; the html endpoint returns a blank
+        // page to unknown agents.
+        let resp = client
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:123.0) Gecko/20100101 Firefox/123.0")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .send()
+            .await
+            .map_err(|e| format!("Search failed: {}", e))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| format!("Read body failed: {}", e))?;
+        if !status.is_success() {
+            return Err(format!("Search HTTP {}: {}", status, truncate(text, 300)));
+        }
+        Ok(text)
     })?;
 
+    let results = parse_ddg_results(&html);
+    if results.is_empty() {
+        return Ok(format!(
+            "No results for '{}'. Try different search terms, or web_fetch a specific URL.",
+            query
+        ));
+    }
+    let mut out = vec![format!("Search results for '{}':", query)];
+    for (i, (title, link, snippet)) in results.iter().take(8).enumerate() {
+        if snippet.is_empty() {
+            out.push(format!("{}. {}\n   {}", i + 1, title, link));
+        } else {
+            out.push(format!("{}. {}\n   {}\n   {}", i + 1, title, link, snippet));
+        }
+    }
+    Ok(truncate(out.join("\n\n"), 8192))
+}
+
+/// Parse DuckDuckGo HTML search results into `(title, url, snippet)` tuples.
+/// Result links carry class `result__a` (href is a `/l/?uddg=` redirect we
+/// decode); snippets carry class `result__snippet`.
+fn parse_ddg_results(html: &str) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
-    if let Some(h) = json.get("Heading").and_then(|v| v.as_str()) {
-        if !h.is_empty() { out.push(format!("# {}", h)); }
-    }
-    if let Some(a) = json.get("AbstractText").and_then(|v| v.as_str()) {
-        if !a.is_empty() {
-            out.push(a.to_string());
-            if let Some(u) = json.get("AbstractURL").and_then(|v| v.as_str()) {
-                if !u.is_empty() { out.push(format!("↳ {}", u)); }
+    let mut pos = 0;
+    while let Some(rel) = html[pos..].find("result__a") {
+        let a_idx = pos + rel;
+        let tag_start = html[..a_idx].rfind("<a").unwrap_or(a_idx);
+        let href = extract_attr(&html[tag_start..], "href").unwrap_or_default();
+        let link = decode_uddg(&href);
+
+        // Inner text of the anchor is the title.
+        let mut after = a_idx;
+        let mut title = String::new();
+        if let Some(gt) = html[tag_start..].find('>') {
+            let start = tag_start + gt + 1;
+            if let Some(close) = html[start..].find("</a>") {
+                title = strip_tags(&html[start..start + close]);
+                after = start + close;
             }
         }
-    }
-    if let Some(topics) = json.get("RelatedTopics").and_then(|v| v.as_array()) {
-        for t in topics.iter().take(8) {
-            if let Some(text) = t.get("Text").and_then(|v| v.as_str()) {
-                let url = t.get("FirstURL").and_then(|v| v.as_str()).unwrap_or("");
-                out.push(format!("• {}{}", text, if url.is_empty() { String::new() } else { format!("  ({})", url) }));
+
+        // The snippet anchor follows shortly after.
+        let mut snippet = String::new();
+        if let Some(srel) = html[after..].find("result__snippet") {
+            let s_idx = after + srel;
+            if let Some(gt) = html[s_idx..].find('>') {
+                let start = s_idx + gt + 1;
+                if let Some(close) = html[start..].find("</a>") {
+                    snippet = strip_tags(&html[start..start + close]);
+                }
             }
         }
+
+        if !title.is_empty() && !link.is_empty() {
+            out.push((title, link, snippet));
+        }
+        pos = after + 4;
+        if out.len() >= 20 {
+            break;
+        }
     }
-    if out.is_empty() {
-        Ok(format!("No instant-answer results for '{}'. Try web_fetch on a specific URL.", query))
+    out
+}
+
+/// Read an HTML attribute value (`name="..."`) from the start of a tag.
+fn extract_attr(tag: &str, name: &str) -> Option<String> {
+    let pat = format!("{}=\"", name);
+    let start = tag.find(&pat)? + pat.len();
+    let end = tag[start..].find('"')? + start;
+    Some(tag[start..end].to_string())
+}
+
+/// Decode a DuckDuckGo result href (`//duckduckgo.com/l/?uddg=<pct-url>&…`) to the
+/// real destination URL.
+fn decode_uddg(href: &str) -> String {
+    if let Some(idx) = href.find("uddg=") {
+        let rest = &href[idx + 5..];
+        let enc = rest.split('&').next().unwrap_or(rest);
+        return pct_decode(enc);
+    }
+    if href.starts_with("http") {
+        href.to_string()
+    } else if let Some(stripped) = href.strip_prefix("//") {
+        format!("https://{}", stripped)
     } else {
-        Ok(truncate(out.join("\n"), 8192))
+        href.to_string()
     }
+}
+
+/// Percent-decode a URL-encoded string (also turns `+` into space).
+fn pct_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(b);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// Strip HTML tags from a small fragment, decode a few common entities, and
+/// collapse whitespace — for result titles/snippets.
+fn strip_tags(s: &str) -> String {
+    let mut text = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(c),
+            _ => {}
+        }
+    }
+    let text = text
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'");
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Minimal percent-encoding for query strings (RFC 3986 unreserved kept).
@@ -485,6 +621,37 @@ mod tests {
 
     fn make_call(name: &str, args: serde_json::Value) -> ToolCall {
         ToolCall { name: name.into(), args, id: None }
+    }
+
+    #[test]
+    fn pct_decode_and_uddg() {
+        assert_eq!(pct_decode("https%3A%2F%2Fa.com%2Fx"), "https://a.com/x");
+        assert_eq!(pct_decode("a+b%20c"), "a b c");
+        assert_eq!(
+            decode_uddg("//duckduckgo.com/l/?uddg=https%3A%2F%2Fnews.com%2Fgame&rut=abc"),
+            "https://news.com/game"
+        );
+        assert_eq!(decode_uddg("https://direct.com/x"), "https://direct.com/x");
+    }
+
+    #[test]
+    fn parse_ddg_results_extracts_title_url_snippet() {
+        let html = r#"
+          <div class="result">
+            <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fespn.com%2Fmatch&rut=z">Match <b>Report</b></a>
+            <a class="result__snippet" href="x">Team A beat Team B 3&#x27;2 last night.</a>
+          </div>"#;
+        let results = parse_ddg_results(html);
+        assert_eq!(results.len(), 1);
+        let (title, url, snippet) = &results[0];
+        assert_eq!(title, "Match Report");
+        assert_eq!(url, "https://espn.com/match");
+        assert_eq!(snippet, "Team A beat Team B 3'2 last night.");
+    }
+
+    #[test]
+    fn parse_ddg_results_empty_on_no_results() {
+        assert!(parse_ddg_results("<html><body>nothing here</body></html>").is_empty());
     }
 
     fn tmp_dir() -> PathBuf {

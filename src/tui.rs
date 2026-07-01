@@ -2,8 +2,8 @@ use std::io::{self, Stdout};
 
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -14,7 +14,10 @@ pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 pub fn init() -> anyhow::Result<Tui> {
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    // Bracketed paste: the terminal hands us a whole paste as one `Event::Paste`
+    // (so a big paste isn't replayed key-by-key), which the smart-paste handler
+    // turns into a file attachment or a compact placeholder chip.
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     // Best-effort: ask the terminal to disambiguate modified keys (so Shift+Enter,
     // Ctrl+Enter, etc. are distinguishable). Terminals that don't support the
     // kitty keyboard protocol silently ignore it; key releases are filtered in
@@ -29,7 +32,7 @@ pub fn init() -> anyhow::Result<Tui> {
 
 pub fn restore() -> anyhow::Result<()> {
     let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     Ok(())
 }

@@ -65,9 +65,12 @@ fn visual_selection_bounds(
 }
 
 pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
-    let panel = Style::default().bg(Color::Indexed(16));
+    let panel = Style::default().bg(Color::Indexed(8));
+    // Breathing room inside the input panel: 2 cols each side, 1 row top/bottom.
+    // The layout allots `input_height + 2` rows, so the vertical padding consumes
+    // that slack and the text area stays `input_height` tall.
     let block = Block::default()
-        .padding(Padding::horizontal(1))
+        .padding(Padding::new(2, 2, 1, 1))
         .style(panel);
     let inner = block.inner(area);
     f.render_widget(block, area);

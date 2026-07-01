@@ -13,6 +13,7 @@ Status legend: ✅ done & working · 🟡 partial / needs polish · ⬜ not star
 | Model picker (fuzzy) + cycle | ✅ | `Ctrl-M`, `:model`, palette. |
 | Request timeout / cancel mid-flight | 🟡 | `CancelStream` drops the receiver; no HTTP-level timeout/abort. |
 | Retry / backoff on transient errors | ⬜ | — |
+| Image generation | ✅ | Image models (`gpt-image-*`, `dall-e-*`) are routed to `POST /v1/images/generations` instead of chat completions (which 503s them). The PNG is saved under `./aitui-images/img-<ts>.png` and the path is reported back over the normal stream channel; handles both `b64_json` and `url` responses. `api::is_image_model` gates the routing. |
 | Token accounting | 🟡 | Requests set `stream_options.include_usage`; the final usage frame → `StreamEvent::Usage`, shown top-right of the chat pane (`↑prompt ↓completion · total`). Mock mode estimates (~4 chars/token). No cost/pricing yet. |
 
 ## Agentic workflow
@@ -21,16 +22,17 @@ Status legend: ✅ done & working · 🟡 partial / needs polish · ⬜ not star
 |---------|:------:|-------|
 | Agent mode toggle (per session) | ✅ | `Ctrl-A` / `:agent`; default-on via config. |
 | Tool catalogue (15 tools) | ✅ | read/write/edit/append/list/search/shell/delete_file · make_dir/move_path/copy_path/delete_dir · web_search/web_fetch/download_file. |
-| Web access (search / fetch / download) | ✅ | `web_search` (DuckDuckGo keyless IA JSON), `web_fetch` (URL→text, HTML stripped), `download_file` (URL→file, e.g. images). Run on the `spawn_blocking` tool thread via `Handle::block_on`; http(s)-only, 20s timeout. |
+| Web access (search / fetch / download) | ✅ | `web_search` (DuckDuckGo keyless **HTML** endpoint → real result links + snippets, `uddg` redirects decoded; the old IA-JSON API returned nothing for news/most queries), `web_fetch` (URL→text, HTML stripped; reports plainly when a JS-rendered page has no readable text instead of a blank "ok"), `download_file` (URL→file). Run on the `spawn_blocking` tool thread via `Handle::block_on`; http(s)-only, 20s timeout. |
 | Filesystem management | ✅ | Create dirs, move/rename, recursive copy, recursive delete — alongside the original read/write/edit/append/delete-file. |
-| Tool invocation via ```` ```tool ```` fences | ✅ | Works, but brittle (see Phase 2). |
-| **Native function-calling** | ⬜ | **Target mechanism** — schemas exist, unwired. |
+| Tool invocation via ```` ```tool ```` fences | ✅ | Fallback path (`:native off`, or auto after a tools-rejection). |
+| **Native function-calling** | ✅ | D-017: sends `tools` schemas; the model returns structured `tool_calls` (streamed deltas accumulated by index in `api/client.rs`, synthesized into an internal ```tool fence so render/execute/cut are unchanged). `api_messages(native)` translates stored turns → `assistant.tool_calls` + `role:"tool"` with `tool_call_id`. Config `api.native_tools` (default on) / `:native`; auto-falls back to fenced if the endpoint 400s on `tools`. |
 | Permission prompts + risk levels | ✅ | Low/Medium/High; allow-once/all, deny-once/all. |
 | Auto-approve read-only tools | ✅ | Configurable. |
 | Per-session permission memory | ✅ | `always_allow` / `always_deny`. |
 | Multi-round tool loop + loop guard | ✅ | Capped at 25 rounds. |
 | Offline mock/test backend | ✅ | `api/mock.rs` turns messages into real tool calls (`read`, `write`, `edit`, `run`, `demo`, …) so the whole agent loop runs with no API. Auto-on when endpoint empty / `AITUI_MOCK` / `:mock`. |
-| Streaming tool-call parsing | 🟡 | `StreamingParser` exists but unused; calls parsed post-turn. |
+| Streaming tool-call parsing | ✅ | Per-token `extract_tool_calls` on the partial drives two things: (1) in agent mode the stream is **cut** the moment a complete tool call appears (D-016) — no more runaway turns of redundant calls — and (2) read-only calls are **speculatively pre-run** (below). The `StreamingParser` state machine remains unused. |
+| Speculative read-only tool pre-exec | ✅ | D-014: while a reply streams, complete `read_file`/`list_dir`/`search_files` calls are pre-run in the background (keyed by `hash(name,args)` in `spec_results`); `execute_tool` uses the cached result instantly. Never speculates writes/edits/deletes/shell/network. |
 | Tool sandboxing / path-escape guards | ⬜ | Executor runs against cwd with no boundary checks. |
 | Diff / content preview for edits/writes | ✅ | `edit_file` renders a `-`/`+` diff and `write_file` previews its body inline (capped at 40 lines), both syntax-highlighted by the file's extension. |
 | `edit_file` unique-match safety | ⬜ | Replaces **all** occurrences via `str::replace`. |
@@ -69,6 +71,7 @@ Status legend: ✅ done & working · 🟡 partial / needs polish · ⬜ not star
 | Command line (`:w`, `:q`, `:new`, …) | ✅ | With history + navigation. |
 | Command palette | ✅ | Fuzzy. |
 | `@path` file-mention completion | ✅ | Fuzzy file search, inlines file content on send. |
+| Smart paste (bracketed) | ✅ | A pasted blob arrives as one `Event::Paste` (bracketed paste enabled in `tui.rs`). Very large (≥50k chars) → written to `./aitui-pastes/paste-<ts>.txt` and attached; medium (≥5 lines or ≥400 chars) → stored and shown as a compact `[PASTED#N-Llines-Cchars]` chip, expanded back to full text on send; small → inserted verbatim. |
 | File attachment picker | ✅ | `Ctrl-F`; directory browsing. |
 | Image attachments (base64) | ✅ | png/jpeg/gif/webp. |
 | Configurable keybindings | ✅ | All action/mode bindings in `[keybinds]` (config.toml), parsed into a precompiled `Keymap`; help overlay shows live bindings. Vim motions stay fixed. Descriptive nvim-style **aliases** accepted (e.g. `insert_to_normal`, `normal_insert`, `send_message`, `toggle_help`, `open_file_picker`, `open_model_picker`); `insert_to_normal` may be a 2-key chord like `jk`. |
@@ -85,6 +88,8 @@ Status legend: ✅ done & working · 🟡 partial / needs polish · ⬜ not star
 | Status bar (coloured chips + spinner) | ✅ | Each status (MOCK/agent/output/✎edited/✦skills/model) is a solid **background chip**; "working" shows an animated braille **spinner** instead of the word. |
 | Tree-sitter syntax highlighting | ✅ | `render/highlight.rs` highlights fenced code blocks, `read_file` results, and write/edit previews. Grammars: rust, python, js/jsx, ts/tsx, json, bash, go, c, css, html. One-shot full parse (no incremental — previews are static & doc-cached; see D-011). Compiled per-language configs cached thread-local. |
 | Token counter (top-right) | ✅ | Last response's `↑prompt ↓completion · total` overlaid on the chat pane's top-right when the endpoint reports usage. |
+| Animated "preparing tool call" | ✅ | D-018: while a tool call streams, the raw partial JSON is replaced by an animated `⠿ Preparing <tool>…` chip (tool name resolves live); the assistant's interstitial prose in that streaming turn is hidden so only the forming call + reasoning show. |
+| Collapsible write previews | ✅ | D-018: `write_file` calls show a one-line header collapsed by default; **click to expand** the full syntax-highlighted content that was written (like long tool results). |
 | Tool output show/hide toggle | ✅ | Long tool output collapses by default. `Ctrl-T` expands/collapses **all** output (shown as an independent `output` status chip — no status-line spam). **Click anywhere on a collapsed tool block** to expand just that one (`toggle_at_viewport_row` falls back to the block's message, so the role label / gutter / summary all work); its tail scrolls into view. |
 | Unicode-aware wrapping | ✅ | `unicode-width`. |
 | Minimal flat theme | ✅ | Trimmed to the few ANSI colours a flat UI needs. |
@@ -92,6 +97,15 @@ Status legend: ✅ done & working · 🟡 partial / needs polish · ⬜ not star
 | Transcript scrolling | ✅ | Wheel · PgUp/PgDn · Ctrl-Home/End. No cursor (by design). |
 | Mouse support | 🟡 | Wheel scroll only; click-to-focus removed with the `Focus` concept. |
 | `ui/` widget refactor | ✅ | `render/` = document model, `ui/` = widgets; sidebar deleted. |
+
+## Performance
+
+| Feature | Status | Notes |
+|---------|:------:|-------|
+| Per-message render cache | ✅ | D-013: each finalized message's rendered rows are cached by content signature (`App.doc_cache`); a streamed token only re-parses/highlights/wraps the one streaming message, not the whole transcript. Streaming cost is flat regardless of history length. |
+| Event-driven redraw | ✅ | D-015: `main.rs` draws only when `dirty` or animating; `event::poll` 33 ms while streaming / 250 ms idle. Idle CPU near zero. |
+| Non-blocking session save | ✅ | `SessionManager::save` moves serialize + `fs::write` to `spawn_blocking` when a tokio runtime is present (falls back to sync for tests), so finishing a turn doesn't hitch the UI. |
+| Cached `@`-mention file list | ✅ | `find_project_files` result cached on `App` (~5 s TTL); typing `@` filters an in-memory list instead of walking the filesystem per keystroke. |
 
 ## Config & security
 
@@ -101,6 +115,7 @@ Status legend: ✅ done & working · 🟡 partial / needs polish · ⬜ not star
 | Env-var overrides (`AITUI_ENDPOINT`, `AITUI_API_KEY`) | ✅ | Added 2026-06-30. |
 | No secrets baked into binary | ✅ | Hardcoded key removed 2026-06-30. |
 | Settings overlay (live edit) | ✅ | Agent default, auto-approve, sizes, system prompt. |
+| API setup prompt | ✅ | `:setup` (or the command palette) opens a URL + key modal; auto-pops when a request fails with a missing/relative endpoint ("relative url without a base"). On confirm it saves to config and rebuilds the client. |
 
 ## Testing
 

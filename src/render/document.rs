@@ -71,36 +71,64 @@ pub fn build(
     streaming: bool,
 ) -> Vec<RenderedLine> {
     let mut out: Vec<RenderedLine> = Vec::new();
+    for (mi, msg) in messages.iter().enumerate() {
+        out.extend(build_message(msg, mi, width, theme, toggled, show_output, streaming));
+    }
+    out
+}
+
+/// Render a single message (index `mi`) into its screen rows: role header, its
+/// blocks, the coloured left gutter bar, and a trailing blank separator. Factored
+/// out so `render::chat` can cache each message's rows independently and rebuild
+/// only the ones that actually changed (see `ChatState`'s doc cache).
+pub fn build_message(
+    msg: &DocMessage,
+    mi: usize,
+    width: usize,
+    theme: &Theme,
+    toggled: &HashSet<(usize, usize)>,
+    show_output: bool,
+    streaming: bool,
+) -> Vec<RenderedLine> {
     // Reserve columns for the nested gutter bars + a trailing space that
     // `mark_gutter` adds (deepest lineage is tool = 2 bars, so 3 columns).
     let inner = width.saturating_sub(MAX_GUTTER_COLS + 1).max(1);
 
-    for (mi, msg) in messages.iter().enumerate() {
-        let start = out.len();
-        render_role_header(&msg.role, mi, theme, &mut out);
+    let mut out: Vec<RenderedLine> = Vec::new();
+    render_role_header(&msg.role, mi, theme, &mut out);
 
-        for (bi, block) in msg.blocks.iter().enumerate() {
-            match block {
-                Block::Markdown(text) => render_markdown(text, mi, inner, theme, &mut out),
-                Block::Code { lang, code } => render_code(lang, code, mi, inner, theme, &mut out),
-                Block::Thinking(text) => {
-                    render_thinking(text, mi, bi, inner, theme, toggled, streaming, &mut out)
-                }
-                Block::ToolCall(call) => render_tool_call(call, mi, inner, theme, &mut out),
-                Block::ToolResult { ok, summary, output } => {
-                    render_tool_result(*ok, summary, output, mi, bi, inner, theme, toggled, show_output, &mut out)
-                }
+    // While streaming, once this turn is producing a tool call, hide the assistant's
+    // interstitial prose so only the animated "generating tool" chip + reasoning show
+    // — the raw generation around the call is noise until the tool runs.
+    let hide_prose = streaming && msg.blocks.iter().any(is_tool_ish);
+
+    for (bi, block) in msg.blocks.iter().enumerate() {
+        match block {
+            Block::Markdown(_) if hide_prose => {}
+            Block::Markdown(text) => render_markdown(text, mi, inner, theme, &mut out),
+            // While streaming, a partial ```tool block (JSON not yet complete) is
+            // shown as an animated "preparing tool call" chip rather than raw JSON.
+            Block::Code { lang, code } if streaming && lang == "tool" => {
+                render_preparing_tool(code, mi, inner, theme, &mut out)
+            }
+            Block::Code { lang, code } => render_code(lang, code, mi, inner, theme, &mut out),
+            Block::Thinking(text) => {
+                render_thinking(text, mi, bi, inner, theme, toggled, streaming, &mut out)
+            }
+            Block::ToolCall(call) => render_tool_call(call, mi, bi, inner, theme, toggled, &mut out),
+            Block::ToolResult { ok, summary, output } => {
+                render_tool_result(*ok, summary, output, mi, bi, inner, theme, toggled, show_output, &mut out)
             }
         }
-
-        // A coloured left gutter bar marks the whole turn so roles read as
-        // distinct blocks — using only the terminal's own palette (no custom bg),
-        // so it follows the terminal's light/dark theme.
-        mark_gutter(&mut out[start..], &role_gutters(&msg.role, theme));
-
-        // A blank, gutter-less line separates turns.
-        out.push(RenderedLine::new(Line::raw(""), String::new(), mi));
     }
+
+    // A coloured left gutter bar marks the whole turn so roles read as distinct
+    // blocks — using only the terminal's own palette (no custom bg), so it follows
+    // the terminal's light/dark theme.
+    mark_gutter(&mut out, &role_gutters(&msg.role, theme));
+
+    // A blank, gutter-less line separates turns.
+    out.push(RenderedLine::new(Line::raw(""), String::new(), mi));
 
     out
 }
@@ -137,16 +165,22 @@ fn mark_gutter(rows: &mut [RenderedLine], colors: &[Color]) {
 }
 
 fn render_role_header(role: &str, mi: usize, theme: &Theme, out: &mut Vec<RenderedLine>) {
-    let (label, marker): (&str, &'static str) = match role {
-        "user" => ("you", "user"),
-        "assistant" => ("assistant", "assistant"),
-        "system" => ("system", "system"),
-        "tool" => ("tool", "tool"),
-        _ => ("?", "assistant"),
+    // Each role gets an icon + its own denoting colour (matching the gutter bar),
+    // bold — so "you" / "assistant" read as distinct speakers, not muted text.
+    let (label, marker, icon, color): (&str, &'static str, &str, Color) = match role {
+        "user" => ("you", "user", "❯", theme.gutter_user),
+        "assistant" => ("assistant", "assistant", "✦", theme.gutter_assistant),
+        "system" => ("system", "system", "◆", theme.gutter_system),
+        "tool" => ("tool", "tool", "⚙", theme.gutter_tool),
+        _ => ("?", "assistant", "✦", theme.gutter_assistant),
     };
+    let text = format!("{} {}", icon, label);
     let mut row = RenderedLine::new(
-        Line::from(Span::styled(label.to_string(), Style::default().fg(theme.muted))),
-        label.to_string(),
+        Line::from(Span::styled(
+            text.clone(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )),
+        text,
         mi,
     );
     row.role_start = Some(marker);
@@ -231,10 +265,10 @@ fn ordered_list_item(raw: &str) -> Option<(String, String)> {
     Some((prefix, body.to_string()))
 }
 
-/// Solid dark background for code blocks (pure ANSI-256 black, index 16) — darker
-/// than most terminal backgrounds, so code reads as a distinct panel without
-/// needing a coloured border.
-const CODE_BG: Color = Color::Indexed(16);
+/// Solid dark background for code blocks (ANSI bright-black / grey, index 8) — a
+/// touch darker than most terminal backgrounds, so code reads as a distinct panel
+/// without needing a coloured border. Index 16 (pure black) read too dark.
+const CODE_BG: Color = Color::Indexed(8);
 
 fn render_code(lang: &str, code: &str, mi: usize, width: usize, theme: &Theme, out: &mut Vec<RenderedLine>) {
     let start = out.len();
@@ -399,7 +433,7 @@ fn render_thinking(
         .with_toggle((mi, bi)),
     );
     if expanded {
-        let bg = Color::Indexed(16);
+        let bg = Color::Indexed(8);
         let avail = width.saturating_sub(4).max(1);
         for raw in text.split('\n') {
             for wline in wrap_words(raw, avail) {
@@ -417,7 +451,69 @@ fn render_thinking(
     }
 }
 
-fn render_tool_call(call: &crate::agent::ToolCall, mi: usize, width: usize, theme: &Theme, out: &mut Vec<RenderedLine>) {
+/// An animated placeholder shown while the assistant is still emitting a tool
+/// call (the JSON isn't closed yet). Hides the raw partial JSON and shows a
+/// spinner + the tool name as it resolves, on a dark chip.
+fn render_preparing_tool(partial: &str, mi: usize, width: usize, theme: &Theme, out: &mut Vec<RenderedLine>) {
+    let start = out.len();
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let spinner = spinner_for(ms);
+    let name = extract_partial_name(partial);
+    let label = match &name {
+        Some(n) if !n.is_empty() => format!("  {} Preparing  {} …", spinner, n),
+        _ => format!("  {} Preparing tool call…", spinner),
+    };
+    out.push(RenderedLine::new(
+        Line::from(Span::styled(
+            label.clone(),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        )),
+        label,
+        mi,
+    ));
+    // A dim, truncated peek at what's forming inside, so it's clear it's live.
+    let peek: String = partial.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !peek.trim().is_empty() {
+        let avail = width.saturating_sub(6).max(1);
+        let shown: String = peek.chars().take(avail).collect();
+        let line = format!("      {}", shown);
+        out.push(RenderedLine::new(
+            Line::from(Span::styled(line.clone(), Style::default().fg(theme.faint))),
+            line,
+            mi,
+        ));
+    }
+    paint_bg(&mut out[start..], width, CODE_BG);
+}
+
+/// Whether a block is a tool call — complete (`ToolCall`) or a mid-stream partial
+/// (`Code` fenced as `tool`). Used to hide interstitial prose while a call forms.
+fn is_tool_ish(b: &Block) -> bool {
+    matches!(b, Block::ToolCall(_)) || matches!(b, Block::Code { lang, .. } if lang == "tool")
+}
+
+/// Best-effort extraction of the `"name"` value from a (possibly partial) tool JSON.
+fn extract_partial_name(s: &str) -> Option<String> {
+    let i = s.find("\"name\"")?;
+    let rest = &s[i + 6..];
+    let q1 = rest.find('"')?;
+    let after = &rest[q1 + 1..];
+    let q2 = after.find('"')?;
+    Some(after[..q2].to_string())
+}
+
+fn render_tool_call(
+    call: &crate::agent::ToolCall,
+    mi: usize,
+    bi: usize,
+    width: usize,
+    theme: &Theme,
+    toggled: &HashSet<(usize, usize)>,
+    out: &mut Vec<RenderedLine>,
+) {
     let icon = call.kind().map(|k| k.icon()).unwrap_or("⚙");
     let color = match call.kind().map(|k| k.risk()) {
         Some(crate::agent::ToolRisk::Low) => theme.success,
@@ -425,16 +521,30 @@ fn render_tool_call(call: &crate::agent::ToolCall, mi: usize, width: usize, them
         Some(crate::agent::ToolRisk::High) => theme.danger,
         None => theme.tool,
     };
+    // A write_file preview is collapsible: click the header to see what was written.
+    // Collapsed by default so a large write doesn't dominate the transcript.
+    let is_write = call.name == "write_file";
+    let expanded = is_write && toggled.contains(&(mi, bi));
+    let arrow = if is_write {
+        if expanded { "▾ " } else { "▸ " }
+    } else {
+        "▸ "
+    };
     let head = format!("  {} {}", icon, call.summary());
-    out.push(RenderedLine::new(
+    let mut row = RenderedLine::new(
         Line::from(vec![
-            Span::styled("    ▸ ".to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("    {}", arrow), Style::default().fg(color).add_modifier(Modifier::BOLD)),
             Span::styled(format!("{} ", icon), Style::default().fg(color)),
             Span::styled(call.summary(), Style::default().fg(theme.text).add_modifier(Modifier::BOLD)),
         ]),
         head,
         mi,
-    ));
+    );
+    if is_write {
+        row = row.with_toggle((mi, bi));
+    }
+    out.push(row);
+
     // For edit_file, preview the diff inline (structural editing, agent-style).
     if call.name == "edit_file" {
         let path = call.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -442,11 +552,21 @@ fn render_tool_call(call: &crate::agent::ToolCall, mi: usize, width: usize, them
         let new = call.args.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
         render_diff(old, new, path, mi, width, theme, out);
     }
-    // For write_file, preview the (syntax-highlighted) content being written.
-    if call.name == "write_file" {
+    // For write_file, preview the (syntax-highlighted) content — only when expanded.
+    if is_write {
         let path = call.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
         let content = call.args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        render_write_preview(content, path, mi, width, theme, out);
+        if expanded {
+            render_write_preview(content, path, mi, width, theme, out);
+        } else {
+            let n = content.lines().count();
+            let hint = format!("      … {} line(s) written · click to view", n);
+            out.push(RenderedLine::new(
+                Line::from(Span::styled(hint.clone(), Style::default().fg(theme.faint))),
+                hint,
+                mi,
+            ));
+        }
     }
 }
 
@@ -731,9 +851,60 @@ mod tests {
             args: serde_json::json!({"path": "a.rs", "content": "fn a() {}\n"}),
             id: None,
         };
-        let rows = build(&doc("assistant", vec![Block::ToolCall(call)]), 60, &Theme::default(), &HashSet::new(), false, false);
+        // Write previews are collapsed by default (click to expand); collapsed
+        // shows a hint, not the content.
+        let collapsed = build(&doc("assistant", vec![Block::ToolCall(call.clone())]), 60, &Theme::default(), &HashSet::new(), false, false);
+        assert!(collapsed.iter().any(|r| r.plain.contains("click to view")));
+        assert!(collapsed.iter().any(|r| r.toggle == Some((0, 0))), "header is a toggle");
+        assert!(!collapsed.iter().any(|r| r.plain.contains("fn a()")));
+
+        // Expanded (the block toggled open) → the syntax-highlighted content shows.
+        let mut toggled = HashSet::new();
+        toggled.insert((0usize, 0usize));
+        let rows = build(&doc("assistant", vec![Block::ToolCall(call)]), 60, &Theme::default(), &toggled, false, false);
         assert!(rows.iter().any(|r| r.plain.contains("fn a()")));
         assert!(has_keyword_colour(&rows));
+    }
+
+    #[test]
+    fn streaming_partial_tool_shows_preparing_chip() {
+        // Mid-stream, an unclosed ```tool block renders as the animated placeholder.
+        let block = Block::Code { lang: "tool".into(), code: "{\"name\":\"read_file\",\"args\":{\"pa".into() };
+        let rows = build(&doc("assistant", vec![block]), 60, &Theme::default(), &HashSet::new(), false, true);
+        assert!(rows.iter().any(|r| r.plain.contains("Preparing")));
+        assert!(rows.iter().any(|r| r.plain.contains("read_file")), "tool name shows as it resolves");
+
+        // Not streaming → a `tool` code block renders normally (no placeholder).
+        let block2 = Block::Code { lang: "tool".into(), code: "half".into() };
+        let rows2 = build(&doc("assistant", vec![block2]), 60, &Theme::default(), &HashSet::new(), false, false);
+        assert!(!rows2.iter().any(|r| r.plain.contains("Preparing")));
+    }
+
+    #[test]
+    fn streaming_hides_interstitial_prose_around_tool_call() {
+        let blocks = vec![
+            Block::Markdown("let me read the file".into()),
+            Block::ToolCall(crate::agent::ToolCall {
+                name: "read_file".into(),
+                args: serde_json::json!({"path": "a.rs"}),
+                id: None,
+            }),
+        ];
+        // Streaming → prose hidden, only the tool call shows.
+        let rows = build(&doc("assistant", blocks.clone()), 60, &Theme::default(), &HashSet::new(), false, true);
+        assert!(!rows.iter().any(|r| r.plain.contains("let me read")));
+        // The tool call itself still renders (its summary shows the path).
+        assert!(rows.iter().any(|r| r.plain.contains("a.rs")));
+        // Finalized (not streaming) → prose shows normally.
+        let rows2 = build(&doc("assistant", blocks), 60, &Theme::default(), &HashSet::new(), false, false);
+        assert!(rows2.iter().any(|r| r.plain.contains("let me read")));
+    }
+
+    #[test]
+    fn extract_partial_name_reads_name_when_terminated() {
+        assert_eq!(extract_partial_name("{\"name\":\"read_file\",\"args\":{}}").as_deref(), Some("read_file"));
+        assert_eq!(extract_partial_name("{\"name\":\"read_f"), None); // value not closed yet
+        assert!(extract_partial_name("{\"args\":{}}").is_none());
     }
 
     #[test]

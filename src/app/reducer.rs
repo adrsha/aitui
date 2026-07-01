@@ -124,6 +124,7 @@ impl App {
                     self.input.paste(&t);
                 }
             }
+            Action::PasteText(t) => self.smart_paste(t),
             Action::Move(dir) => match dir {
                 Dir::Left => self.input.left(),
                 Dir::Right => self.input.right(),
@@ -177,6 +178,21 @@ impl App {
                 if sid == self.sessions.active_id() {
                     self.chat.stick_bottom = true;
                 }
+                // Pre-run any complete read-only tool block already in the reply so
+                // its result is ready the instant the turn finishes.
+                self.speculate_read_tools(sid);
+                // In agent mode, the protocol is "emit a tool block and nothing
+                // after it" — so the moment a complete tool call appears, stop the
+                // model generating (it can't see the result mid-stream and would
+                // otherwise spiral into redundant calls) and run the round.
+                if self.cut_stream.is_none() && self.should_cut_stream(sid) {
+                    if let Some(s) = self.sessions.by_id_mut(sid) {
+                        s.finalize_assistant_stream();
+                    }
+                    self.streams.retain(|h| h.session_id != sid);
+                    self.sessions.save();
+                    self.cut_stream = Some(sid);
+                }
                 self.touch();
             }
             Action::StreamReasoning(sid, t) => {
@@ -199,12 +215,27 @@ impl App {
                 self.touch();
                 return self.maybe_start_agent_round(sid);
             }
+            Action::StartAgentRound(sid) => return self.maybe_start_agent_round(sid),
             Action::StreamError(sid, e) => {
                 if let Some(s) = self.sessions.by_id_mut(sid) {
                     s.finalize_assistant_stream();
                 }
                 self.streams.retain(|h| h.session_id != sid);
-                self.set_status(format!("Stream error: {}", e));
+                // If the endpoint rejected the native `tools` field, fall back to
+                // fenced parsing so the app keeps working (the user resends).
+                if looks_like_base_url_error(&e) {
+                    // No / invalid endpoint URL — prompt for the URL + key.
+                    self.set_status("No valid API endpoint — enter your URL and key.");
+                    let ep = self.config.api.endpoint.clone();
+                    let key = self.config.api.api_key.clone();
+                    self.overlay = Overlay::ApiSetup(crate::app::overlay::ApiSetup::new(ep, key));
+                } else if self.config.api.native_tools && looks_like_tools_error(&e) {
+                    self.config.api.native_tools = false;
+                    let _ = self.config.save();
+                    self.set_status("Endpoint rejected native tools — switched to fenced mode. Resend your message.");
+                } else {
+                    self.set_status(format!("Stream error: {}", e));
+                }
                 self.sessions.save();
                 self.touch();
             }
@@ -486,6 +517,12 @@ impl App {
                     self.overlay = Overlay::Settings(Settings { selected: 0, editing_prompt: false, prompt_buf: prompt });
                 }
             }
+            Action::OpenApiSetup => {
+                let ep = self.config.api.endpoint.clone();
+                let key = self.config.api.api_key.clone();
+                self.overlay = Overlay::ApiSetup(crate::app::overlay::ApiSetup::new(ep, key));
+                self.set_status("Enter API URL + key · Tab switch · ⏎ save · Esc cancel");
+            }
             Action::PickerUp => self.picker_up(),
             Action::PickerDown => self.picker_down(),
             Action::PickerConfirm => return self.picker_confirm(),
@@ -557,6 +594,7 @@ impl App {
             }
             Overlay::Permission(r) => r.up(),
             Overlay::Startup(s) => s.up(),
+            Overlay::ApiSetup(a) => a.next_field(),
             Overlay::Browser(_) | Overlay::Notice { .. } | Overlay::None => {}
         }
     }
@@ -571,6 +609,7 @@ impl App {
             }
             Overlay::Permission(r) => r.down(),
             Overlay::Startup(s) => s.down(),
+            Overlay::ApiSetup(a) => a.next_field(),
             Overlay::Browser(_) | Overlay::Notice { .. } | Overlay::None => {}
         }
     }
@@ -585,6 +624,7 @@ impl App {
                 p.refilter();
             }
             Overlay::Settings(s) if s.editing_prompt => s.prompt_buf.push(c),
+            Overlay::ApiSetup(a) => a.push(c),
             _ => {}
         }
     }
@@ -601,9 +641,32 @@ impl App {
             Overlay::Settings(s) if s.editing_prompt => {
                 s.prompt_buf.pop();
             }
+            Overlay::ApiSetup(a) => a.backspace(),
             _ => {}
         }
         None
+    }
+
+    /// Apply the API setup: save endpoint + key to config, rebuild the client, and
+    /// leave mock mode if a real endpoint is now set.
+    fn apply_api_setup(&mut self) {
+        let (ep, key) = match &self.overlay {
+            Overlay::ApiSetup(a) => (a.endpoint.trim().to_string(), a.api_key.trim().to_string()),
+            _ => return,
+        };
+        self.overlay = Overlay::None;
+        self.config.api.endpoint = ep.clone();
+        self.config.api.api_key = key.clone();
+        let _ = self.config.save();
+        self.api = crate::api::ApiClient::new(&ep, &key).ok();
+        if !ep.is_empty() {
+            self.mock = false;
+        }
+        self.set_status(if ep.is_empty() {
+            "API endpoint cleared — mock mode".to_string()
+        } else {
+            format!("API endpoint set: {}", ep)
+        });
     }
 
         // ── Input history helpers (shell-style up/down) ───────────────────
@@ -709,6 +772,11 @@ impl App {
                 self.overlay = Overlay::Startup(s);
                 self.startup_confirm()
             }
+            Overlay::ApiSetup(a) => {
+                self.overlay = Overlay::ApiSetup(a);
+                self.apply_api_setup();
+                None
+            }
             Overlay::Notice { .. } | Overlay::None => None,
         }
     }
@@ -811,6 +879,16 @@ impl App {
                     "Mock mode OFF — using the live API"
                 });
             }
+            "native" | "nativetools" => {
+                self.config.api.native_tools = !self.config.api.native_tools;
+                let on = self.config.api.native_tools;
+                let _ = self.config.save();
+                self.set_status(format!(
+                    "Native tool-calling: {}",
+                    if on { "ON (structured tool_calls)" } else { "off (```tool fences)" }
+                ));
+            }
+            "setup" | "apikey" | "endpoint" => return Some(Action::OpenApiSetup),
             "settings" | "config" | "set" => return Some(Action::OpenSettings),
             "sessions" | "ls" => return Some(Action::OpenSessionPicker),
             "skill" | "skills" => return Some(Action::OpenSkillPicker),
@@ -883,6 +961,31 @@ impl App {
     }
 }
 
+/// Heuristic: does a stream error look like the endpoint rejecting the native
+/// `tools` field (so we should fall back to fenced parsing)? Matches a 4xx that
+/// mentions tools/functions or an explicit "not supported".
+/// Does a stream error indicate a missing/relative endpoint URL (so we should
+/// prompt for the API URL + key)?
+fn looks_like_base_url_error(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("relative url without a base")
+        || e.contains("without a base")
+        || e.contains("builder error")
+        || e.contains("no api client")
+}
+
+fn looks_like_tools_error(err: &str) -> bool {
+    let e = err.to_lowercase();
+    let mentions_tools = e.contains("tool") || e.contains("function");
+    let rejected = e.contains("400")
+        || e.contains("not supported")
+        || e.contains("unsupported")
+        || e.contains("does not support")
+        || e.contains("unknown field")
+        || e.contains("unrecognized");
+    mentions_tools && rejected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,11 +1002,13 @@ mod tests {
         let mut config = Config::default();
         config.ui.agent_default = false;
         let keymap = crate::input::keymap::Keymap::from_config(&config.keybinds);
+        let (spec_tx, spec_rx) = tokio::sync::mpsc::channel(64);
         App {
             config,
             keymap,
             sessions: SessionManager::new(),
             chat: ChatState::new(),
+            doc_cache: crate::render::chat::DocCache::default(),
             vim: VimMode::Normal,
             input: InputBuffer::default(),
             command: String::new(),
@@ -914,6 +1019,7 @@ mod tests {
             input_draft: String::new(),
             overlay: Overlay::None,
             mention: Mention::default(),
+            pastes: Vec::new(),
             models: vec!["gemini-2.5-flash".into(), "claude-sonnet-4-6".into()],
             model_idx: 0,
             attachment: None,
@@ -938,6 +1044,14 @@ mod tests {
             agent_queue: VecDeque::new(),
             agent_tool_rx: None,
             models_rx: None,
+            spec_results: std::collections::HashMap::new(),
+            spec_dispatched: std::collections::HashSet::new(),
+            spec_epoch: 0,
+            cut_stream: None,
+            spec_tx,
+            spec_rx,
+            mention_files: Vec::new(),
+            mention_files_at: None,
             layout: PanelLayout::default(),
             api: None,
         }
@@ -1070,6 +1184,36 @@ mod tests {
         app.input.col = 5;
         app.apply(Action::Paste);
         assert_eq!(app.input.text(), "hello world");
+    }
+
+    #[test]
+    fn medium_paste_chips_and_expands_on_send() {
+        let mut app = test_app();
+        app.vim = VimMode::Insert;
+        let blob = (0..10).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+        app.apply(Action::PasteText(blob.clone()));
+        // The composer shows a compact chip, not the raw blob.
+        assert!(app.input.text().contains("[PASTED#1-10lines-"));
+        assert!(!app.input.text().contains("line5"));
+        assert_eq!(app.pastes.len(), 1);
+        // Sending expands the chip back to the full text and clears the store.
+        let _ = app.submit();
+        let sent = app.sessions.active().messages.iter().rev().find(|m| m.role == "user").unwrap();
+        let text = match &sent.content {
+            crate::api::models::MessageContent::Text(t) => t.clone(),
+            _ => String::new(),
+        };
+        assert!(text.contains("line5"), "full pasted text must be restored on send");
+        assert!(app.pastes.is_empty());
+    }
+
+    #[test]
+    fn small_paste_inserted_verbatim() {
+        let mut app = test_app();
+        app.vim = VimMode::Insert;
+        app.apply(Action::PasteText("hello world".into()));
+        assert_eq!(app.input.text(), "hello world");
+        assert!(app.pastes.is_empty(), "small pastes don't create chips");
     }
 
     #[test]
@@ -1410,6 +1554,89 @@ mod tests {
     // ── Agent ──────────────────────────────────────────────────────────────────
 
     #[test]
+    fn speculative_result_is_used_without_respawning() {
+        use crate::agent::{ToolCall, ToolResult};
+        let mut app = test_app();
+        let call = ToolCall { name: "read_file".into(), args: serde_json::json!({"path": "x"}), id: None };
+        app.permissions.remember_allow(call.kind().unwrap());
+        // A result pre-run while the reply streamed is stashed under its call sig.
+        app.store_spec_result(app.spec_epoch, ToolResult::success(call.clone(), "file contents".into(), 1));
+        app.pending_tools.push_back(call);
+        app.agent_session = Some(app.sessions.active_id());
+
+        let _ = app.process_next_tool();
+
+        // The cached result was used directly — no async tool execution spawned.
+        assert!(app.agent_tool_rx.is_none(), "must not respawn a pre-run tool");
+        assert!(
+            app.sessions.active().messages.iter().any(|m| m.role == "tool"
+                && matches!(&m.content, crate::api::models::MessageContent::Text(t) if t.contains("file contents"))),
+            "the speculative result should be recorded as a tool message",
+        );
+    }
+
+    #[test]
+    fn stale_epoch_speculative_result_is_dropped() {
+        use crate::agent::{ToolCall, ToolResult};
+        let mut app = test_app();
+        let call = ToolCall { name: "read_file".into(), args: serde_json::json!({"path": "x"}), id: None };
+        let stale = app.spec_epoch;
+        app.spec_epoch = app.spec_epoch.wrapping_add(1); // turn moved on
+        app.store_spec_result(stale, ToolResult::success(call, "old".into(), 1));
+        assert!(app.spec_results.is_empty(), "a result from a past turn must be dropped");
+    }
+
+    #[test]
+    fn tools_error_detection() {
+        assert!(looks_like_tools_error("API error 400: model does not support tools"));
+        assert!(looks_like_tools_error("unknown field `tools`, expected one of ..."));
+        assert!(looks_like_tools_error("function calling is unsupported here"));
+        assert!(!looks_like_tools_error("API error 500: internal error"));
+        assert!(!looks_like_tools_error("connection refused"));
+    }
+
+    #[test]
+    fn api_setup_opens_and_edits_both_fields() {
+        let mut app = test_app();
+        app.apply(Action::OpenApiSetup);
+        assert!(matches!(app.overlay, Overlay::ApiSetup(_)));
+        // Prefilled from (empty) config; the overlay consumes PickerChar.
+        for c in "http://x/v1".chars() {
+            app.apply(Action::PickerChar(c));
+        }
+        match &app.overlay {
+            Overlay::ApiSetup(a) => assert_eq!(a.endpoint, "http://x/v1"),
+            _ => panic!("expected ApiSetup overlay"),
+        }
+        app.apply(Action::PickerDown); // switch to the key field
+        for c in "sk-1".chars() {
+            app.apply(Action::PickerChar(c));
+        }
+        match &app.overlay {
+            Overlay::ApiSetup(a) => {
+                assert_eq!(a.field, 1);
+                assert_eq!(a.api_key, "sk-1");
+            }
+            _ => panic!("expected ApiSetup overlay"),
+        }
+    }
+
+    #[test]
+    fn base_url_error_detection() {
+        assert!(looks_like_base_url_error("Request failed: builder error: relative url without a base"));
+        assert!(looks_like_base_url_error("No API client"));
+        assert!(!looks_like_base_url_error("API error 500: internal"));
+    }
+
+    #[test]
+    fn native_command_toggles_config() {
+        let mut app = test_app();
+        let before = app.config.api.native_tools;
+        app.apply(Action::RunCommand("native".into()));
+        assert_eq!(app.config.api.native_tools, !before);
+    }
+
+    #[test]
     fn toggle_agent_mode_switches_and_sets_status() {
         let mut app = test_app();
         app.apply(Action::ToggleAgentMode);
@@ -1623,6 +1850,44 @@ mod tests {
         app.apply(Action::StreamToken(sid, "hello".into()));
         assert_eq!(app.sessions.active().streaming_display().as_deref(), Some("hello"));
         assert_ne!(app.content_rev, rev);
+    }
+
+    #[test]
+    fn agent_stream_cut_on_complete_tool_call() {
+        let mut app = test_app();
+        app.sessions.active_mut().agent_mode = true;
+        app.sessions.active_mut().begin_assistant_stream();
+        let sid = app.sessions.active_id();
+        push_active_stream(&mut app);
+        app.apply(Action::StreamToken(
+            sid,
+            "```tool\n{\"name\":\"list_dir\",\"args\":{\"path\":\".\"}}\n```".into(),
+        ));
+        // The stream was cut: flag set for the main loop, message finalized, handle gone.
+        assert_eq!(app.cut_stream, Some(sid), "a complete tool call must cut the stream");
+        assert!(!app.sessions.active().is_streaming());
+        assert!(app.streams.is_empty());
+        assert!(
+            app.sessions.active().messages.last().is_some_and(|m| matches!(
+                &m.content,
+                crate::api::models::MessageContent::Text(t) if t.contains("list_dir")
+            )),
+            "the finalized turn keeps the tool call",
+        );
+    }
+
+    #[test]
+    fn non_agent_stream_is_not_cut() {
+        let mut app = test_app(); // agent mode off
+        app.sessions.active_mut().begin_assistant_stream();
+        let sid = app.sessions.active_id();
+        push_active_stream(&mut app);
+        app.apply(Action::StreamToken(
+            sid,
+            "```tool\n{\"name\":\"list_dir\",\"args\":{\"path\":\".\"}}\n```".into(),
+        ));
+        assert_eq!(app.cut_stream, None, "non-agent mode must keep streaming normally");
+        assert!(app.sessions.active().is_streaming());
     }
 
     #[test]

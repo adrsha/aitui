@@ -37,14 +37,16 @@ Scope decisions (see [`DECISIONS.md`](./DECISIONS.md)):
 
 ## Status at a glance
 
-_Last updated: 2026-06-30_
+_Last updated: 2026-07-01_
 
 - **Phase 0 (baseline):** ✅ done — modular Elm-style app, streaming chat,
   sessions, vim input, prompt-fenced agent loop.
-- **Phase 1 (foundation wiring):** 🟡 in progress — splitting the monolithic
-  renderer into `ui/` widgets. `render/` and `ui/` currently coexist; the
-  refactor is mid-flight (visible as ~24 dead-code/unused-import warnings).
-- **Phase 2 (native tool-calling):** ⬜ not started — the highest-leverage next
-  step toward "agentic perfection."
+- **Phase 1 (foundation wiring):** 🟡 in progress — `render/` (document model) and
+  `ui/` (widgets) split is settled; build is down to 2 pre-existing WIP warnings.
+- **Phase 2 (native tool-calling):** ✅ done — OpenAI `tools`/`tool_calls` via a
+  translation layer (fenced stays the internal form); config `:native` + auto-fallback.
+- **Phase 6 (performance):** 🟡 landed a first pass — per-message render cache,
+  event-driven redraw, non-blocking save, cached `@`-mention walk, and speculative
+  read-only tool pre-execution.
 
 See [`ROADMAP.md`](./ROADMAP.md) for the full plan.
