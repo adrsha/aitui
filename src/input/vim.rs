@@ -5,10 +5,8 @@ pub enum VimMode {
     Normal,
     /// Insert mode: typing text.
     Insert,
-    /// Visual mode: character-wise selection.
+    /// Visual mode: character-wise or line-wise selection.
     Visual,
-    /// Command-line mode: typing a `:` command.
-    Command,
     /// Operator pending: e.g. `d` waiting for a motion.
     Operator(char),
 }
@@ -24,11 +22,10 @@ mod tests {
             VimMode::Normal,
             VimMode::Insert,
             VimMode::Visual,
-            VimMode::Command,
             VimMode::Operator('d'),
             VimMode::Operator('y'),
         ];
         let unique: HashSet<_> = modes.into_iter().collect();
-        assert_eq!(unique.len(), 6);
+        assert_eq!(unique.len(), 5);
     }
 }

@@ -124,7 +124,11 @@ mod tests {
     fn never_exceeds_width() {
         let text = "lorem ipsum dolor sit amet consectetur adipiscing elit";
         for line in wrap_words(text, 12) {
-            assert!(UnicodeWidthStr::width(line.as_str()) <= 12, "line too wide: {:?}", line);
+            assert!(
+                UnicodeWidthStr::width(line.as_str()) <= 12,
+                "line too wide: {:?}",
+                line
+            );
         }
     }
 }

@@ -54,7 +54,6 @@ fn run(
         // ── 1b. Pending external program: suspend TUI, run it, restore ───
         if let Some(ext) = app.pending_external.take() {
             run_external(terminal, ext)?;
-            app.set_status("Back in AiTUI");
             app.touch();
             dirty = true;
             continue;
@@ -80,7 +79,11 @@ fn run(
                     app.models_rx = None;
                     dirty = true;
                 }
-                Ok(Err(_)) => { app.models_rx = None; }
+                Ok(Err(_)) => {
+                    dispatch(app, vec![Action::ModelsFailed]);
+                    app.models_rx = None;
+                    dirty = true;
+                }
                 Err(_) => {}
             }
         }
@@ -96,12 +99,23 @@ fn run(
                 loop {
                     match h.rx.try_recv() {
                         Ok(api::StreamEvent::Token(t)) => actions.push(Action::StreamToken(sid, t)),
-                        Ok(api::StreamEvent::Reasoning(r)) => actions.push(Action::StreamReasoning(sid, r)),
+                        Ok(api::StreamEvent::Reasoning(r)) => {
+                            actions.push(Action::StreamReasoning(sid, r))
+                        }
                         Ok(api::StreamEvent::Usage(u)) => actions.push(Action::StreamUsage(sid, u)),
-                        Ok(api::StreamEvent::Done) => { actions.push(Action::StreamDone(sid)); break; }
-                        Ok(api::StreamEvent::Error(e)) => { actions.push(Action::StreamError(sid, e)); break; }
+                        Ok(api::StreamEvent::Done) => {
+                            actions.push(Action::StreamDone(sid));
+                            break;
+                        }
+                        Ok(api::StreamEvent::Error(e)) => {
+                            actions.push(Action::StreamError(sid, e));
+                            break;
+                        }
                         Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => { actions.push(Action::StreamDone(sid)); break; }
+                        Err(TryRecvError::Disconnected) => {
+                            actions.push(Action::StreamDone(sid));
+                            break;
+                        }
                     }
                 }
             }
@@ -199,7 +213,8 @@ fn run_external_inner(ext: app::state::PendingExternal) -> anyhow::Result<()> {
         }
         PendingExternal::EditorText(text) => {
             let ed = editor();
-            let path = std::env::temp_dir().join(format!("aitui-conversation-{}.md", std::process::id()));
+            let path =
+                std::env::temp_dir().join(format!("aitui-conversation-{}.md", std::process::id()));
             std::fs::File::create(&path)?.write_all(text.as_bytes())?;
             let mut cmd = Command::new(&ed);
             if jumps_to_end(&ed) {

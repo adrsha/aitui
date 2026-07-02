@@ -17,7 +17,14 @@ pub enum Block {
     /// A tool the assistant asked to run (parsed from a ```tool fence).
     ToolCall(ToolCall),
     /// The result of a tool execution (parsed from a stored "tool" message).
-    ToolResult { ok: bool, summary: String, output: String },
+    /// `name` is the canonical tool name (e.g. "edit", "delete") when known, so the
+    /// renderer can pick a purpose-built view; `None` for legacy stored results.
+    ToolResult {
+        ok: bool,
+        name: Option<String>,
+        summary: String,
+        output: String,
+    },
 }
 
 /// Parse an assistant/user message body into ordered blocks.
@@ -127,7 +134,9 @@ fn find_fence(s: &str) -> Option<usize> {
     let mut search_from = 0;
     while let Some(rel) = s[search_from..].find("```") {
         let pos = search_from + rel;
-        let is_tool = s[pos + 3..].trim_start_matches([' ', '\t']).starts_with("tool");
+        let is_tool = s[pos + 3..]
+            .trim_start_matches([' ', '\t'])
+            .starts_with("tool");
         if line_anchored(s, pos) || is_tool {
             return Some(pos);
         }
@@ -180,7 +189,11 @@ fn parse_fence(s: &str) -> (Option<Block>, usize) {
         Some(end) => {
             let after_close = end + 3;
             // Swallow a trailing newline after the close fence.
-            let extra = if body[after_close..].starts_with('\n') { 1 } else { 0 };
+            let extra = if body[after_close..].starts_with('\n') {
+                1
+            } else {
+                0
+            };
             (&body[..end], body_start_rel + after_close + extra)
         }
         None => (body, s.len()),
@@ -193,7 +206,13 @@ fn parse_fence(s: &str) -> (Option<Block>, usize) {
         }
         // Fall through to a code block if the JSON is malformed.
     }
-    (Some(Block::Code { lang, code: inner.to_string() }), consumed)
+    (
+        Some(Block::Code {
+            lang,
+            code: inner.to_string(),
+        }),
+        consumed,
+    )
 }
 
 fn find_closing_fence(body: &str, allow_midline: bool) -> Option<usize> {
@@ -209,7 +228,11 @@ fn find_closing_fence(body: &str, allow_midline: bool) -> Option<usize> {
     // so a call emitted entirely on one line (`…issues.```tool {json}``` more`)
     // still closes instead of dragging trailing prose into the block. Regular code
     // blocks keep the strict rule so streaming/partial content isn't cut short.
-    if allow_midline { body.find("```") } else { None }
+    if allow_midline {
+        body.find("```")
+    } else {
+        None
+    }
 }
 
 /// Parse the JSON inside a ```tool fence into a [`ToolCall`], accepting both
@@ -227,10 +250,20 @@ fn parse_tool_json(s: &str) -> Option<ToolCall> {
 }
 
 /// Parse a stored tool-result message body of the form
-/// `"[tool-result] <summary> (ok|error)\n<output>"` into a [`Block::ToolResult`].
+/// `"[tool-result:<name>] <summary> (ok|error)\n<output>"` into a [`Block::ToolResult`].
+/// The `:<name>` tag is optional — older stored results use the bare `[tool-result]`
+/// header and yield `name = None`.
 pub fn parse_tool_result(text: &str) -> Block {
     let first = text.lines().next().unwrap_or("");
-    let header = first.strip_prefix("[tool-result] ").unwrap_or(first);
+    // Recover the optional canonical tool name from `[tool-result:<name>] …`.
+    let (name, header) = if let Some(rest) = first.strip_prefix("[tool-result:") {
+        match rest.split_once("] ") {
+            Some((n, h)) => (Some(n.to_string()), h),
+            None => (None, first),
+        }
+    } else {
+        (None, first.strip_prefix("[tool-result] ").unwrap_or(first))
+    };
     let ok = !header.ends_with("(error)");
     let summary = header
         .trim_end_matches("(ok)")
@@ -238,7 +271,12 @@ pub fn parse_tool_result(text: &str) -> Block {
         .trim()
         .to_string();
     let output = text.splitn(2, '\n').nth(1).unwrap_or("").to_string();
-    Block::ToolResult { ok, summary, output }
+    Block::ToolResult {
+        ok,
+        name,
+        summary,
+        output,
+    }
 }
 
 #[cfg(test)]
@@ -264,7 +302,10 @@ mod tests {
             blocks,
             vec![
                 Block::Markdown("before".to_string()),
-                Block::Code { lang: "rust".to_string(), code: "fn main() {}".to_string() },
+                Block::Code {
+                    lang: "rust".to_string(),
+                    code: "fn main() {}".to_string()
+                },
                 Block::Markdown("after".to_string()),
             ]
         );
@@ -275,7 +316,10 @@ mod tests {
         let blocks = parse_blocks("```\nplain\n```");
         assert_eq!(
             blocks,
-            vec![Block::Code { lang: "".to_string(), code: "plain".to_string() }]
+            vec![Block::Code {
+                lang: "".to_string(),
+                code: "plain".to_string()
+            }]
         );
     }
 
@@ -286,7 +330,10 @@ mod tests {
             blocks,
             vec![
                 Block::Markdown("text".to_string()),
-                Block::Code { lang: "python".to_string(), code: "print(1)".to_string() },
+                Block::Code {
+                    lang: "python".to_string(),
+                    code: "print(1)".to_string()
+                },
             ]
         );
     }
@@ -306,7 +353,10 @@ mod tests {
     #[test]
     fn unclosed_think_tag_streams() {
         let blocks = parse_blocks("<think>still thinking...");
-        assert_eq!(blocks, vec![Block::Thinking("still thinking...".to_string())]);
+        assert_eq!(
+            blocks,
+            vec![Block::Thinking("still thinking...".to_string())]
+        );
     }
 
     #[test]
@@ -323,7 +373,8 @@ mod tests {
 
     #[test]
     fn tool_fence_becomes_tool_call() {
-        let text = "I will read it\n```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"a.rs\"}}\n```";
+        let text =
+            "I will read it\n```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"a.rs\"}}\n```";
         let blocks = parse_blocks(text);
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0], Block::Markdown("I will read it".to_string()));
@@ -363,7 +414,9 @@ mod tests {
         assert!(call.is_some(), "expected a ToolCall, got {:?}", blocks);
         assert_eq!(call.unwrap().name, "read_file");
         // Trailing prose after the closer is preserved.
-        assert!(blocks.iter().any(|b| matches!(b, Block::Markdown(m) if m.contains("I need the result"))));
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(b, Block::Markdown(m) if m.contains("I need the result"))));
     }
 
     #[test]
@@ -376,7 +429,11 @@ mod tests {
             Block::Code { lang, code } => Some((lang.clone(), code.clone())),
             _ => None,
         });
-        assert!(code.is_some(), "indented fence should be a Code block, got {:?}", blocks);
+        assert!(
+            code.is_some(),
+            "indented fence should be a Code block, got {:?}",
+            blocks
+        );
         assert_eq!(code.as_ref().unwrap().0, "bash");
         assert!(code.unwrap().1.contains("find"));
     }
@@ -396,7 +453,10 @@ mod tests {
         let blocks = parse_blocks("```tool\nnot json\n```");
         assert_eq!(
             blocks,
-            vec![Block::Code { lang: "tool".to_string(), code: "not json".to_string() }]
+            vec![Block::Code {
+                lang: "tool".to_string(),
+                code: "not json".to_string()
+            }]
         );
     }
 
@@ -409,7 +469,10 @@ mod tests {
             vec![
                 Block::Thinking("plan".to_string()),
                 Block::Markdown("Here:".to_string()),
-                Block::Code { lang: "sh".to_string(), code: "ls".to_string() },
+                Block::Code {
+                    lang: "sh".to_string(),
+                    code: "ls".to_string()
+                },
                 Block::Markdown("Done.".to_string()),
             ]
         );
@@ -417,11 +480,13 @@ mod tests {
 
     #[test]
     fn tool_result_parsing_ok() {
+        // Bare (legacy) header → name is None.
         let block = parse_tool_result("[tool-result] Read a.rs (ok)\nfile contents\nline2");
         assert_eq!(
             block,
             Block::ToolResult {
                 ok: true,
+                name: None,
                 summary: "Read a.rs".to_string(),
                 output: "file contents\nline2".to_string(),
             }
@@ -433,7 +498,27 @@ mod tests {
         let block = parse_tool_result("[tool-result] Shell foo (error)\nboom");
         assert_eq!(
             block,
-            Block::ToolResult { ok: false, summary: "Shell foo".to_string(), output: "boom".to_string() }
+            Block::ToolResult {
+                ok: false,
+                name: None,
+                summary: "Shell foo".to_string(),
+                output: "boom".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn tool_result_parsing_extracts_name() {
+        // New header form carries the canonical tool name for purpose-built rendering.
+        let block = parse_tool_result("[tool-result:edit] 🔧 edit(a.rs) (ok)\n- x\n+ y");
+        assert_eq!(
+            block,
+            Block::ToolResult {
+                ok: true,
+                name: Some("edit".to_string()),
+                summary: "🔧 edit(a.rs)".to_string(),
+                output: "- x\n+ y".to_string(),
+            }
         );
     }
 
@@ -441,8 +526,12 @@ mod tests {
     fn code_fence_with_inner_triple_backtick_in_prose_not_confused() {
         // A fence that contains text but closes properly.
         let blocks = parse_blocks("```\na\nb\n```");
-        assert_eq!(blocks, vec![Block::Code { lang: "".into(), code: "a\nb".into() }]);
+        assert_eq!(
+            blocks,
+            vec![Block::Code {
+                lang: "".into(),
+                code: "a\nb".into()
+            }]
+        );
     }
 }
-
-

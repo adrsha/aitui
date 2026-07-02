@@ -21,20 +21,20 @@ Status legend: ✅ done & working · 🟡 partial / needs polish · ⬜ not star
 | Feature | Status | Notes |
 |---------|:------:|-------|
 | Agent mode toggle (per session) | ✅ | `Ctrl-A` / `:agent`; default-on via config. |
-| Tool catalogue (15 tools) | ✅ | read/write/edit/append/list/search/shell/delete_file · make_dir/move_path/copy_path/delete_dir · web_search/web_fetch/download_file. |
+| Tool catalogue (15 tools) | ✅ | read/write/edit/append/list/search/shell/delete_file · make_dir/move_path/copy_path/delete_dir · web_search/web_fetch/download_file. `read_file` takes optional `offset`/`limit` line window (+60k cap on whole-file reads); `list_dir` takes `depth` (indented tree, skips .hidden/target/node_modules, 400-entry cap); `search_files` uses ripgrep (regex, gitignore-aware, binary-skip, optional `glob`) with the literal-substring walker as fallback. |
 | Web access (search / fetch / download) | ✅ | `web_search` (DuckDuckGo keyless **HTML** endpoint → real result links + snippets, `uddg` redirects decoded; the old IA-JSON API returned nothing for news/most queries), `web_fetch` (URL→text, HTML stripped; reports plainly when a JS-rendered page has no readable text instead of a blank "ok"), `download_file` (URL→file). Run on the `spawn_blocking` tool thread via `Handle::block_on`; http(s)-only, 20s timeout. |
 | Filesystem management | ✅ | Create dirs, move/rename, recursive copy, recursive delete — alongside the original read/write/edit/append/delete-file. |
 | Tool invocation via ```` ```tool ```` fences | ✅ | Fallback path (`:native off`, or auto after a tools-rejection). |
 | **Native function-calling** | ✅ | D-017: sends `tools` schemas; the model returns structured `tool_calls` (streamed deltas accumulated by index in `api/client.rs`, synthesized into an internal ```tool fence so render/execute/cut are unchanged). `api_messages(native)` translates stored turns → `assistant.tool_calls` + `role:"tool"` with `tool_call_id`. Config `api.native_tools` (default on) / `:native`; auto-falls back to fenced if the endpoint 400s on `tools`. |
-| Permission prompts + risk levels | ✅ | Low/Medium/High; allow-once/all, deny-once/all. |
-| Auto-approve read-only tools | ✅ | Configurable. |
-| Per-session permission memory | ✅ | `always_allow` / `always_deny`. |
+| Permission prompts + risk levels | ✅ | Low/Medium/High. 8-option menu (↑↓ + ⏎, or `a`/`d` quick once): **allow / deny** × **once · all of this tool type · all in this directory · everything for 10 min**. Scoped choices persist for the session as `PermissionRule`s (kind/directory/timed); deny rules beat allow; timed rules auto-expire. Directory scope resolves via `ToolCall::permission_directory` against the session cwd. |
+| Auto-approve read-only tools | ✅ | Configurable; seeded as kind-scoped allow rules. |
+| Per-session permission memory | ✅ | `PermissionMemory` holds `always_allow`/`always_deny` (kind) + scoped `rules` (Kind/Directory/Timed); `check(call, cwd)` prunes expired then returns Allow/Deny/ask. |
 | Multi-round tool loop + loop guard | ✅ | Capped at 25 rounds. |
 | Offline mock/test backend | ✅ | `api/mock.rs` turns messages into real tool calls (`read`, `write`, `edit`, `run`, `demo`, …) so the whole agent loop runs with no API. Auto-on when endpoint empty / `AITUI_MOCK` / `:mock`. |
 | Streaming tool-call parsing | ✅ | Per-token `extract_tool_calls` on the partial drives two things: (1) in agent mode the stream is **cut** the moment a complete tool call appears (D-016) — no more runaway turns of redundant calls — and (2) read-only calls are **speculatively pre-run** (below). The `StreamingParser` state machine remains unused. |
 | Speculative read-only tool pre-exec | ✅ | D-014: while a reply streams, complete `read_file`/`list_dir`/`search_files` calls are pre-run in the background (keyed by `hash(name,args)` in `spec_results`); `execute_tool` uses the cached result instantly. Never speculates writes/edits/deletes/shell/network. |
 | Tool sandboxing / path-escape guards | ⬜ | Executor runs against cwd with no boundary checks. |
-| Diff / content preview for edits/writes | ✅ | `edit_file` renders a `-`/`+` diff and `write_file` previews its body inline (capped at 40 lines), both syntax-highlighted by the file's extension. |
+| Diff / content preview for edits/writes | ✅ | `edit_file` renders a `-`/`+` diff at the call; write previews are collapsible (D-018). **On update**, the executor also emits a real old→new line diff in the tool *result* (`write_file`/`edit_file`/`append_file`, `line_diff` — common prefix/suffix stripped); tool-result output colours `+`/`-`/`@@` lines (green/red/accent), so `git diff` output is coloured too. New files report "Created", existing "Updated". |
 | `edit_file` unique-match safety | ⬜ | Replaces **all** occurrences via `str::replace`. |
 
 ## Sessions & persistence
@@ -90,7 +90,7 @@ Status legend: ✅ done & working · 🟡 partial / needs polish · ⬜ not star
 | Token counter (top-right) | ✅ | Last response's `↑prompt ↓completion · total` overlaid on the chat pane's top-right when the endpoint reports usage. |
 | Animated "preparing tool call" | ✅ | D-018: while a tool call streams, the raw partial JSON is replaced by an animated `⠿ Preparing <tool>…` chip (tool name resolves live); the assistant's interstitial prose in that streaming turn is hidden so only the forming call + reasoning show. |
 | Collapsible write previews | ✅ | D-018: `write_file` calls show a one-line header collapsed by default; **click to expand** the full syntax-highlighted content that was written (like long tool results). |
-| Tool output show/hide toggle | ✅ | Long tool output collapses by default. `Ctrl-T` expands/collapses **all** output (shown as an independent `output` status chip — no status-line spam). **Click anywhere on a collapsed tool block** to expand just that one (`toggle_at_viewport_row` falls back to the block's message, so the role label / gutter / summary all work); its tail scrolls into view. |
+| Tool output show/hide toggle | ✅ | Long tool output collapses by default. `Ctrl-T` expands/collapses **all** output (shown as an independent `output` status chip — no status-line spam). **Click anywhere on a collapsed tool block** to expand just that one. The click **preserves your reading position** — it only reveals/sticks-to-bottom if you were already at the bottom; toggling while scrolled up leaves the scroll put. |
 | Unicode-aware wrapping | ✅ | `unicode-width`. |
 | Minimal flat theme | ✅ | Trimmed to the few ANSI colours a flat UI needs. |
 | Help overlay | ✅ | `?` — updated for the new keymap. |

@@ -1,4 +1,6 @@
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use crate::app::action::{Action, Dir};
 use crate::app::overlay::Overlay;
@@ -34,31 +36,62 @@ fn handle_key(app: &App, key: KeyEvent) -> Vec<Action> {
             vec![Action::Quit]
         };
     }
-    if km.redraw.matches(&key) { return vec![Action::Resize]; }
-    if km.next_session.matches(&key) { return vec![Action::NextSession]; }
-    if km.prev_session.matches(&key) { return vec![Action::PrevSession]; }
-    if km.session_picker.matches(&key) { return vec![Action::OpenSessionPicker]; }
-    if km.fork_session.matches(&key) { return vec![Action::ForkSession]; }
-    if km.open_editor.matches(&key) { return vec![Action::OpenEditor]; }
-    if km.open_file.matches(&key) { return vec![Action::OpenEditPicker]; }
+    if km.redraw.matches(&key) {
+        return vec![Action::Resize];
+    }
+    if km.next_session.matches(&key) {
+        return vec![Action::NextSession];
+    }
+    if km.prev_session.matches(&key) {
+        return vec![Action::PrevSession];
+    }
+    if km.session_picker.matches(&key) {
+        return vec![Action::OpenSessionPicker];
+    }
+    if km.fork_session.matches(&key) {
+        return vec![Action::ForkSession];
+    }
+    if km.open_editor.matches(&key) {
+        return vec![Action::OpenEditor];
+    }
+    if km.open_file.matches(&key) {
+        return vec![Action::OpenEditPicker];
+    }
     if km.open_shell.matches(&key) {
         // While the browser is open, this key closes it too (both keys toggle).
-        return if app.overlay.is_browser() { vec![Action::BrowserClose] } else { vec![Action::OpenShell] };
+        return if app.overlay.is_browser() {
+            vec![Action::BrowserClose]
+        } else {
+            vec![Action::OpenShell]
+        };
     }
-    if km.next_model.matches(&key) { return vec![Action::NextModel]; }
-    if km.prev_model.matches(&key) { return vec![Action::PrevModel]; }
-    if km.file_picker.matches(&key) { return vec![Action::OpenFilePicker]; }
-    if km.model_picker.matches(&key) { return vec![Action::OpenModelPicker]; }
-    if km.toggle_agent.matches(&key) { return vec![Action::ToggleAgentMode]; }
+    if km.next_model.matches(&key) {
+        return vec![Action::NextModel];
+    }
+    if km.prev_model.matches(&key) {
+        return vec![Action::PrevModel];
+    }
+    if km.file_picker.matches(&key) {
+        return vec![Action::OpenFilePicker];
+    }
+    if km.model_picker.matches(&key) {
+        return vec![Action::OpenModelPicker];
+    }
+    if km.toggle_agent.matches(&key) {
+        return vec![Action::ToggleAgentMode];
+    }
 
     // ── Overlays take priority over the rest ────────────────────────────
     match &app.overlay {
         Overlay::Startup(_) => return handle_startup(&key, km),
-        Overlay::Picker(_) => return handle_picker(&key),
+        Overlay::Picker(_) => return handle_picker(app, &key),
         Overlay::Browser(_) => return handle_browser(&key),
         Overlay::Palette(_) => return handle_palette(&key),
         Overlay::Settings(_) => return handle_settings(&key),
         Overlay::Permission(_) => return handle_permission(&key),
+        Overlay::Decision(_) => return handle_decision(&key),
+        Overlay::Plan(_) => return handle_plan(&key),
+        Overlay::ToolRequest(_) => return handle_tool_request(&key),
         Overlay::ApiSetup(_) => return handle_api_setup(&key),
         // A notice is a plain "OK" dialog: any key dismisses it.
         Overlay::Notice { .. } => return vec![Action::DismissNotice],
@@ -66,19 +99,32 @@ fn handle_key(app: &App, key: KeyEvent) -> Vec<Action> {
     }
 
     // ── Transcript scrolling (works in any input mode) ──────────────────
-    if km.scroll_up.matches(&key) { return vec![Action::ChatPageUp]; }
-    if km.scroll_down.matches(&key) { return vec![Action::ChatPageDown]; }
-    if km.scroll_half_down.matches(&key) { return vec![Action::ChatHalfDown]; }
-    if km.scroll_half_up.matches(&key) { return vec![Action::ChatHalfUp]; }
-    if km.scroll_top.matches(&key) { return vec![Action::ChatTop]; }
-    if km.scroll_bottom.matches(&key) { return vec![Action::ChatBottom]; }
-    if km.toggle_output.matches(&key) { return vec![Action::ToggleOutput]; }
+    if km.scroll_up.matches(&key) {
+        return vec![Action::ChatPageUp];
+    }
+    if km.scroll_down.matches(&key) {
+        return vec![Action::ChatPageDown];
+    }
+    if km.scroll_half_down.matches(&key) {
+        return vec![Action::ChatHalfDown];
+    }
+    if km.scroll_half_up.matches(&key) {
+        return vec![Action::ChatHalfUp];
+    }
+    if km.scroll_top.matches(&key) {
+        return vec![Action::ChatTop];
+    }
+    if km.scroll_bottom.matches(&key) {
+        return vec![Action::ChatBottom];
+    }
+    if km.toggle_output.matches(&key) {
+        return vec![Action::ToggleOutput];
+    }
 
     // ── Vim modes for the input box ─────────────────────────────────────
     match app.vim {
         VimMode::Insert => handle_insert(app, &key),
         VimMode::Normal => handle_normal(app, &key),
-        VimMode::Command => handle_command(app, &key),
         VimMode::Visual => handle_visual(&key),
         VimMode::Operator(op) => handle_operator(&key, op),
     }
@@ -105,7 +151,29 @@ fn handle_startup(key: &KeyEvent, km: &crate::input::keymap::Keymap) -> Vec<Acti
     }
 }
 
-fn handle_picker(key: &KeyEvent) -> Vec<Action> {
+fn handle_picker(app: &App, key: &KeyEvent) -> Vec<Action> {
+    if let Overlay::Picker(p) = &app.overlay {
+        if p.kind == crate::app::overlay::PickerKind::Session {
+            match key.code {
+                KeyCode::Char('a') | KeyCode::Char('n') if !ctrl_pressed(key) => {
+                    return vec![Action::NewSession]
+                }
+                KeyCode::Char('d') if !ctrl_pressed(key) => {
+                    return p
+                        .selected_index()
+                        .map(Action::DeleteSessionAt)
+                        .into_iter()
+                        .collect();
+                }
+                // Rename still uses the editable command palette/line: type the new
+                // name after the inserted command and press Enter.
+                KeyCode::Char('r') if !ctrl_pressed(key) => {
+                    return vec![Action::RunCommand("rename ".to_string())];
+                }
+                _ => {}
+            }
+        }
+    }
     match key.code {
         KeyCode::Esc => vec![Action::PickerCancel],
         KeyCode::Enter => vec![Action::PickerConfirm],
@@ -172,21 +240,32 @@ fn handle_permission(key: &KeyEvent) -> Vec<Action> {
         KeyCode::Esc => vec![Action::AgentCancel],
         KeyCode::Up | KeyCode::Char('k') if !ctrl_pressed(key) => vec![Action::PickerUp],
         KeyCode::Down | KeyCode::Char('j') if !ctrl_pressed(key) => vec![Action::PickerDown],
-        KeyCode::Enter => vec![Action::AgentPermitOnce],
-        KeyCode::Char('a') if !ctrl_pressed(key) => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                vec![Action::AgentPermitAll]
-            } else {
-                vec![Action::AgentPermitOnce]
-            }
-        }
-        KeyCode::Char('d') if !ctrl_pressed(key) => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                vec![Action::AgentDenyAll]
-            } else {
-                vec![Action::AgentDenyOnce]
-            }
-        }
+        // Enter applies whichever menu option is highlighted.
+        KeyCode::Enter => vec![Action::AgentResolvePermission],
+        // Quick shortcuts for the common once-off cases, so you don't have to
+        // arrow to them: 'a' allow this call, 'd' deny this call.
+        KeyCode::Char('a') if !ctrl_pressed(key) => vec![Action::AgentQuickAllow],
+        KeyCode::Char('d') if !ctrl_pressed(key) => vec![Action::AgentQuickDeny],
+        _ => vec![],
+    }
+}
+
+fn handle_decision(key: &KeyEvent) -> Vec<Action> {
+    match key.code {
+        KeyCode::Esc => vec![Action::AgentCancel],
+        KeyCode::Up | KeyCode::Char('k') if !ctrl_pressed(key) => vec![Action::PickerUp],
+        KeyCode::Down | KeyCode::Char('j') if !ctrl_pressed(key) => vec![Action::PickerDown],
+        KeyCode::Char(' ') if !ctrl_pressed(key) => vec![Action::AgentDecisionToggle],
+        KeyCode::Enter => vec![Action::AgentResolveDecision],
+        _ => vec![],
+    }
+}
+
+fn handle_plan(key: &KeyEvent) -> Vec<Action> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('d') if !ctrl_pressed(key) => vec![Action::AgentPlanDeny],
+        KeyCode::Char('e') if !ctrl_pressed(key) => vec![Action::AgentPlanEdit],
+        KeyCode::Char('a') | KeyCode::Enter if !ctrl_pressed(key) => vec![Action::AgentPlanAccept],
         _ => vec![],
     }
 }
@@ -196,21 +275,41 @@ fn handle_permission(key: &KeyEvent) -> Vec<Action> {
 fn handle_normal(app: &App, key: &KeyEvent) -> Vec<Action> {
     // Configurable mode-switch / action keys first.
     let km = &app.keymap;
-    if km.insert.matches(key) { return vec![Action::EnterInsert]; }
-    if km.command.matches(key) { return vec![Action::EnterCommand]; }
-    if km.palette.matches(key) { return vec![Action::OpenCommandPalette]; }
-    if km.help.matches(key) { return vec![Action::ToggleHelp]; }
-    if km.submit.matches(key) { return vec![Action::Submit]; }
-    if km.visual.matches(key) { return vec![Action::EnterVisual]; }
+    if km.insert.matches(key) {
+        return vec![Action::EnterInsert];
+    }
+    // `:` and `/` both open the command palette overlay (no separate command mode).
+    if km.command.matches(key) {
+        return vec![Action::OpenCommandPalette];
+    }
+    if km.palette.matches(key) {
+        return vec![Action::OpenCommandPalette];
+    }
+    if km.help.matches(key) {
+        return vec![Action::ToggleHelp];
+    }
+    if km.submit.matches(key) {
+        return vec![Action::Submit];
+    }
+    if km.visual.matches(key) {
+        return vec![Action::EnterVisual];
+    }
 
     // Fixed vim motions / edits (standard vim, not remapped).
     match key.code {
         KeyCode::Esc => vec![],
+        KeyCode::Char('V') => vec![Action::EnterVisualLine],
         KeyCode::Char('I') => vec![Action::EnterInsert, Action::LineStart],
         KeyCode::Char('a') => vec![Action::EnterInsert, Action::Move(Dir::Right)],
         KeyCode::Char('A') => vec![Action::EnterInsert, Action::LineEnd],
         KeyCode::Char('o') => vec![Action::EnterInsert, Action::Newline],
-        KeyCode::Char('O') => vec![Action::LineStart, Action::EnterInsert, Action::Newline, Action::Move(Dir::Up), Action::LineEnd],
+        KeyCode::Char('O') => vec![
+            Action::LineStart,
+            Action::EnterInsert,
+            Action::Newline,
+            Action::Move(Dir::Up),
+            Action::LineEnd,
+        ],
         KeyCode::Char('h') | KeyCode::Left => vec![Action::Move(Dir::Left)],
         KeyCode::Char('j') | KeyCode::Down => vec![Action::Move(Dir::Down)],
         KeyCode::Char('k') | KeyCode::Up => vec![Action::Move(Dir::Up)],
@@ -232,6 +331,19 @@ fn handle_normal(app: &App, key: &KeyEvent) -> Vec<Action> {
 }
 
 fn handle_insert(app: &App, key: &KeyEvent) -> Vec<Action> {
+    // Newline chords must win even when popups/keymaps also handle Enter.
+    // Some terminals report Shift+Enter as Enter+SHIFT; others send a literal \n.
+    if key.code == KeyCode::Enter
+        && key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
+    {
+        return vec![Action::Newline];
+    }
+    if matches!(key.code, KeyCode::Char('\n')) {
+        return vec![Action::Newline];
+    }
+
     // While the @mention popup is open, the arrow keys / Enter drive it.
     if app.mention.active && !app.mention.matches.is_empty() {
         match key.code {
@@ -254,6 +366,14 @@ fn handle_insert(app: &App, key: &KeyEvent) -> Vec<Action> {
 
     // Word delete: Ctrl-W / Ctrl-Backspace (back), Ctrl-Delete (forward).
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    // Portable newline fallback. Shift/Alt/Ctrl+Enter only reach us when the
+    // terminal speaks the kitty keyboard protocol (breaks under tmux / plain
+    // xterm), so Ctrl-J — the canonical LF chord — is always available to insert a
+    // newline without submitting, whatever the terminal.
+    if ctrl && key.code == KeyCode::Char('j') {
+        return vec![Action::Newline];
+    }
     if ctrl && matches!(key.code, KeyCode::Backspace) {
         return vec![Action::DeleteWordBack];
     }
@@ -264,12 +384,17 @@ fn handle_insert(app: &App, key: &KeyEvent) -> Vec<Action> {
         return vec![Action::DeleteWordForward];
     }
 
-    // Enter sends the message (same as :w); Shift/Alt/Ctrl+Enter inserts a newline.
+    // Enter sends the message (same as :w); Shift/Alt/Ctrl+Enter inserts a newline
+    // (kitty-protocol terminals only — Ctrl-J above is the portable fallback).
     if key.code == KeyCode::Enter {
         let newline = key
             .modifiers
             .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL);
-        return if newline { vec![Action::Newline] } else { vec![Action::Submit] };
+        return if newline {
+            vec![Action::Newline]
+        } else {
+            vec![Action::Submit]
+        };
     }
     // Honour the `submit` binding if it's mapped to a non-Enter key too.
     if app.keymap.submit.matches(key) {
@@ -290,14 +415,10 @@ fn handle_insert(app: &App, key: &KeyEvent) -> Vec<Action> {
     }
 }
 
-fn handle_command(app: &App, key: &KeyEvent) -> Vec<Action> {
+fn handle_tool_request(key: &KeyEvent) -> Vec<Action> {
     match key.code {
-        KeyCode::Esc => vec![Action::EnterNormal],
-        KeyCode::Enter => vec![Action::RunCommand(app.command.clone())],
-        KeyCode::Backspace => vec![Action::CommandBackspace],
-        KeyCode::Up => vec![Action::CommandHistoryPrev],
-        KeyCode::Down => vec![Action::CommandHistoryNext],
-        KeyCode::Char(c) => vec![Action::CommandChar(c)],
+        KeyCode::Char('y') | KeyCode::Enter => vec![Action::AgentEnableTools],
+        KeyCode::Char('n') | KeyCode::Esc => vec![Action::AgentDeclineTools],
         _ => vec![],
     }
 }
@@ -333,7 +454,8 @@ fn handle_operator(key: &KeyEvent, _op: char) -> Vec<Action> {
 fn chord_escapes(chord: Option<(char, char)>, last_insert: Option<char>, key: KeyCode) -> bool {
     match (chord, key) {
         (Some((c1, c2)), KeyCode::Char(c)) => {
-            c.eq_ignore_ascii_case(&c2) && last_insert.map_or(false, |p| p.eq_ignore_ascii_case(&c1))
+            c.eq_ignore_ascii_case(&c2)
+                && last_insert.map_or(false, |p| p.eq_ignore_ascii_case(&c1))
         }
         _ => false,
     }
@@ -359,18 +481,30 @@ mod tests {
     #[test]
     fn chord_fires_on_second_char_after_first() {
         // chord = jk, last typed = 'j', now pressing 'k' → escape
-        assert!(chord_escapes(Some(('j', 'k')), Some('j'), KeyCode::Char('k')));
+        assert!(chord_escapes(
+            Some(('j', 'k')),
+            Some('j'),
+            KeyCode::Char('k')
+        ));
     }
 
     #[test]
     fn chord_ignores_when_previous_char_differs() {
-        assert!(!chord_escapes(Some(('j', 'k')), Some('x'), KeyCode::Char('k')));
+        assert!(!chord_escapes(
+            Some(('j', 'k')),
+            Some('x'),
+            KeyCode::Char('k')
+        ));
         assert!(!chord_escapes(Some(('j', 'k')), None, KeyCode::Char('k')));
     }
 
     #[test]
     fn chord_ignores_non_second_char() {
-        assert!(!chord_escapes(Some(('j', 'k')), Some('j'), KeyCode::Char('z')));
+        assert!(!chord_escapes(
+            Some(('j', 'k')),
+            Some('j'),
+            KeyCode::Char('z')
+        ));
     }
 
     #[test]

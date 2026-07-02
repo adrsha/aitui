@@ -5,6 +5,7 @@ pub mod layout;
 pub mod overlay;
 pub mod scrollbar;
 pub mod statusbar;
+pub mod todo;
 
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -15,8 +16,14 @@ use ratatui::Frame;
 use crate::app::state::{App, PanelLayout};
 use crate::render::theme::Theme;
 
+/// Input box auto-sizes to its content: one row per logical line, at least one row
+/// so it's always visible, and at most `config.ui.input_height` rows so a huge
+/// paste can't crowd out the transcript (that cap is what `:resize` adjusts).
 pub fn render(f: &mut Frame, app: &mut App) {
-    let lay = layout::compute(f.area(), app.config.ui.input_height);
+    let max_rows = app.config.ui.input_height.max(1);
+    let input_rows = (app.input.lines.len() as u16).clamp(1, max_rows);
+    let todo_h = todo::height(app.todos.len());
+    let lay = layout::compute(f.area(), input_rows, todo_h);
 
     // Reserve the rightmost column of the transcript for a scrollbar; the text
     // area (used for wrapping + click hit-testing) is everything left of it.
@@ -32,6 +39,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     chat::render(f, app, chat_area, &theme);
     scrollbar::render(f, app, scroll_area, &theme);
     render_tokens(f, app, chat_area, &theme);
+    todo::render(f, app, lay.todo, &theme);
     input::render(f, app, lay.input, &theme);
     statusbar::render(f, app, lay.statusbar, &theme);
 
@@ -48,6 +56,15 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
 
     overlay::render(f, app, &theme);
+
+    // Display pending image via Kitty protocol, then clear it (one-shot).
+    if let Some(ref path) = app.pending_image.take() {
+        let col = chat_area.x + 2;
+        let row = chat_area.y + 3;
+        let cols = chat_area.width.saturating_sub(4).max(4);
+        let rows = cols / 2;
+        let _ = crate::render::image::display_image(path, col, row, cols, rows);
+    }
 }
 
 /// Fade everything already drawn in `area` by adding the ANSI DIM attribute and
@@ -67,10 +84,28 @@ fn dim_area(f: &mut Frame, area: Rect) {
 /// Split the transcript rect into (text area, 1-column scrollbar on the right).
 fn split_scrollbar(chat: Rect) -> (Rect, Rect) {
     if chat.width < 2 {
-        return (chat, Rect { x: chat.x, y: chat.y, width: 0, height: chat.height });
+        return (
+            chat,
+            Rect {
+                x: chat.x,
+                y: chat.y,
+                width: 0,
+                height: chat.height,
+            },
+        );
     }
-    let text = Rect { x: chat.x, y: chat.y, width: chat.width - 1, height: chat.height };
-    let bar = Rect { x: chat.x + chat.width - 1, y: chat.y, width: 1, height: chat.height };
+    let text = Rect {
+        x: chat.x,
+        y: chat.y,
+        width: chat.width - 1,
+        height: chat.height,
+    };
+    let bar = Rect {
+        x: chat.x + chat.width - 1,
+        y: chat.y,
+        width: 1,
+        height: chat.height,
+    };
     (text, bar)
 }
 
@@ -81,12 +116,23 @@ fn render_tokens(f: &mut Frame, app: &App, chat: Rect, theme: &Theme) {
     if chat.width < 12 || chat.height == 0 {
         return;
     }
-    let label = format!(" ↑{} ↓{} · {} tok ", u.prompt_tokens, u.completion_tokens, u.total_tokens);
+    let label = format!(
+        " ↑{} ↓{} · {} tok ",
+        u.prompt_tokens, u.completion_tokens, u.total_tokens
+    );
     let w = (label.chars().count() as u16).min(chat.width);
-    let area = Rect { x: chat.x + chat.width - w, y: chat.y, width: w, height: 1 };
+    let area = Rect {
+        x: chat.x + chat.width - w,
+        y: chat.y,
+        width: w,
+        height: 1,
+    };
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(label, Style::default().fg(theme.faint)))),
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::default().fg(theme.faint),
+        ))),
         area,
     );
 }

@@ -24,7 +24,8 @@ pub enum Action {
     EnterInsert,
     EnterNormal,
     EnterVisual,
-    EnterCommand,
+    /// Line-wise visual selection (`V`).
+    EnterVisualLine,
     EnterOperator(char),
 
     // Input editing
@@ -50,12 +51,8 @@ pub enum Action {
     LineStart,
     LineEnd,
 
-    // Command line
-    CommandChar(char),
-    CommandBackspace,
+    // Command palette — `:`/`/` open an overlay; RunCommand runs the typed line.
     RunCommand(String),
-    CommandHistoryPrev,
-    CommandHistoryNext,
 
     // Sent-message history (shell-style up/down in the composer)
     InputHistoryPrev,
@@ -140,6 +137,8 @@ pub enum Action {
     NextModel,
     PrevModel,
     ModelsLoaded(Vec<String>),
+    /// The `/v1/models` fetch failed (connection/timeout) — fall back to mock.
+    ModelsFailed,
 
     // Files / attachment
     OpenFilePicker,
@@ -164,14 +163,28 @@ pub enum Action {
     MentionAccept,
     MentionCancel,
 
+    // Sessions (from the picker)
+    /// Delete the session at the given index in the picker list.
+    DeleteSessionAt(usize),
+
     // Agent
     ToggleAgentMode,
-    AgentPermitOnce,
-    AgentPermitAll,
-    AgentDenyOnce,
-    AgentDenyAll,
+    /// Apply the currently-highlighted option in the permission menu.
+    AgentResolvePermission,
+    /// Quick keys: allow / deny this one call without opening the full menu.
+    AgentQuickAllow,
+    AgentQuickDeny,
+    AgentDecisionToggle,
+    AgentResolveDecision,
+    AgentPlanEdit,
+    AgentPlanAccept,
+    AgentPlanDeny,
     AgentToolResult(crate::agent::ToolResult),
     AgentCancel,
+    /// The model emitted tool calls while agent mode is off: enable agent mode
+    /// and run them, or decline and let the model answer without tools.
+    AgentEnableTools,
+    AgentDeclineTools,
 
     // System prompt
     SetSystemPrompt(Option<String>),

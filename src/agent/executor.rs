@@ -2,9 +2,44 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{OnceLock, RwLock};
 use std::time::Instant;
 
+use base64::Engine;
+
 use super::tools::{ToolCall, ToolResult};
+
+#[derive(Debug, Clone)]
+pub struct SearchSettings {
+    pub provider: String,
+    pub searxng_url: String,
+}
+
+impl Default for SearchSettings {
+    fn default() -> Self {
+        Self {
+            provider: "searxng".to_string(),
+            searxng_url: String::new(),
+        }
+    }
+}
+
+static SEARCH_SETTINGS: OnceLock<RwLock<SearchSettings>> = OnceLock::new();
+
+pub fn configure_search(settings: SearchSettings) {
+    let lock = SEARCH_SETTINGS.get_or_init(|| RwLock::new(SearchSettings::default()));
+    if let Ok(mut guard) = lock.write() {
+        *guard = settings;
+    }
+}
+
+fn search_settings() -> SearchSettings {
+    SEARCH_SETTINGS
+        .get_or_init(|| RwLock::new(SearchSettings::default()))
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
 
 /// Execute a tool call, returning the result.
 /// `cwd` is the base directory for relative paths.
@@ -14,89 +49,152 @@ pub fn execute(call: ToolCall, cwd: &PathBuf) -> ToolResult {
     let duration_ms = start.elapsed().as_millis() as u64;
     match result {
         Ok(output) => ToolResult::success(call, output, duration_ms),
-        Err(err)   => ToolResult::failure(call, err, duration_ms),
+        Err(err) => ToolResult::failure(call, err, duration_ms),
     }
 }
 
 fn resolve_path(raw: &str, cwd: &PathBuf) -> PathBuf {
     let p = PathBuf::from(raw);
-    if p.is_absolute() { p } else { cwd.join(p) }
+    if p.is_absolute() {
+        p
+    } else {
+        cwd.join(p)
+    }
 }
 
 fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
+    use super::tools::ToolKind;
+
+    // Legacy tools no longer advertised in the schema, kept so a stray call still
+    // does the right thing (append must not silently overwrite like write would).
     match call.name.as_str() {
-        "read_file" => {
-            let path_str = call.args.get("path").and_then(|v| v.as_str())
+        "append_file" => return append_legacy(call, cwd),
+        "make_dir" => {
+            let path_str = call
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
                 .ok_or("Missing 'path' argument")?;
             let path = resolve_path(path_str, cwd);
-            fs::read_to_string(&path)
-                .map_err(|e| format!("Cannot read {}: {}", path.display(), e))
+            fs::create_dir_all(&path)
+                .map_err(|e| format!("Cannot create {}: {}", path.display(), e))?;
+            return Ok(format!("Created directory {}", path.display()));
+        }
+        _ => {}
+    }
+
+    match call.kind() {
+        Some(ToolKind::Read) => {
+            let path_str = call
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'path' argument")?;
+            let path = resolve_path(path_str, cwd);
+            let content = fs::read_to_string(&path)
+                .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
+            // Optional line window: offset = 1-based first line, limit = line count.
+            let offset = call
+                .args
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            let limit = call
+                .args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            if offset.is_none() && limit.is_none() {
+                // Whole file, but cap so a huge file can't blow the context window.
+                return Ok(truncate(content, 60_000));
+            }
+            let total = content.lines().count();
+            let start = offset.unwrap_or(1).max(1);
+            let take = limit.unwrap_or(usize::MAX);
+            let slice: String = content
+                .lines()
+                .skip(start - 1)
+                .take(take)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let end = (start - 1 + take.min(total.saturating_sub(start - 1))).min(total);
+            Ok(format!(
+                "[lines {}-{} of {}]\n{}",
+                start,
+                end,
+                total,
+                truncate(slice, 60_000)
+            ))
         }
 
-        "write_file" => {
-            let path_str = call.args.get("path").and_then(|v| v.as_str())
+        Some(ToolKind::Write) => {
+            let path_str = call
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
                 .ok_or("Missing 'path' argument")?;
-            let content = call.args.get("content").and_then(|v| v.as_str())
+            let content = call
+                .args
+                .get("content")
+                .and_then(|v| v.as_str())
                 .ok_or("Missing 'content' argument")?;
             let path = resolve_path(path_str, cwd);
+            // Capture the old content first so an update can show a diff.
+            let old = fs::read_to_string(&path).ok();
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|e| format!("Cannot create directories: {}", e))?;
             }
             fs::write(&path, content)
                 .map_err(|e| format!("Cannot write {}: {}", path.display(), e))?;
-            Ok(format!("Written {} bytes to {}", content.len(), path.display()))
-        }
-
-        "append_file" => {
-            let path_str = call.args.get("path").and_then(|v| v.as_str())
-                .ok_or("Missing 'path' argument")?;
-            let content = call.args.get("content").and_then(|v| v.as_str())
-                .ok_or("Missing 'content' argument")?;
-            let path = resolve_path(path_str, cwd);
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(|e| format!("Cannot open {}: {}", path.display(), e))?;
-            file.write_all(content.as_bytes())
-                .map_err(|e| format!("Cannot append to {}: {}", path.display(), e))?;
-            Ok(format!("Appended {} bytes to {}", content.len(), path.display()))
-        }
-
-        "list_dir" => {
-            let path_str = call.args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-            let path = resolve_path(path_str, cwd);
-            let entries = fs::read_dir(&path)
-                .map_err(|e| format!("Cannot list {}: {}", path.display(), e))?;
-
-            let mut lines: Vec<String> = Vec::new();
-            let mut dirs: Vec<String> = Vec::new();
-            let mut files: Vec<String> = Vec::new();
-
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if entry.path().is_dir() {
-                    dirs.push(format!("  📁 {}/", name));
-                } else {
-                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    files.push(format!("  📄 {}  ({})", name, fmt_size(size)));
-                }
+            match old {
+                Some(old) => Ok(format!(
+                    "Updated {}\n{}",
+                    path.display(),
+                    line_diff(&old, content)
+                )),
+                None => Ok(format!(
+                    "Created {} ({} lines)",
+                    path.display(),
+                    content.lines().count()
+                )),
             }
+        }
 
-            dirs.sort();
-            files.sort();
-            lines.push(format!("📂 {}", path.display()));
-            lines.extend(dirs);
-            lines.extend(files);
+        Some(ToolKind::List) => {
+            let path_str = call
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            let path = resolve_path(path_str, cwd);
+            // depth: how many levels to descend (1 = just this dir, the default).
+            let depth = call
+                .args
+                .get("depth")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1)
+                .max(1) as usize;
+            let mut lines: Vec<String> = vec![format!("📂 {}", path.display())];
+            let mut count = 0usize;
+            list_recursive(&path, depth, 1, &mut lines, &mut count);
             if lines.len() == 1 {
                 lines.push("  (empty)".to_string());
+            }
+            if count >= LIST_CAP {
+                lines.push(format!(
+                    "  … (capped at {} entries — narrow the path or lower depth)",
+                    LIST_CAP
+                ));
             }
             Ok(lines.join("\n"))
         }
 
-        "run_shell" => {
-            let cmd = call.args.get("command").and_then(|v| v.as_str())
+        Some(ToolKind::Shell) => {
+            let cmd = call
+                .args
+                .get("command")
+                .and_then(|v| v.as_str())
                 .ok_or("Missing 'command' argument")?;
             let output = Command::new("sh")
                 .arg("-c")
@@ -117,7 +215,9 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
                 result.push_str(&stdout);
             }
             if !stderr.is_empty() {
-                if !result.is_empty() { result.push('\n'); }
+                if !result.is_empty() {
+                    result.push('\n');
+                }
                 result.push_str("[stderr]\n");
                 result.push_str(&stderr);
             }
@@ -127,31 +227,70 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
             Ok(truncate(result, 8192))
         }
 
-        "search_files" => {
-            let pattern = call.args.get("pattern").and_then(|v| v.as_str())
+        Some(ToolKind::Search) => {
+            let pattern = call
+                .args
+                .get("pattern")
+                .or_else(|| call.args.get("query"))
+                .and_then(|v| v.as_str())
                 .ok_or("Missing 'pattern' argument")?;
-            let path_str = call.args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let path_str = call
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
             let path = resolve_path(path_str, cwd);
+            // Optional glob to restrict files (e.g. "*.rs"); passed to ripgrep when present.
+            let glob = call.args.get("glob").and_then(|v| v.as_str());
 
-            let mut matches: Vec<String> = Vec::new();
-            search_recursive(&path, pattern, &path, &mut matches, 0);
+            // Prefer ripgrep: regex, .gitignore-aware, skips binaries, fast. Fall back
+            // to the built-in literal-substring walker when `rg` isn't installed.
+            let matches = match ripgrep(pattern, &path, glob) {
+                Some(m) => m,
+                None => {
+                    let mut m: Vec<String> = Vec::new();
+                    search_recursive(&path, pattern, &path, &mut m, 0);
+                    m
+                }
+            };
 
             if matches.is_empty() {
-                Ok(format!("No matches for '{}' in {}", pattern, path.display()))
+                Ok(format!(
+                    "No matches for '{}' in {}",
+                    pattern,
+                    path.display()
+                ))
             } else {
-                let header = format!("{} match(es) for '{}':", matches.len(), pattern);
+                let shown = matches.len().min(200);
+                let header = format!(
+                    "{} match(es) for '{}' (showing {}):",
+                    matches.len(),
+                    pattern,
+                    shown
+                );
                 let mut out = vec![header];
                 out.extend(matches.into_iter().take(200));
                 Ok(truncate(out.join("\n"), 8192))
             }
         }
 
-        "edit_file" => {
-            let path_str = call.args.get("path").and_then(|v| v.as_str())
+        Some(ToolKind::Edit) => {
+            let path_str = call
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
                 .ok_or("Missing 'path' argument")?;
-            let old_s = call.args.get("old_string").and_then(|v| v.as_str())
+            let old_s = call
+                .args
+                .get("old_string")
+                .or_else(|| call.args.get("old"))
+                .and_then(|v| v.as_str())
                 .ok_or("Missing 'old_string' argument")?;
-            let new_s = call.args.get("new_string").and_then(|v| v.as_str())
+            let new_s = call
+                .args
+                .get("new_string")
+                .or_else(|| call.args.get("new"))
+                .and_then(|v| v.as_str())
                 .ok_or("Missing 'new_string' argument")?;
             let path = resolve_path(path_str, cwd);
             let content = fs::read_to_string(&path)
@@ -163,37 +302,45 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
             fs::write(&path, &replaced)
                 .map_err(|e| format!("Cannot write {}: {}", path.display(), e))?;
             let count = content.matches(old_s).count();
-            Ok(format!("Edit {} ({} occurrence{})", path.display(), count, if count == 1 { "" } else { "s" }))
+            Ok(format!(
+                "Edit {} ({} occurrence{})\n{}",
+                path.display(),
+                count,
+                if count == 1 { "" } else { "s" },
+                line_diff(&content, &replaced)
+            ))
         }
 
-        "delete_file" => {
-            let path_str = call.args.get("path").and_then(|v| v.as_str())
+        Some(ToolKind::Delete) => {
+            // One delete for both: detect file vs directory tree.
+            let path_str = call
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
                 .ok_or("Missing 'path' argument")?;
             let path = resolve_path(path_str, cwd);
-            if path.is_dir() {
-                return Err(format!("{} is a directory; use delete_dir to remove it", path.display()));
+            if !path.exists() {
+                return Err(format!("Not found: {}", path.display()));
             }
-            fs::remove_file(&path)
-                .map_err(|e| format!("Cannot delete {}: {}", path.display(), e))?;
-            Ok(format!("Deleted {}", path.display()))
+            if path.is_dir() {
+                fs::remove_dir_all(&path)
+                    .map_err(|e| format!("Cannot delete {}: {}", path.display(), e))?;
+                Ok(format!("Removed {}/ (directory)", path.display()))
+            } else {
+                fs::remove_file(&path)
+                    .map_err(|e| format!("Cannot delete {}: {}", path.display(), e))?;
+                Ok(format!("Removed {}", path.display()))
+            }
         }
 
-        "make_dir" => {
-            let path_str = call.args.get("path").and_then(|v| v.as_str())
-                .ok_or("Missing 'path' argument")?;
-            let path = resolve_path(path_str, cwd);
-            fs::create_dir_all(&path)
-                .map_err(|e| format!("Cannot create {}: {}", path.display(), e))?;
-            Ok(format!("Created directory {}", path.display()))
-        }
-
-        "move_path" => {
+        Some(ToolKind::Move) => {
             let (from, to) = from_to(call, cwd)?;
             if !from.exists() {
                 return Err(format!("Source not found: {}", from.display()));
             }
             if let Some(parent) = to.parent() {
-                fs::create_dir_all(parent).map_err(|e| format!("Cannot create target dir: {}", e))?;
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Cannot create target dir: {}", e))?;
             }
             // Try a fast rename; fall back to copy+remove across filesystems.
             match fs::rename(&from, &to) {
@@ -206,39 +353,34 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
             }
         }
 
-        "copy_path" => {
+        Some(ToolKind::Copy) => {
             let (from, to) = from_to(call, cwd)?;
             if !from.exists() {
                 return Err(format!("Source not found: {}", from.display()));
             }
             if let Some(parent) = to.parent() {
-                fs::create_dir_all(parent).map_err(|e| format!("Cannot create target dir: {}", e))?;
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Cannot create target dir: {}", e))?;
             }
             copy_recursive(&from, &to)?;
             Ok(format!("Copied {} → {}", from.display(), to.display()))
         }
 
-        "delete_dir" => {
-            let path_str = call.args.get("path").and_then(|v| v.as_str())
-                .ok_or("Missing 'path' argument")?;
-            let path = resolve_path(path_str, cwd);
-            if !path.is_dir() {
-                return Err(format!("{} is not a directory (use delete_file)", path.display()));
-            }
-            fs::remove_dir_all(&path)
-                .map_err(|e| format!("Cannot delete {}: {}", path.display(), e))?;
-            Ok(format!("Deleted directory {}", path.display()))
-        }
-
-        "web_search" => {
-            let query = call.args.get("query").or_else(|| call.args.get("q"))
+        Some(ToolKind::WebSearch) => {
+            let query = call
+                .args
+                .get("query")
+                .or_else(|| call.args.get("q"))
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'query' argument")?;
             web_search(query)
         }
 
-        "web_fetch" => {
-            let url = call.args.get("url").and_then(|v| v.as_str())
+        Some(ToolKind::WebFetch) => {
+            let url = call
+                .args
+                .get("url")
+                .and_then(|v| v.as_str())
                 .ok_or("Missing 'url' argument")?;
             let body = http_get_text(url)?;
             let text = truncate(strip_html(&body), 8192);
@@ -255,30 +397,80 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
             }
         }
 
-        "download_file" => {
-            let url = call.args.get("url").and_then(|v| v.as_str())
+        Some(ToolKind::Download) => {
+            let url = call
+                .args
+                .get("url")
+                .and_then(|v| v.as_str())
                 .ok_or("Missing 'url' argument")?;
-            let path_str = call.args.get("path").and_then(|v| v.as_str())
+            let path_str = call
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
                 .ok_or("Missing 'path' argument")?;
             let path = resolve_path(path_str, cwd);
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|e| format!("Cannot create target dir: {}", e))?;
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Cannot create target dir: {}", e))?;
             }
             let bytes = http_get_bytes(url)?;
             let n = bytes.len();
-            fs::write(&path, &bytes).map_err(|e| format!("Cannot write {}: {}", path.display(), e))?;
+            fs::write(&path, &bytes)
+                .map_err(|e| format!("Cannot write {}: {}", path.display(), e))?;
             Ok(format!("Downloaded {} bytes → {}", n, path.display()))
         }
 
-        name => Err(format!("Unknown tool: {}", name)),
+        // These are intercepted by the app layer and never reach the executor;
+        // handled here only for match exhaustiveness.
+        Some(ToolKind::Todo) => Ok("(todo handled by UI)".into()),
+        Some(ToolKind::Ask) => Ok("(ask handled by UI)".into()),
+        Some(ToolKind::Plan) => Ok("(plan handled by UI)".into()),
+
+        None => Err(format!("Unknown tool: {}", call.name)),
     }
+}
+
+/// Legacy `append_file`: append content without overwriting. Not advertised in the
+/// current schema, kept so a stray call still appends rather than clobbering.
+fn append_legacy(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
+    let path_str = call
+        .args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'path' argument")?;
+    let content = call
+        .args
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'content' argument")?;
+    let path = resolve_path(path_str, cwd);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("Cannot open {}: {}", path.display(), e))?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("Cannot append to {}: {}", path.display(), e))?;
+    Ok(format!(
+        "Appended to {} ({} lines)",
+        path.display(),
+        content.lines().count()
+    ))
 }
 
 /// Resolve the `from`/`to` (aliases `source`/`dest`/`destination`) path args.
 fn from_to(call: &ToolCall, cwd: &PathBuf) -> Result<(PathBuf, PathBuf), String> {
-    let from = call.args.get("from").or_else(|| call.args.get("source")).and_then(|v| v.as_str())
+    let from = call
+        .args
+        .get("from")
+        .or_else(|| call.args.get("source"))
+        .and_then(|v| v.as_str())
         .ok_or("Missing 'from' argument")?;
-    let to = call.args.get("to").or_else(|| call.args.get("dest")).or_else(|| call.args.get("destination"))
+    let to = call
+        .args
+        .get("to")
+        .or_else(|| call.args.get("dest"))
+        .or_else(|| call.args.get("destination"))
         .and_then(|v| v.as_str())
         .ok_or("Missing 'to' argument")?;
     Ok((resolve_path(from, cwd), resolve_path(to, cwd)))
@@ -288,7 +480,9 @@ fn from_to(call: &ToolCall, cwd: &PathBuf) -> Result<(PathBuf, PathBuf), String>
 fn copy_recursive(from: &Path, to: &Path) -> Result<(), String> {
     if from.is_dir() {
         fs::create_dir_all(to).map_err(|e| format!("Cannot create {}: {}", to.display(), e))?;
-        for entry in fs::read_dir(from).map_err(|e| format!("Cannot read {}: {}", from.display(), e))? {
+        for entry in
+            fs::read_dir(from).map_err(|e| format!("Cannot read {}: {}", from.display(), e))?
+        {
             let entry = entry.map_err(|e| e.to_string())?;
             copy_recursive(&entry.path(), &to.join(entry.file_name()))?;
         }
@@ -301,7 +495,11 @@ fn copy_recursive(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 fn remove_any(path: &Path) -> Result<(), String> {
-    let r = if path.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
+    let r = if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
     r.map_err(|e| format!("Cannot remove {}: {}", path.display(), e))
 }
 
@@ -310,6 +508,45 @@ fn remove_any(path: &Path) -> Result<(), String> {
 /// is safe and keeps the executor's synchronous signature).
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     tokio::runtime::Handle::current().block_on(fut)
+}
+
+/// A compact line diff of `old` → `new`: strips the common prefix/suffix and shows
+/// the changed span as `- ` (removed) then `+ ` (added) lines. Good for the typical
+/// single-region edit; a scattered change shows the whole span between first and
+/// last difference. Capped so a huge write doesn't flood the transcript.
+fn line_diff(old: &str, new: &str) -> String {
+    if old == new {
+        return "(no changes)".to_string();
+    }
+    let o: Vec<&str> = old.lines().collect();
+    let n: Vec<&str> = new.lines().collect();
+    let mut p = 0;
+    while p < o.len() && p < n.len() && o[p] == n[p] {
+        p += 1;
+    }
+    let mut s = 0;
+    while s < o.len().saturating_sub(p)
+        && s < n.len().saturating_sub(p)
+        && o[o.len() - 1 - s] == n[n.len() - 1 - s]
+    {
+        s += 1;
+    }
+    let removed = &o[p..o.len() - s];
+    let added = &n[p..n.len() - s];
+    let mut lines: Vec<String> = Vec::new();
+    if p > 0 || s > 0 {
+        lines.push(format!("@@ line {} @@", p + 1));
+    }
+    for l in removed {
+        lines.push(format!("- {}", l));
+    }
+    for l in added {
+        lines.push(format!("+ {}", l));
+    }
+    if lines.is_empty() {
+        return "(no changes)".to_string();
+    }
+    truncate(lines.join("\n"), 6000)
 }
 
 fn http_client() -> Result<reqwest::Client, String> {
@@ -326,9 +563,16 @@ fn http_get_text(url: &str) -> Result<String, String> {
     }
     let client = http_client()?;
     block_on(async move {
-        let resp = client.get(url).send().await.map_err(|e| format!("Request failed: {}", e))?;
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| format!("Read body failed: {}", e))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("Read body failed: {}", e))?;
         if !status.is_success() {
             return Err(format!("HTTP {}: {}", status, truncate(text, 500)));
         }
@@ -342,47 +586,235 @@ fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
     }
     let client = http_client()?;
     block_on(async move {
-        let resp = client.get(url).send().await.map_err(|e| format!("Request failed: {}", e))?;
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(format!("HTTP {}", status));
         }
-        resp.bytes().await.map(|b| b.to_vec()).map_err(|e| format!("Read body failed: {}", e))
+        resp.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| format!("Read body failed: {}", e))
     })
 }
 
-/// Web search via DuckDuckGo's keyless HTML endpoint, which returns real result
-/// links + snippets (the Instant-Answer JSON API only has encyclopedia-style
-/// abstracts, so it returns nothing for news / most queries). No API key needed.
+/// Web search. SearxNG is the default provider because it is open-source and
+/// self-hostable; DuckDuckGo/Bing remain fallback providers so the tool still
+/// works when public SearxNG instances rate-limit or block automated requests.
 fn web_search(query: &str) -> Result<String, String> {
+    let settings = search_settings();
+    let provider = settings.provider.trim().to_lowercase();
+    let mut diagnostics = Vec::new();
+
+    let mut tried_primary = false;
+    if provider.is_empty() || provider == "searxng" || provider == "searx" {
+        tried_primary = true;
+        match search_searxng(query, settings.searxng_url.trim()) {
+            Ok((provider_name, results)) if !results.is_empty() => {
+                return Ok(format_search_results(query, &provider_name, &results));
+            }
+            Ok((provider_name, _)) => {
+                diagnostics.push(format!("{} returned no parseable results", provider_name))
+            }
+            Err(e) => diagnostics.push(format!("SearxNG failed: {}", e)),
+        }
+    }
+
+    if provider == "duckduckgo" || provider == "ddg" || tried_primary {
+        match search_duckduckgo(query) {
+            Ok(results) if !results.is_empty() => {
+                return Ok(format_search_results(query, "DuckDuckGo", &results))
+            }
+            Ok(_) => diagnostics.push(
+                "DuckDuckGo returned no parseable results; likely blocked/challenged".to_string(),
+            ),
+            Err(e) => diagnostics.push(format!("DuckDuckGo failed: {}", e)),
+        }
+    }
+
+    if provider == "bing" || tried_primary || provider == "duckduckgo" || provider == "ddg" {
+        match search_bing(query) {
+            Ok(results) if !results.is_empty() => {
+                return Ok(format_search_results(query, "Bing", &results))
+            }
+            Ok(_) => diagnostics.push("Bing returned no parseable results".to_string()),
+            Err(e) => diagnostics.push(format!("Bing failed: {}", e)),
+        }
+    }
+
+    if !matches!(
+        provider.as_str(),
+        "" | "searx" | "searxng" | "duckduckgo" | "ddg" | "bing"
+    ) {
+        diagnostics.push(format!(
+            "Unknown search provider '{}'; supported: searxng, duckduckgo, bing",
+            provider
+        ));
+    }
+
+    Ok(format!(
+        "No parseable search results for '{}'. Diagnostics: {}. Try setting [search].searxng_url or AITUI_SEARXNG_URL to your own SearxNG instance, or web_fetch a specific URL.",
+        query,
+        diagnostics.join("; ")
+    ))
+}
+
+fn search_duckduckgo(query: &str) -> Result<Vec<(String, String, String)>, String> {
+    let html = fetch_search_html("https://html.duckduckgo.com/html/", query)?;
+    Ok(parse_ddg_results(&html))
+}
+
+fn search_bing(query: &str) -> Result<Vec<(String, String, String)>, String> {
+    let html = fetch_search_html("https://www.bing.com/search", query)?;
+    Ok(parse_bing_results(&html))
+}
+
+fn search_searxng(
+    query: &str,
+    configured_url: &str,
+) -> Result<(String, Vec<(String, String, String)>), String> {
+    let mut diagnostics = Vec::new();
+    for base in searxng_bases(configured_url) {
+        match fetch_searxng_json(&base, query) {
+            Ok(json) => {
+                let results = parse_searxng_json_results(&json);
+                if !results.is_empty() {
+                    return Ok((format!("SearxNG {}", normalize_base_url(&base)), results));
+                }
+                diagnostics.push(format!("{} returned JSON with no parseable results", base));
+            }
+            Err(e) => diagnostics.push(format!("{}: {}", base, e)),
+        }
+    }
+    Err(diagnostics.join("; "))
+}
+
+fn searxng_bases(configured_url: &str) -> Vec<String> {
+    let mut bases = Vec::new();
+    if !configured_url.trim().is_empty() {
+        bases.push(normalize_base_url(configured_url));
+    }
+    if let Ok(env_url) = std::env::var("AITUI_SEARXNG_URL") {
+        if !env_url.trim().is_empty() {
+            bases.push(normalize_base_url(&env_url));
+        }
+    }
+    // Public instances are best-effort only; most will eventually rate-limit
+    // automated clients. Users should set `searxng_url` for reliable searches.
+    for url in [
+        "https://search.inetol.net/",
+        "https://searx.tiekoetter.com/",
+        "https://opnxng.com/",
+        "https://baresearch.org/",
+    ] {
+        bases.push(normalize_base_url(url));
+    }
+    bases.dedup();
+    bases
+}
+
+fn normalize_base_url(url: &str) -> String {
+    let url = url.trim().trim_end_matches('/');
+    url.strip_suffix("/search").unwrap_or(url).to_string()
+}
+
+fn fetch_searxng_json(base_url: &str, query: &str) -> Result<String, String> {
+    let base = normalize_base_url(base_url);
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        return Err(format!("Refusing non-http(s) SearxNG URL: {}", base_url));
+    }
+    let url = format!("{}/search?q={}&format=json", base, urlencode(query));
+    fetch_url_text(&url, "application/json,text/html;q=0.5", false)
+}
+
+fn fetch_search_html(base_url: &str, query: &str) -> Result<String, String> {
+    let sep = if base_url.contains('?') { '&' } else { '?' };
+    let url = format!("{}{}q={}", base_url, sep, urlencode(query));
+    fetch_url_text(
+        &url,
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        true,
+    )
+}
+
+fn fetch_url_text(url: &str, accept: &str, allow_202: bool) -> Result<String, String> {
     let client = http_client()?;
-    let url = format!("https://html.duckduckgo.com/html/?q={}", urlencode(query));
-    let html = block_on(async move {
-        // A browser-ish UA + Accept-Language; the html endpoint returns a blank
-        // page to unknown agents.
+    let url = url.to_string();
+    block_on(async move {
         let resp = client
             .get(&url)
-            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:123.0) Gecko/20100101 Firefox/123.0")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (X11; Linux x86_64; rv:123.0) Gecko/20100101 Firefox/123.0",
+            )
+            .header("Accept", accept)
             .header("Accept-Language", "en-US,en;q=0.9")
             .send()
             .await
-            .map_err(|e| format!("Search failed: {}", e))?;
+            .map_err(|e| format!("Search request failed: {}", e))?;
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| format!("Read body failed: {}", e))?;
-        if !status.is_success() {
-            return Err(format!("Search HTTP {}: {}", status, truncate(text, 300)));
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("Read body failed: {}", e))?;
+        if !(status.is_success() || (allow_202 && status.as_u16() == 202)) {
+            return Err(format!("HTTP {}: {}", status, truncate(text, 300)));
+        }
+        if text.to_lowercase().contains("making sure you")
+            && text.to_lowercase().contains("not a bot")
+        {
+            return Err("bot-check page returned".to_string());
         }
         Ok(text)
-    })?;
+    })
+}
 
-    let results = parse_ddg_results(&html);
-    if results.is_empty() {
-        return Ok(format!(
-            "No results for '{}'. Try different search terms, or web_fetch a specific URL.",
-            query
-        ));
+fn parse_searxng_json_results(json: &str) -> Vec<(String, String, String)> {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(items) = root.get("results").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let title = item
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let url = item
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let snippet = item
+            .get("content")
+            .or_else(|| item.get("snippet"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if title.is_empty() || url.is_empty() {
+            continue;
+        }
+        out.push((strip_tags(title), html_unescape(url), strip_tags(snippet)));
+        if out.len() >= 20 {
+            break;
+        }
     }
-    let mut out = vec![format!("Search results for '{}':", query)];
+    out
+}
+
+fn format_search_results(
+    query: &str,
+    provider: &str,
+    results: &[(String, String, String)],
+) -> String {
+    let mut out = vec![format!("Search results for '{}' ({}):", query, provider)];
     for (i, (title, link, snippet)) in results.iter().take(8).enumerate() {
         if snippet.is_empty() {
             out.push(format!("{}. {}\n   {}", i + 1, title, link));
@@ -390,7 +822,7 @@ fn web_search(query: &str) -> Result<String, String> {
             out.push(format!("{}. {}\n   {}\n   {}", i + 1, title, link, snippet));
         }
     }
-    Ok(truncate(out.join("\n\n"), 8192))
+    truncate(out.join("\n\n"), 8192)
 }
 
 /// Parse DuckDuckGo HTML search results into `(title, url, snippet)` tuples.
@@ -403,7 +835,7 @@ fn parse_ddg_results(html: &str) -> Vec<(String, String, String)> {
         let a_idx = pos + rel;
         let tag_start = html[..a_idx].rfind("<a").unwrap_or(a_idx);
         let href = extract_attr(&html[tag_start..], "href").unwrap_or_default();
-        let link = decode_uddg(&href);
+        let link = decode_uddg(&html_unescape(&href));
 
         // Inner text of the anchor is the title.
         let mut after = a_idx;
@@ -439,6 +871,66 @@ fn parse_ddg_results(html: &str) -> Vec<(String, String, String)> {
     out
 }
 
+/// Parse Bing HTML results. Bing marks organic results as `<li class="b_algo">`
+/// with the main title in the first `<h2><a ...>` and the snippet in
+/// `<div class="b_caption"><p>...`.
+fn parse_bing_results(html: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = html[pos..].find("b_algo") {
+        let item_start = pos + rel;
+        let item_end = html[item_start + 1..]
+            .find("<li class=\"b_algo\"")
+            .map(|n| item_start + 1 + n)
+            .unwrap_or_else(|| (item_start + 12_000).min(html.len()));
+        let item = &html[item_start..item_end];
+
+        let Some(h2_rel) = item.find("<h2") else {
+            pos = item_end;
+            continue;
+        };
+        let h2 = &item[h2_rel..];
+        let Some(a_rel) = h2.find("<a") else {
+            pos = item_end;
+            continue;
+        };
+        let a = &h2[a_rel..];
+        let href = extract_attr(a, "href").unwrap_or_default();
+        let link = decode_bing_url(&html_unescape(&href));
+
+        let mut title = String::new();
+        if let Some(gt) = a.find('>') {
+            let start = gt + 1;
+            if let Some(close) = a[start..].find("</a>") {
+                title = strip_tags(&a[start..start + close]);
+            }
+        }
+
+        let mut snippet = String::new();
+        if let Some(cap_rel) = item.find("b_caption") {
+            let cap = &item[cap_rel..];
+            if let Some(p_rel) = cap.find("<p") {
+                let p = &cap[p_rel..];
+                if let Some(gt) = p.find('>') {
+                    let start = gt + 1;
+                    if let Some(close) = p[start..].find("</p>") {
+                        snippet = strip_tags(&p[start..start + close]);
+                    }
+                }
+            }
+        }
+
+        if !title.is_empty() && !link.is_empty() {
+            out.push((title, link, snippet));
+        }
+        pos = item_end;
+        if out.len() >= 20 {
+            break;
+        }
+    }
+    out
+}
+
 /// Read an HTML attribute value (`name="..."`) from the start of a tag.
 fn extract_attr(tag: &str, name: &str) -> Option<String> {
     let pat = format!("{}=\"", name);
@@ -462,6 +954,45 @@ fn decode_uddg(href: &str) -> String {
     } else {
         href.to_string()
     }
+}
+
+/// Decode Bing click-tracking URLs. Bing often wraps organic result URLs as
+/// `/ck/a?...&u=a1<base64url destination>&...`; return the destination when we
+/// can decode it, otherwise keep the original href.
+fn decode_bing_url(href: &str) -> String {
+    if let Some(idx) = href.find("u=") {
+        let rest = &href[idx + 2..];
+        let enc = rest.split('&').next().unwrap_or(rest);
+        let enc = pct_decode(enc);
+        let b64 = enc.strip_prefix("a1").unwrap_or(&enc);
+        for engine in [
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            &base64::engine::general_purpose::URL_SAFE,
+        ] {
+            if let Ok(bytes) = engine.decode(b64) {
+                let decoded = String::from_utf8_lossy(&bytes).to_string();
+                if decoded.starts_with("http://") || decoded.starts_with("https://") {
+                    return decoded;
+                }
+            }
+        }
+    }
+    if href.starts_with("http") {
+        href.to_string()
+    } else if let Some(stripped) = href.strip_prefix("//") {
+        format!("https://{}", stripped)
+    } else {
+        href.to_string()
+    }
+}
+
+fn html_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
 }
 
 /// Percent-decode a URL-encoded string (also turns `+` into space).
@@ -521,7 +1052,9 @@ fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
@@ -533,7 +1066,11 @@ fn urlencode(s: &str) -> String {
 fn strip_html(html: &str) -> String {
     let lower = html.to_lowercase();
     // If it doesn't look like HTML, return as-is.
-    if !lower.contains("<html") && !lower.contains("<body") && !lower.contains("<div") && !lower.contains("<p") {
+    if !lower.contains("<html")
+        && !lower.contains("<body")
+        && !lower.contains("<div")
+        && !lower.contains("<p")
+    {
         return html.to_string();
     }
     let mut out = String::with_capacity(html.len() / 2);
@@ -551,16 +1088,109 @@ fn strip_html(html: &str) -> String {
             }
             continue;
         }
-        if lower[i..].starts_with("<script") { skip_until = Some("</script>"); i += 7; continue; }
-        if lower[i..].starts_with("<style") { skip_until = Some("</style>"); i += 6; continue; }
+        if lower[i..].starts_with("<script") {
+            skip_until = Some("</script>");
+            i += 7;
+            continue;
+        }
+        if lower[i..].starts_with("<style") {
+            skip_until = Some("</style>");
+            i += 6;
+            continue;
+        }
         let c = bytes[i] as char;
-        if c == '<' { in_tag = true; }
-        else if c == '>' { in_tag = false; out.push(' '); }
-        else if !in_tag { out.push(c); }
+        if c == '<' {
+            in_tag = true;
+        } else if c == '>' {
+            in_tag = false;
+            out.push(' ');
+        } else if !in_tag {
+            out.push(c);
+        }
         i += 1;
     }
     // Collapse runs of whitespace.
     out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Max entries a single `list_dir` will emit before it stops descending.
+const LIST_CAP: usize = 400;
+
+/// Recursively list `dir` up to `max_depth` levels (1 = just this dir). Dirs first,
+/// then files, each sorted; hidden and heavy build dirs are skipped. Appends indented
+/// lines to `lines` and counts entries so the caller can report a cap hit.
+fn list_recursive(
+    dir: &Path,
+    max_depth: usize,
+    depth: usize,
+    lines: &mut Vec<String>,
+    count: &mut usize,
+) {
+    if depth > max_depth || *count >= LIST_CAP {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    let indent = "  ".repeat(depth);
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name == "target" || name == "node_modules" {
+            continue;
+        }
+        if entry.path().is_dir() {
+            dirs.push((format!("{}📁 {}/", indent, name), entry.path()));
+        } else {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            files.push(format!("{}📄 {}  ({})", indent, name, fmt_size(size)));
+        }
+    }
+    dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    files.sort();
+    for (line, sub) in dirs {
+        if *count >= LIST_CAP {
+            return;
+        }
+        lines.push(line);
+        *count += 1;
+        list_recursive(&sub, max_depth, depth + 1, lines, count);
+    }
+    for line in files {
+        if *count >= LIST_CAP {
+            return;
+        }
+        lines.push(line);
+        *count += 1;
+    }
+}
+
+/// Run ripgrep for `pattern` under `path`, returning `file:line: text` matches.
+/// Returns `None` if `rg` isn't on PATH (caller falls back to the built-in walker).
+/// `rg`'s own exit code 1 (no matches) maps to an empty vec, not a fallback.
+fn ripgrep(pattern: &str, path: &Path, glob: Option<&str>) -> Option<Vec<String>> {
+    let mut cmd = Command::new("rg");
+    cmd.arg("--line-number")
+        .arg("--no-heading")
+        .arg("--color=never")
+        .arg("--max-count=50")
+        .arg("--max-columns=300");
+    if let Some(g) = glob {
+        cmd.arg("--glob").arg(g);
+    }
+    cmd.arg("-e").arg(pattern).arg(path);
+    let output = cmd.output().ok()?;
+    // rg missing → Command::output errors above → None. Here rg ran: 0 = matches,
+    // 1 = no matches (both fine), 2 = actual error (still return what we parsed).
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Some(
+        stdout
+            .lines()
+            .take(200)
+            .map(|l| format!("  {}", l))
+            .collect(),
+    )
 }
 
 fn search_recursive(
@@ -591,7 +1221,12 @@ fn search_recursive(
                 for (line_no, line) in content.lines().enumerate() {
                     if line.to_lowercase().contains(&pattern.to_lowercase()) {
                         let rel = path.strip_prefix(base).unwrap_or(&path);
-                        matches.push(format!("  {}:{}: {}", rel.display(), line_no + 1, line.trim()));
+                        matches.push(format!(
+                            "  {}:{}: {}",
+                            rel.display(),
+                            line_no + 1,
+                            line.trim()
+                        ));
                     }
                 }
             }
@@ -600,17 +1235,27 @@ fn search_recursive(
 }
 
 fn fmt_size(bytes: u64) -> String {
-
-    if bytes < 1024 { format!("{}B", bytes) }
-    else if bytes < 1024 * 1024 { format!("{:.1}KB", bytes as f64 / 1024.0) }
-    else { format!("{:.1}MB", bytes as f64 / 1024.0 / 1024.0) }
+    if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / 1024.0 / 1024.0)
+    }
 }
 
 fn truncate(s: String, max: usize) -> String {
     if s.len() <= max {
         s
     } else {
-        format!("{}…\n[truncated {} bytes]", &s[..max], s.len() - max)
+        // Slice on a UTF-8 char boundary: `&s[..max]` panics if `max` lands in the
+        // middle of a multi-byte char (any non-ASCII tool output near the cap),
+        // which was crashing the app mid-tool-call. Walk back to the nearest boundary.
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…\n[truncated {} bytes]", &s[..end], s.len() - end)
     }
 }
 
@@ -620,7 +1265,35 @@ mod tests {
     use std::fs;
 
     fn make_call(name: &str, args: serde_json::Value) -> ToolCall {
-        ToolCall { name: name.into(), args, id: None }
+        ToolCall {
+            name: name.into(),
+            args,
+            id: None,
+        }
+    }
+
+    #[test]
+    fn truncate_does_not_panic_on_multibyte_boundary() {
+        // A cap landing inside a multi-byte char used to panic. Build a string where
+        // byte `max` falls mid-emoji and confirm it truncates cleanly.
+        let s = format!("{}🚀🚀🚀", "a".repeat(9));
+        // "🚀" is 4 bytes; max=10 lands inside the first emoji.
+        let out = truncate(s, 10);
+        assert!(out.starts_with(&"a".repeat(9)));
+        assert!(out.contains("truncated"));
+    }
+
+    #[test]
+    fn line_diff_shows_changed_region_only() {
+        let d = line_diff("a\nb\nc\nd", "a\nB\nc\nd");
+        assert!(d.contains("- b"));
+        assert!(d.contains("+ B"));
+        assert!(
+            !d.contains("- a") && !d.contains("- c"),
+            "common lines omitted: {}",
+            d
+        );
+        assert_eq!(line_diff("same", "same"), "(no changes)");
     }
 
     #[test]
@@ -654,6 +1327,82 @@ mod tests {
         assert!(parse_ddg_results("<html><body>nothing here</body></html>").is_empty());
     }
 
+    #[test]
+    fn parse_searxng_json_results_extracts_title_url_snippet() {
+        let json = r#"{
+          "query": "rust crossterm",
+          "results": [
+            {
+              "title": "<b>Crossterm</b> docs",
+              "url": "https://docs.rs/crossterm/latest/crossterm/",
+              "content": "Terminal manipulation &amp; event handling"
+            },
+            {
+              "title": "Missing URL",
+              "content": "ignored"
+            }
+          ]
+        }"#;
+        let results = parse_searxng_json_results(json);
+        assert_eq!(results.len(), 1);
+        let (title, url, snippet) = &results[0];
+        assert_eq!(title, "Crossterm docs");
+        assert_eq!(url, "https://docs.rs/crossterm/latest/crossterm/");
+        assert_eq!(snippet, "Terminal manipulation & event handling");
+    }
+
+    #[test]
+    fn searxng_bases_prefers_configured_url_and_dedups() {
+        let bases = searxng_bases("https://example.com/search/");
+        assert_eq!(
+            bases.first().map(|s| s.as_str()),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            bases
+                .iter()
+                .filter(|s| s.as_str() == "https://example.com")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn parse_bing_results_extracts_and_decodes_redirect() {
+        let html = r#"
+          <ol id="b_results">
+            <li class="b_algo">
+              <h2><a target="_blank" href="https://www.bing.com/ck/a?!&amp;&amp;u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9kb2NzP3E9cnVzdCZsYW5nPWVu&amp;ntb=1">Example <strong>Docs</strong></a></h2>
+              <div class="b_caption"><p>A useful &amp; relevant result.</p></div>
+            </li>
+          </ol>"#;
+        let results = parse_bing_results(html);
+        assert_eq!(results.len(), 1);
+        let (title, url, snippet) = &results[0];
+        assert_eq!(title, "Example Docs");
+        assert_eq!(url, "https://example.com/docs?q=rust&lang=en");
+        assert_eq!(snippet, "A useful & relevant result.");
+    }
+
+    #[test]
+    fn decode_bing_url_falls_back_to_direct_url() {
+        assert_eq!(
+            decode_bing_url("https://example.com/direct"),
+            "https://example.com/direct"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "live network test; run manually when changing web_search providers"]
+    async fn live_web_search_returns_results() {
+        let text = tokio::task::spawn_blocking(|| web_search("Rust crossterm"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(text.contains("Search results for"), "{}", text);
+        assert!(!text.contains("No parseable search results"), "{}", text);
+    }
+
     fn tmp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("aitui_test_{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
@@ -665,7 +1414,10 @@ mod tests {
         let dir = tmp_dir();
         let path = dir.join("test.txt");
         fs::write(&path, "hello world").unwrap();
-        let call = make_call("read_file", serde_json::json!({"path": path.to_str().unwrap()}));
+        let call = make_call(
+            "read_file",
+            serde_json::json!({"path": path.to_str().unwrap()}),
+        );
         let result = execute(call, &dir);
         assert!(result.is_ok());
         assert_eq!(result.text(), "hello world");
@@ -674,7 +1426,10 @@ mod tests {
     #[test]
     fn read_file_missing_returns_error() {
         let dir = tmp_dir();
-        let call = make_call("read_file", serde_json::json!({"path": "/nonexistent/path.txt"}));
+        let call = make_call(
+            "read_file",
+            serde_json::json!({"path": "/nonexistent/path.txt"}),
+        );
         let result = execute(call, &dir);
         assert!(!result.is_ok());
         assert!(result.text().contains("Cannot read"));
@@ -684,37 +1439,77 @@ mod tests {
     fn write_file_creates_file() {
         let dir = tmp_dir();
         let path = dir.join("new_file.txt");
-        let call = make_call("write_file", serde_json::json!({
-            "path": path.to_str().unwrap(),
-            "content": "new content"
-        }));
+        let call = make_call(
+            "write_file",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "content": "new content"
+            }),
+        );
         let result = execute(call, &dir);
         assert!(result.is_ok());
-        assert!(result.text().contains("Written"));
+        assert!(
+            result.text().contains("Created"),
+            "new file reports Created: {}",
+            result.text()
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), "new content");
+    }
+
+    #[test]
+    fn write_file_update_shows_diff() {
+        let dir = tmp_dir();
+        let path = dir.join("upd.txt");
+        fs::write(&path, "line1\nold\nline3").unwrap();
+        let call = make_call(
+            "write_file",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "content": "line1\nnew\nline3"
+            }),
+        );
+        let result = execute(call, &dir);
+        assert!(result.is_ok());
+        let text = result.text();
+        assert!(
+            text.contains("Updated"),
+            "existing file reports Updated: {}",
+            text
+        );
+        assert!(text.contains("- old"), "diff shows removed line: {}", text);
+        assert!(text.contains("+ new"), "diff shows added line: {}", text);
     }
 
     #[test]
     fn write_file_dot_relative_path_resolves_under_cwd() {
         // Mirrors the model output `{"path":"./src/test.rs", ...}`.
         let dir = tmp_dir();
-        let call = make_call("write_file", serde_json::json!({
-            "path": "./sub/test.rs",
-            "content": "\"Hi there\""
-        }));
+        let call = make_call(
+            "write_file",
+            serde_json::json!({
+                "path": "./sub/test.rs",
+                "content": "\"Hi there\""
+            }),
+        );
         let result = execute(call, &dir);
         assert!(result.is_ok(), "write failed: {}", result.text());
-        assert_eq!(fs::read_to_string(dir.join("sub/test.rs")).unwrap(), "\"Hi there\"");
+        assert_eq!(
+            fs::read_to_string(dir.join("sub/test.rs")).unwrap(),
+            "\"Hi there\""
+        );
     }
 
     #[test]
     fn write_file_creates_parent_dirs() {
         let dir = tmp_dir();
         let path = dir.join("nested").join("deep").join("file.txt");
-        let call = make_call("write_file", serde_json::json!({
-            "path": path.to_str().unwrap(),
-            "content": "nested"
-        }));
+        let call = make_call(
+            "write_file",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "content": "nested"
+            }),
+        );
         let result = execute(call, &dir);
         assert!(result.is_ok());
         assert!(path.exists());
@@ -725,11 +1520,14 @@ mod tests {
         let dir = tmp_dir();
         let path = dir.join("edit.txt");
         fs::write(&path, "hello world foo").unwrap();
-        let call = make_call("edit_file", serde_json::json!({
-            "path": path.to_str().unwrap(),
-            "old_string": "world",
-            "new_string": "there"
-        }));
+        let call = make_call(
+            "edit_file",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "world",
+                "new_string": "there"
+            }),
+        );
         let result = execute(call, &dir);
         assert!(result.is_ok());
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello there foo");
@@ -740,11 +1538,14 @@ mod tests {
         let dir = tmp_dir();
         let path = dir.join("edit_err.txt");
         fs::write(&path, "hello world").unwrap();
-        let call = make_call("edit_file", serde_json::json!({
-            "path": path.to_str().unwrap(),
-            "old_string": "nope",
-            "new_string": "there"
-        }));
+        let call = make_call(
+            "edit_file",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "nope",
+                "new_string": "there"
+            }),
+        );
         let result = execute(call, &dir);
         assert!(!result.is_ok());
         assert!(result.text().contains("old_string not found"));
@@ -755,40 +1556,53 @@ mod tests {
         let dir = tmp_dir();
         let path = dir.join("append.txt");
         fs::write(&path, "base").unwrap();
-        let call = make_call("append_file", serde_json::json!({
-            "path": path.to_str().unwrap(),
-            "content": "+more"
-        }));
+        let call = make_call(
+            "append_file",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "content": "+more"
+            }),
+        );
         let result = execute(call, &dir);
         assert!(result.is_ok());
         assert_eq!(fs::read_to_string(&path).unwrap(), "base+more");
     }
 
     #[test]
-    fn delete_file_removes_file() {
+    fn delete_removes_file() {
         let dir = tmp_dir();
         let path = dir.join("delete_me.txt");
         fs::write(&path, "bye").unwrap();
-        let call = make_call("delete_file", serde_json::json!({
-            "path": path.to_str().unwrap(),
-        }));
+        // Canonical name.
+        let call = make_call(
+            "delete",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+            }),
+        );
         let result = execute(call, &dir);
         assert!(result.is_ok());
         assert!(!path.exists());
-        assert!(result.text().contains("Deleted"));
+        assert!(result.text().contains("Removed"));
     }
 
     #[test]
-    fn delete_file_refuses_directory() {
+    fn delete_removes_directory_tree() {
+        // Merged delete: one tool handles both files and directories.
         let dir = tmp_dir();
-        let sub = dir.join("subdir");
+        let sub = dir.join("subdir/inner");
         fs::create_dir_all(&sub).unwrap();
-        let call = make_call("delete_file", serde_json::json!({
-            "path": sub.to_str().unwrap(),
-        }));
+        fs::write(sub.join("f"), "x").unwrap();
+        let call = make_call(
+            "delete",
+            serde_json::json!({
+                "path": dir.join("subdir").to_str().unwrap(),
+            }),
+        );
         let result = execute(call, &dir);
-        assert!(!result.is_ok());
-        assert!(result.text().contains("is a directory"));
+        assert!(result.is_ok(), "{}", result.text());
+        assert!(!dir.join("subdir").exists());
+        assert!(result.text().contains("directory"));
     }
 
     #[test]
@@ -804,7 +1618,10 @@ mod tests {
     fn move_path_renames_file() {
         let dir = tmp_dir();
         fs::write(dir.join("src.txt"), "hi").unwrap();
-        let call = make_call("move_path", serde_json::json!({"from": "src.txt", "to": "dst.txt"}));
+        let call = make_call(
+            "move_path",
+            serde_json::json!({"from": "src.txt", "to": "dst.txt"}),
+        );
         let result = execute(call, &dir);
         assert!(result.is_ok(), "{}", result.text());
         assert!(!dir.join("src.txt").exists());
@@ -816,10 +1633,16 @@ mod tests {
         let dir = tmp_dir();
         fs::create_dir_all(dir.join("tree/sub")).unwrap();
         fs::write(dir.join("tree/sub/f.txt"), "x").unwrap();
-        let call = make_call("copy_path", serde_json::json!({"from": "tree", "to": "tree_copy"}));
+        let call = make_call(
+            "copy_path",
+            serde_json::json!({"from": "tree", "to": "tree_copy"}),
+        );
         let result = execute(call, &dir);
         assert!(result.is_ok(), "{}", result.text());
-        assert_eq!(fs::read_to_string(dir.join("tree_copy/sub/f.txt")).unwrap(), "x");
+        assert_eq!(
+            fs::read_to_string(dir.join("tree_copy/sub/f.txt")).unwrap(),
+            "x"
+        );
         assert!(dir.join("tree/sub/f.txt").exists(), "source preserved");
     }
 
@@ -835,13 +1658,23 @@ mod tests {
     }
 
     #[test]
-    fn delete_file_refuses_directory_points_to_delete_dir() {
+    fn legacy_delete_aliases_still_execute() {
+        // Old names (delete_file / delete_dir) alias onto the merged `delete`.
         let dir = tmp_dir();
+        fs::write(dir.join("f.txt"), "x").unwrap();
         fs::create_dir_all(dir.join("d")).unwrap();
-        let call = make_call("delete_file", serde_json::json!({"path": "d"}));
-        let result = execute(call, &dir);
-        assert!(!result.is_ok());
-        assert!(result.text().contains("delete_dir"));
+        assert!(execute(
+            make_call("delete_file", serde_json::json!({"path": "f.txt"})),
+            &dir
+        )
+        .is_ok());
+        assert!(!dir.join("f.txt").exists());
+        assert!(execute(
+            make_call("delete_dir", serde_json::json!({"path": "d"})),
+            &dir
+        )
+        .is_ok());
+        assert!(!dir.join("d").exists());
     }
 
     #[test]
@@ -871,9 +1704,12 @@ mod tests {
     #[test]
     fn run_shell_executes_command() {
         let dir = tmp_dir();
-        let call = make_call("run_shell", serde_json::json!({
-            "command": "echo hello_from_shell"
-        }));
+        let call = make_call(
+            "run_shell",
+            serde_json::json!({
+                "command": "echo hello_from_shell"
+            }),
+        );
         let result = execute(call, &dir);
         assert!(result.is_ok());
         assert!(result.text().contains("hello_from_shell"));
@@ -922,4 +1758,3 @@ mod tests {
         assert!(t.contains("truncated"));
     }
 }
-

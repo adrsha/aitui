@@ -20,7 +20,12 @@ pub fn stream(request: &ChatRequest) -> mpsc::Receiver<StreamEvent> {
     let reply = build_reply(request);
     // Rough offline token estimate (~4 chars/token) so the top-right counter has
     // something to show in mock mode.
-    let prompt_tokens = request.messages.iter().map(|m| message_text(m).len()).sum::<usize>() as u32 / 4;
+    let prompt_tokens = request
+        .messages
+        .iter()
+        .map(|m| message_text(m).len())
+        .sum::<usize>() as u32
+        / 4;
     let completion_tokens = reply.len() as u32 / 4;
     let (tx, rx) = mpsc::channel(256);
     tokio::spawn(async move {
@@ -49,33 +54,63 @@ fn tokenize(s: &str) -> Vec<String> {
 
 /// Build the scripted assistant reply from the latest message.
 fn build_reply(request: &ChatRequest) -> String {
-    let last = request.messages.last().map(message_text).unwrap_or_default();
+    let last = request
+        .messages
+        .last()
+        .map(message_text)
+        .unwrap_or_default();
     let trimmed = last.trim();
 
     // A tool just ran (its result is fed back as the latest message). Reply with
     // no further tool calls so the agent loop stops cleanly.
     if trimmed.starts_with("[tool-result]") {
-        return "Done — the tool finished (mock mode). Try another command, or type `help`.".to_string();
+        return "Done — the tool finished (mock mode). Try another command, or type `help`."
+            .to_string();
     }
 
     // The real command is the last non-empty line (so `@file` context prepended
     // ahead of it is ignored).
-    let cmd_line = last.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let cmd_line = last
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     let (cmd, arg) = split_first_word(cmd_line);
 
     match cmd.to_ascii_lowercase().as_str() {
-        "read" | "cat" => with_tool("Reading that file…", "read_file", json!({ "path": arg.trim() })),
+        "read" | "cat" => with_tool(
+            "Reading that file…",
+            "read_file",
+            json!({ "path": arg.trim() }),
+        ),
         "list" | "ls" => {
-            let path = if arg.trim().is_empty() { "." } else { arg.trim() };
-            with_tool("Listing the directory…", "list_dir", json!({ "path": path }))
+            let path = if arg.trim().is_empty() {
+                "."
+            } else {
+                arg.trim()
+            };
+            with_tool(
+                "Listing the directory…",
+                "list_dir",
+                json!({ "path": path }),
+            )
         }
         "write" => {
             let (path, content) = split_first_word(arg);
-            with_tool("Writing the file…", "write_file", json!({ "path": path, "content": content }))
+            with_tool(
+                "Writing the file…",
+                "write_file",
+                json!({ "path": path, "content": content }),
+            )
         }
         "append" => {
             let (path, content) = split_first_word(arg);
-            with_tool("Appending to the file…", "append_file", json!({ "path": path, "content": content }))
+            with_tool(
+                "Appending to the file…",
+                "append_file",
+                json!({ "path": path, "content": content }),
+            )
         }
         "edit" => {
             let (path, rest) = split_first_word(arg);
@@ -88,18 +123,34 @@ fn build_reply(request: &ChatRequest) -> String {
                 None => "Usage: `edit <path> <old text> => <new text>` (mock mode)".to_string(),
             }
         }
-        "delete" | "rm" => with_tool("Deleting the file…", "delete_file", json!({ "path": arg.trim() })),
+        "delete" | "rm" => with_tool(
+            "Deleting the file…",
+            "delete_file",
+            json!({ "path": arg.trim() }),
+        ),
         "search" | "grep" => {
             let (pattern, path) = match arg.split_once(" in ") {
                 Some((p, d)) => (p.trim(), d.trim()),
                 None => (arg.trim(), "."),
             };
-            with_tool("Searching files…", "search_files", json!({ "pattern": pattern, "path": path }))
+            with_tool(
+                "Searching files…",
+                "search_files",
+                json!({ "pattern": pattern, "path": path }),
+            )
         }
-        "run" | "sh" | "shell" => with_tool("Running the command…", "run_shell", json!({ "command": arg.trim() })),
+        "run" | "sh" | "shell" => with_tool(
+            "Running the command…",
+            "run_shell",
+            json!({ "command": arg.trim() }),
+        ),
         "demo" => demo_reply(),
         "help" | "" => help_reply(),
-        _ => format!("I didn't recognise `{}` (mock mode).\n\n{}", cmd, help_reply()),
+        _ => format!(
+            "I didn't recognise `{}` (mock mode).\n\n{}",
+            cmd,
+            help_reply()
+        ),
     }
 }
 

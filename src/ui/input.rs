@@ -31,7 +31,11 @@ fn wrap_input_lines(lines: &[String], width: usize) -> Vec<VisualLine> {
         }
     }
     if out.is_empty() {
-        out.push(VisualLine { text: String::new(), logical_row: 0, char_offset: 0 });
+        out.push(VisualLine {
+            text: String::new(),
+            logical_row: 0,
+            char_offset: 0,
+        });
     }
     out
 }
@@ -45,7 +49,10 @@ fn visual_cursor(visual: &[VisualLine], logical_row: usize, logical_col: usize) 
             }
         }
     }
-    let vi = visual.iter().rposition(|vl| vl.logical_row == logical_row).unwrap_or(0);
+    let vi = visual
+        .iter()
+        .rposition(|vl| vl.logical_row == logical_row)
+        .unwrap_or(0);
     let col = visual[vi].text.chars().count().min(logical_col);
     (vi, col)
 }
@@ -80,16 +87,6 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         return;
     }
 
-    // ── Command mode line (":...") ───────────────────────────────────────
-    if app.vim == VimMode::Command {
-        let cmd = format!(":{}", app.command);
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(cmd, Style::default().fg(theme.text)))).style(panel),
-            inner,
-        );
-        return;
-    }
-
     // ── Multi-line input with wrapping ───────────────────────────────────
     let avail_w = inner.width.saturating_sub(1).max(1) as usize;
     let visual = wrap_input_lines(&app.input.lines, avail_w);
@@ -98,7 +95,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let (cursor_vi, cursor_vc) = visual_cursor(&visual, app.input.row, app.input.col);
 
     let input_h = inner_h.min(total_visual.max(1));
-    let start_row = if cursor_vi >= input_h { cursor_vi + 1 - input_h } else { 0 };
+    let start_row = if cursor_vi >= input_h {
+        cursor_vi + 1 - input_h
+    } else {
+        0
+    };
 
     let mut rendered: Vec<Line<'static>> = Vec::with_capacity(inner_h);
     for vi in start_row..start_row + input_h {
@@ -109,11 +110,16 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         let vl = &visual[vi];
         let line_text = &vl.text;
         if app.vim == VimMode::Visual && app.input.visual_anchor.is_some() {
-            rendered.push(Line::from(render_visual_wrapped(app, &visual, vi, vl, theme)));
+            rendered.push(Line::from(render_visual_wrapped(
+                app, &visual, vi, vl, theme,
+            )));
         } else if vi == cursor_vi {
             rendered.push(Line::from(render_input_line(line_text, cursor_vc, theme)));
         } else {
-            rendered.push(Line::from(Span::styled(line_text.clone(), Style::default().fg(theme.text))));
+            rendered.push(Line::from(Span::styled(
+                line_text.clone(),
+                Style::default().fg(theme.text),
+            )));
         }
     }
     for _ in rendered.len()..inner_h {
@@ -188,8 +194,15 @@ fn render_mention_popup(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let x = area.x;
     let y = area.y.saturating_sub(popup_h);
 
-    let popup_area = Rect { x, y, width: popup_w, height: popup_h };
-    let block = Block::default().title(" @file ").padding(Padding::horizontal(1));
+    let popup_area = Rect {
+        x,
+        y,
+        width: popup_w,
+        height: popup_h,
+    };
+    let block = Block::default()
+        .title(" @file ")
+        .padding(Padding::horizontal(1));
     let inner = block.inner(popup_area);
     f.render_widget(ratatui::widgets::Clear, popup_area);
     f.render_widget(block, popup_area);
@@ -203,7 +216,12 @@ fn render_mention_popup(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             };
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(path.clone(), style))),
-                Rect { x: inner.x, y: inner.y + i as u16, width: inner.width, height: 1 },
+                Rect {
+                    x: inner.x,
+                    y: inner.y + i as u16,
+                    width: inner.width,
+                    height: 1,
+                },
             );
         }
     }

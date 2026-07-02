@@ -5,6 +5,17 @@ use serde::{Deserialize, Serialize};
 pub struct ChatMessage {
     pub role: String,
     pub content: MessageContent,
+    /// True for assistant turns produced by the offline mock backend. Mock turns
+    /// remain visible in the UI, but are omitted from live API context/transcripts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mock: bool,
+    /// How long this response/tool result took to finish, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Time to first result (first token/reasoning byte) in ms — how long the
+    /// assistant took to return *anything*, distinct from the full-stream duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_ms: Option<u64>,
     /// Native function-calling: an assistant turn's structured tool calls. Only
     /// set on the wire (built by `api_messages` in native mode); stored sessions
     /// keep tool calls as fenced text, so this defaults to None on load.
@@ -32,8 +43,19 @@ pub struct ApiFunction {
 }
 
 impl ApiToolCall {
-    pub fn function(id: impl Into<String>, name: impl Into<String>, arguments: impl Into<String>) -> Self {
-        Self { id: id.into(), kind: "function".into(), function: ApiFunction { name: name.into(), arguments: arguments.into() } }
+    pub fn function(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind: "function".into(),
+            function: ApiFunction {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        }
     }
 }
 
@@ -62,7 +84,15 @@ pub struct ImageUrl {
 impl ChatMessage {
     /// A plain text message with no native tool metadata.
     fn plain(role: &str, content: MessageContent) -> Self {
-        Self { role: role.to_string(), content, tool_calls: None, tool_call_id: None }
+        Self {
+            role: role.to_string(),
+            content,
+            mock: false,
+            duration_ms: None,
+            first_ms: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
     }
 
     pub fn user(text: impl Into<String>) -> Self {
@@ -99,7 +129,7 @@ impl ChatMessage {
 }
 
 /// The request body sent to the OpenAI-compatible endpoint.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -122,7 +152,7 @@ pub struct ChatRequest {
     pub tool_choice: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StreamOptions {
     pub include_usage: bool,
 }
@@ -134,7 +164,9 @@ impl ChatRequest {
             messages,
             stream: true,
             max_tokens: None,
-            stream_options: Some(StreamOptions { include_usage: true }),
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
             reasoning_effort: None,
             tools: None,
             tool_choice: None,
@@ -147,10 +179,10 @@ impl ChatRequest {
         self
     }
 
-    /// Attach native function-calling tool schemas with `tool_choice:"auto"`.
+    /// Attach native function-calling tool schemas with `tool_choice:"required"`.
     pub fn with_tools(mut self, schemas: serde_json::Value) -> Self {
         self.tools = Some(schemas);
-        self.tool_choice = Some(serde_json::Value::String("auto".to_string()));
+        self.tool_choice = Some(serde_json::Value::String("required".to_string()));
         self
     }
 }
@@ -159,7 +191,12 @@ impl ChatRequest {
 /// `/v1/images/generations` rather than `/v1/chat/completions`.
 pub fn is_image_model(model: &str) -> bool {
     let m = model.to_lowercase();
-    m.contains("gpt-image") || m.starts_with("dall-e") || m.contains("image-generation")
+    // Match the model name itself, not any substring: a chat model whose id merely
+    // *contains* "image" (e.g. a vision/captioning chat model) must NOT be routed to
+    // the image endpoint. Use the final path segment so a vendor prefix like
+    // "openai/gpt-image-1" still resolves, and anchor to known image families.
+    let name = m.rsplit('/').next().unwrap_or(&m);
+    name.starts_with("gpt-image") || name.starts_with("dall-e") || name.starts_with("dalle")
 }
 
 /// Request body for `/v1/images/generations`. `response_format` is intentionally
@@ -175,7 +212,12 @@ pub struct ImageRequest {
 
 impl ImageRequest {
     pub fn new(model: &str, prompt: &str) -> Self {
-        Self { model: model.to_string(), prompt: prompt.to_string(), n: 1, size: "1024x1024".to_string() }
+        Self {
+            model: model.to_string(),
+            prompt: prompt.to_string(),
+            n: 1,
+            size: "1024x1024".to_string(),
+        }
     }
 }
 
@@ -267,5 +309,21 @@ mod tests {
         assert!(!is_image_model("gpt-4o"));
         assert!(!is_image_model("claude-sonnet-4-6"));
         assert!(!is_image_model("gemini-2.5-flash"));
+    }
+
+    #[test]
+    fn vendor_prefixed_image_model_detected() {
+        assert!(is_image_model("openai/gpt-image-1"));
+        assert!(is_image_model("azure/dall-e-3"));
+    }
+
+    #[test]
+    fn chat_model_merely_containing_image_is_not_routed() {
+        // These are chat/vision models — a substring match would misroute them to
+        // the image endpoint and strip their tool access.
+        assert!(!is_image_model("qwen2-vl-image-instruct"));
+        assert!(!is_image_model("llava-image-captioner"));
+        assert!(!is_image_model("some-provider/image-reasoner-v2"));
+        assert!(!is_image_model("gpt-4o-image-understanding"));
     }
 }

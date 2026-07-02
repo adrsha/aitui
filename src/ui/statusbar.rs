@@ -14,7 +14,10 @@ use crate::render::theme::Theme;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 fn spinner_frame() -> &'static str {
-    let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     SPINNER[((ms / 90) as usize) % SPINNER.len()]
 }
 
@@ -23,7 +26,10 @@ fn spinner_frame() -> &'static str {
 fn chip(text: impl Into<String>, bg: Color) -> Span<'static> {
     Span::styled(
         format!(" {} ", text.into()),
-        Style::default().bg(bg).fg(Color::Black).add_modifier(Modifier::BOLD),
+        Style::default()
+            .bg(bg)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
     )
 }
 
@@ -51,8 +57,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let (mode_label, mode_bg) = match app.vim {
         VimMode::Normal => ("NORMAL", Color::Blue),
         VimMode::Insert => ("INSERT", Color::Green),
+        VimMode::Visual if app.input.visual_line => ("V-LINE", Color::Magenta),
         VimMode::Visual => ("VISUAL", Color::Magenta),
-        VimMode::Command => ("COMMAND", Color::Yellow),
         VimMode::Operator(_) => ("OP", Color::Cyan),
     };
     left.push(chip(mode_label, mode_bg));
@@ -67,13 +73,13 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     // Session badge (low-key chip): white on the faint bg so it stays readable.
     left.push(Span::styled(
         format!(" {} ", sess_label),
-        Style::default().bg(theme.faint).fg(Color::White).add_modifier(Modifier::BOLD),
+        Style::default()
+            .bg(theme.faint)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
     ));
 
     let mut chips: Vec<(String, Color)> = Vec::new();
-    if app.mock {
-        chips.push(("MOCK".into(), theme.danger));
-    }
     if agent_mode {
         chips.push(("agent".into(), theme.warning));
     }
@@ -98,11 +104,23 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     // Free-text status message (plain, follows terminal fg).
     if !status.is_empty() {
         left.push(Span::raw("  "));
-        left.push(Span::styled(status.to_string(), Style::default().fg(theme.muted)));
+        left.push(Span::styled(
+            status.to_string(),
+            Style::default().fg(theme.muted),
+        ));
     }
 
-    // Right side: current model as an accent chip.
-    let right = format!(" {} ", model);
+    // Right side: model chip. While the list loads it animates a spinner; if the
+    // fetch failed it shows a warning; otherwise the selected model name.
+    use crate::app::state::ModelLoad;
+    let (right, right_bg) = match app.model_load {
+        ModelLoad::Loading => (
+            format!(" {} loading models ", spinner_frame()),
+            theme.warning,
+        ),
+        ModelLoad::Failed => (" ⚠ models unavailable ".to_string(), theme.danger),
+        ModelLoad::Loaded => (format!(" {} ", model), theme.accent),
+    };
     let left_len: usize = left.iter().map(|s| s.content.chars().count()).sum();
     let right_len = right.chars().count();
     let pad = area.width.saturating_sub((left_len + right_len) as u16) as usize;
@@ -111,7 +129,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     spans.push(Span::raw(" ".repeat(pad)));
     spans.push(Span::styled(
         right,
-        Style::default().bg(theme.accent).fg(Color::Black).add_modifier(Modifier::BOLD),
+        Style::default()
+            .bg(right_bg)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
     ));
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);

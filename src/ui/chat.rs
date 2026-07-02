@@ -19,8 +19,10 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect, _theme: &Theme) {
     let start = chat.scroll;
     let end = (start + vp_h).min(total);
 
-    let lines: Vec<Line<'static>> =
-        chat.doc()[start..end].iter().map(|row| row.line.clone()).collect();
+    let lines: Vec<Line<'static>> = chat.doc()[start..end]
+        .iter()
+        .map(|row| row.line.clone())
+        .collect();
 
     f.render_widget(Paragraph::new(lines), area);
 }

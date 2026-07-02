@@ -2,17 +2,20 @@
 //! agent tool-execution loop. These methods may return a follow-up `Action`
 //! (e.g. attach a freshly spawned stream) for the reducer to process.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-use crate::agent::{self, Permission, ToolCall, ToolKind, ToolResult};
+use crate::agent::{
+    self, Permission, PermissionDecision, PermissionScope, ToolCall, ToolKind, ToolResult,
+};
 use crate::api::models::MessageContent;
 use crate::api::{ChatMessage, ChatRequest};
 use crate::app::action::Action;
-use crate::app::overlay::{Overlay, PermissionRequest};
-use crate::app::state::{expand_mentions, App, MAX_AGENT_ITERATIONS};
+use crate::app::overlay::{DecisionRequest, Overlay, PermissionRequest, PlanRequest};
+use crate::app::state::{expand_mentions, App, TodoItem, TodoStatus, MAX_AGENT_ITERATIONS};
 use crate::domain::blocks::{parse_blocks, parse_tool_result};
-use crate::render::document::{build, build_message, DocMessage, RenderedLine};
+use crate::render::document::{build, build_message, DocMessage, LoadingKind, RenderedLine};
 use crate::render::theme::Theme;
 
 /// Plain display text for a stored message.
@@ -23,7 +26,9 @@ fn message_text(m: &ChatMessage) -> String {
             .iter()
             .map(|p| match p {
                 crate::api::models::ContentPart::Text { text } => text.clone(),
-                crate::api::models::ContentPart::ImageUrl { .. } => "🖼 [image attached]".to_string(),
+                crate::api::models::ContentPart::ImageUrl { .. } => {
+                    "🖼 [image attached]".to_string()
+                }
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -76,6 +81,8 @@ impl App {
         let cache = &mut self.doc_cache;
         let toggled = &self.chat.toggled;
         let session = self.sessions.active();
+        let active_tool = self.active_tool.clone();
+        let active_tool_for_session = self.agent_session == Some(session.id);
 
         cache.reset_if_env_changed(width, show_output);
         cache.truncate(session.messages.len());
@@ -83,7 +90,7 @@ impl App {
         let mut out: Vec<RenderedLine> = Vec::new();
         for (mi, m) in session.messages.iter().enumerate() {
             let text = message_text(m);
-            let sig = message_sig(&m.role, &text, toggled, mi);
+            let sig = message_sig(&m.role, &text, m.duration_ms, toggled, mi);
             if let Some(rows) = cache.get(mi, sig) {
                 out.extend_from_slice(rows);
             } else {
@@ -92,7 +99,14 @@ impl App {
                 } else {
                     parse_blocks(&text)
                 };
-                let doc_msg = DocMessage { role: m.role.clone(), blocks };
+                let doc_msg = DocMessage {
+                    role: m.role.clone(),
+                    blocks,
+                    duration_ms: m.duration_ms,
+                    first_ms: m.first_ms,
+                    loading: None,
+                    started_at: None,
+                };
                 // Finalized messages don't animate — pass streaming=false so a
                 // finished thinking block isn't spinning (and stays cacheable).
                 let rows = build_message(&doc_msg, mi, width, &theme, toggled, show_output, false);
@@ -101,12 +115,57 @@ impl App {
             }
         }
 
+        if active_tool_for_session {
+            if let Some((summary, started_at)) = active_tool {
+                let mi = session.messages.len();
+                let doc_msg = DocMessage {
+                    role: "tool".into(),
+                    blocks: vec![crate::domain::blocks::Block::Markdown(summary)],
+                    duration_ms: None,
+                    first_ms: None,
+                    loading: Some(LoadingKind::Tool),
+                    started_at: Some(started_at),
+                };
+                out.extend(build_message(
+                    &doc_msg,
+                    mi,
+                    width,
+                    &theme,
+                    toggled,
+                    show_output,
+                    false,
+                ));
+            }
+        }
+
         // The live streaming partial: rebuilt every frame (its text changes each
         // token), appended after the cached history, with the spinner animating.
         if let Some(partial) = session.streaming_display() {
             let mi = session.messages.len();
-            let doc_msg = DocMessage { role: "assistant".into(), blocks: parse_blocks(&partial) };
-            out.extend(build_message(&doc_msg, mi, width, &theme, toggled, show_output, true));
+            let loading = if partial.is_empty() {
+                LoadingKind::Network
+            } else {
+                LoadingKind::Streaming
+            };
+            let doc_msg = DocMessage {
+                role: "assistant".into(),
+                blocks: parse_blocks(&partial),
+                duration_ms: None,
+                // Time-to-first-result, fixed once the first byte lands (None while
+                // still waiting → the header shows a live "waiting" timer).
+                first_ms: session.pending_first_ms(),
+                loading: Some(loading),
+                started_at: session.pending_started_at,
+            };
+            out.extend(build_message(
+                &doc_msg,
+                mi,
+                width,
+                &theme,
+                toggled,
+                show_output,
+                true,
+            ));
         }
 
         if out.is_empty() {
@@ -127,14 +186,6 @@ impl App {
         const CHIP_CHARS: usize = 400;
         const CHIP_LINES: usize = 5;
 
-        // In the `:` command line there are no chips — insert the (newline-stripped) text.
-        if self.vim == crate::input::vim::VimMode::Command {
-            for c in text.chars().filter(|c| *c != '\n') {
-                self.command.push(c);
-            }
-            return;
-        }
-
         let lines = text.lines().count().max(1);
         let chars = text.chars().count();
 
@@ -142,7 +193,10 @@ impl App {
             match write_paste_file(&text) {
                 Ok(path) => {
                     self.attachment = Some(path);
-                    self.set_status(format!("🖇 Large paste attached as file ({} lines, {} chars)", lines, chars));
+                    self.set_status(format!(
+                        "🖇 Large paste attached as file ({} lines, {} chars)",
+                        lines, chars
+                    ));
                 }
                 Err(e) => {
                     self.set_status(format!("Paste file error: {} — pasted inline", e));
@@ -155,7 +209,10 @@ impl App {
             let n = self.pastes.len();
             let token = format!("[PASTED#{}-{}lines-{}chars]", n, lines, chars);
             self.input.paste(&token);
-            self.set_status(format!("Pasted {} lines, {} chars — expands on send", lines, chars));
+            self.set_status(format!(
+                "Pasted {} lines, {} chars — expands on send",
+                lines, chars
+            ));
         } else {
             self.input.paste(&text);
             self.update_mention();
@@ -235,7 +292,11 @@ impl App {
         self.input_draft.clear();
 
         let mention_ctx = expand_mentions(&text);
-        let text = if mention_ctx.is_empty() { text } else { format!("{}\n\n{}", mention_ctx, text) };
+        let text = if mention_ctx.is_empty() {
+            text
+        } else {
+            format!("{}\n\n{}", mention_ctx, text)
+        };
 
         let msg = build_user_message(&text, attachment.as_ref(), self);
         self.sessions.active_mut().push_message(msg);
@@ -266,21 +327,22 @@ impl App {
         self.spec_epoch = self.spec_epoch.wrapping_add(1);
         self.spec_dispatched.clear();
         self.spec_results.clear();
-        let Some(session) = self.sessions.by_id_mut(sid) else { return None };
+        let is_mock = self.is_mock();
+        let Some(session) = self.sessions.by_id_mut(sid) else {
+            return None;
+        };
         session.begin_assistant_stream();
+        session.pending_mock = is_mock;
         // The animated status-bar spinner ("working") is the generating indicator
         // now — don't set a free-text "Generating…" that later messages clobber.
         self.status = None;
-        if sid == self.sessions.active_id() {
-            self.chat.stick_bottom = true;
-        }
         self.touch();
 
         // Image-generation models use a different endpoint (chat completions 503s
         // them). Route to /v1/images/generations with the last user message as the
         // prompt; the result comes back over the same stream channel.
         let model = self.current_model().to_string();
-        if crate::api::is_image_model(&model) && !self.mock {
+        if crate::api::is_image_model(&model) && !self.is_mock() {
             let prompt = self
                 .sessions
                 .by_id(sid)
@@ -288,22 +350,30 @@ impl App {
                 .map(message_text)
                 .unwrap_or_default();
             if prompt.trim().is_empty() {
-                if let Some(s) = self.sessions.by_id_mut(sid) { s.finalize_assistant_stream(); }
+                if let Some(s) = self.sessions.by_id_mut(sid) {
+                    s.finalize_assistant_stream();
+                }
                 self.set_status("Nothing to generate — describe the image first.");
                 return None;
             }
-            self.set_status("🖼 Generating image…");
             return match self.api.as_ref() {
                 Some(client) => match client.generate_image(&model, &prompt) {
-                    Ok(rx) => Some(Action::AttachStream(sid, rx)),
+                    Ok((rx, img_path)) => {
+                        self.pending_image = Some(img_path.into());
+                        Some(Action::AttachStream(sid, rx))
+                    }
                     Err(e) => {
-                        if let Some(s) = self.sessions.by_id_mut(sid) { s.finalize_assistant_stream(); }
+                        if let Some(s) = self.sessions.by_id_mut(sid) {
+                            s.finalize_assistant_stream();
+                        }
                         self.set_status(format!("Image request failed: {}", e));
                         None
                     }
                 },
                 None => {
-                    if let Some(s) = self.sessions.by_id_mut(sid) { s.finalize_assistant_stream(); }
+                    if let Some(s) = self.sessions.by_id_mut(sid) {
+                        s.finalize_assistant_stream();
+                    }
                     self.set_status("No API client");
                     None
                 }
@@ -311,8 +381,11 @@ impl App {
         }
 
         // Prepend active skills as system messages (personas / house styles).
-        let native = self.config.api.native_tools;
-        let mut messages = self.sessions.by_id(sid).map(|s| s.api_messages(native)).unwrap_or_default();
+        let mut messages = self
+            .sessions
+            .by_id(sid)
+            .map(|s| s.api_messages(true))
+            .unwrap_or_default();
         for skill in self.skills.iter().rev().filter(|s| s.active) {
             messages.insert(0, ChatMessage::system(skill.body.clone()));
         }
@@ -323,31 +396,40 @@ impl App {
         }
         let mut request = ChatRequest::new(self.current_model(), messages)
             .with_reasoning_effort(self.reasoning_effort.clone());
-        // Native function-calling: send the tool schemas so the model returns
-        // structured tool_calls instead of ```tool fences (agent turns only).
-        if native {
-            let agent = self.sessions.by_id(sid).map(|s| s.agent_mode).unwrap_or(false);
-            if agent {
-                request = request.with_tools(crate::agent::tool_schemas());
-            }
+        // Send tool schemas so the model returns structured tool_calls instead of
+        // ```tool fences (agent turns only).
+        if self
+            .sessions
+            .by_id(sid)
+            .map(|s| s.agent_mode)
+            .unwrap_or(false)
+        {
+            request = request.with_tools(crate::agent::tool_schemas());
         }
 
         // Offline mock backend: scripted, tool-driving reply, no network.
-        if self.mock {
-            return Some(Action::AttachStream(sid, crate::api::mock::stream(&request)));
+        if self.is_mock() {
+            return Some(Action::AttachStream(
+                sid,
+                crate::api::mock::stream(&request),
+            ));
         }
 
         match self.api.as_ref() {
             Some(client) => match client.stream(request) {
                 Ok(rx) => Some(Action::AttachStream(sid, rx)),
                 Err(e) => {
-                    if let Some(s) = self.sessions.by_id_mut(sid) { s.finalize_assistant_stream(); }
+                    if let Some(s) = self.sessions.by_id_mut(sid) {
+                        s.finalize_assistant_stream();
+                    }
                     self.set_status(format!("Request failed: {}", e));
                     None
                 }
             },
             None => {
-                if let Some(s) = self.sessions.by_id_mut(sid) { s.finalize_assistant_stream(); }
+                if let Some(s) = self.sessions.by_id_mut(sid) {
+                    s.finalize_assistant_stream();
+                }
                 self.set_status("No API client");
                 None
             }
@@ -365,10 +447,17 @@ impl App {
             // Nothing to run for this session; let a queued session take over.
             return self.start_next_queued_round();
         }
-        let agent = self.sessions.by_id(sid).map(|s| s.agent_mode).unwrap_or(false);
+        let agent = self
+            .sessions
+            .by_id(sid)
+            .map(|s| s.agent_mode)
+            .unwrap_or(false);
         if !agent {
-            let n = self.tool_calls_in(sid).len();
-            self.set_status(format!("⚠ {} tool call(s) not run — agent mode OFF (Ctrl-A)", n));
+            // Agent mode is off but the model asked for tools: offer to enable agent
+            // mode and run them, or decline and let it answer without.
+            let count = self.tool_calls_in(sid).len();
+            self.overlay = Overlay::ToolRequest(crate::app::overlay::ToolRequest { sid, count });
+            self.set_status("Model wants tools — y enable agent & run · n answer without");
             return None;
         }
         if self.agent_session.is_some() && self.agent_session != Some(sid) {
@@ -381,6 +470,41 @@ impl App {
         self.start_agent_round_for(sid)
     }
 
+    /// Accept a tool request from a non-agent session: turn on agent mode and run
+    /// the pending tool call(s).
+    pub fn enable_agent_and_run(&mut self) -> Option<Action> {
+        let sid = match &self.overlay {
+            Overlay::ToolRequest(r) => r.sid,
+            _ => return None,
+        };
+        self.overlay = Overlay::None;
+        if let Some(s) = self.sessions.by_id_mut(sid) {
+            s.agent_mode = true;
+        }
+        self.sessions.save();
+        self.set_status("◇ Agent mode ON — running the requested tool(s)");
+        self.start_agent_round_for(sid)
+    }
+
+    /// Decline a tool request: leave agent mode off, tell the model the tools were
+    /// declined, and let it answer without them.
+    pub fn decline_agent_tools(&mut self) -> Option<Action> {
+        let sid = match &self.overlay {
+            Overlay::ToolRequest(r) => r.sid,
+            _ => return None,
+        };
+        self.overlay = Overlay::None;
+        if let Some(s) = self.sessions.by_id_mut(sid) {
+            s.push_message(ChatMessage::user(
+                "(You requested a tool, but agent mode is off and the user declined. \
+                 Answer directly without using any tools.)",
+            ));
+        }
+        self.touch();
+        self.set_status("Declined — the model will answer without tools");
+        self.begin_stream_for(sid)
+    }
+
     fn start_agent_round_for(&mut self, sid: usize) -> Option<Action> {
         let calls = self.tool_calls_in(sid);
         if calls.is_empty() {
@@ -391,7 +515,10 @@ impl App {
         if self.agent_iterations > MAX_AGENT_ITERATIONS {
             self.agent_iterations = 0;
             self.agent_session = None;
-            self.set_status(format!("⚠ Agent stopped after {} rounds (loop guard).", MAX_AGENT_ITERATIONS));
+            self.set_status(format!(
+                "⚠ Agent stopped after {} rounds (loop guard).",
+                MAX_AGENT_ITERATIONS
+            ));
             return self.start_next_queued_round();
         }
         self.agent_session = Some(sid);
@@ -411,12 +538,19 @@ impl App {
 
     /// The session the current tool round belongs to (falls back to active).
     fn agent_sid(&self) -> usize {
-        self.agent_session.unwrap_or_else(|| self.sessions.active_id())
+        self.agent_session
+            .unwrap_or_else(|| self.sessions.active_id())
     }
 
     pub(super) fn tool_calls_in(&self, sid: usize) -> Vec<ToolCall> {
-        let Some(session) = self.sessions.by_id(sid) else { return Vec::new() };
-        let last = session.messages.iter().rev().find(|m| m.role == "assistant");
+        let Some(session) = self.sessions.by_id(sid) else {
+            return Vec::new();
+        };
+        let last = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant");
         match last {
             Some(m) => parse_blocks(&message_text(m))
                 .into_iter()
@@ -430,26 +564,65 @@ impl App {
     }
 
     pub fn process_next_tool(&mut self) -> Option<Action> {
+        let cwd = self.agent_cwd();
         while let Some(call) = self.pending_tools.pop_front() {
-            let kind = match call.kind() {
-                Some(k) => k,
-                None => {
-                    let res = ToolResult::failure(call.clone(), format!("Unknown tool: {}", call.name), 0);
-                    self.record_tool_result(res);
-                    continue;
-                }
+            let Some(kind) = call.kind() else {
+                let res =
+                    ToolResult::failure(call.clone(), format!("Unknown tool: {}", call.name), 0);
+                self.record_tool_result(res);
+                continue;
             };
-            match self.permissions.check(&kind) {
-                Some(Permission::Deny) | Some(Permission::DenyAll) => {
-                    let res = ToolResult::failure(call.clone(), "Skipped: denied by session policy".into(), 0);
+            if kind == ToolKind::Todo {
+                let res = self.apply_todo(&call);
+                self.record_tool_result(res);
+                continue;
+            }
+            if kind == ToolKind::Ask {
+                return self.open_decision(call);
+            }
+            if kind == ToolKind::Plan {
+                return self.open_plan(call);
+            }
+            match self.permissions.check(&call, &cwd) {
+                Some(PermissionDecision::Deny) => {
+                    let res = ToolResult::failure(
+                        call.clone(),
+                        "Skipped: denied by session policy".into(),
+                        0,
+                    );
                     self.record_tool_result(res);
                 }
-                Some(Permission::Allow) | Some(Permission::AllowAll) => {
+                Some(PermissionDecision::Allow) => {
                     return self.execute_tool(call);
                 }
                 None => {
-                    self.overlay = Overlay::Permission(PermissionRequest { call, selected: 0 });
-                    self.set_status("Permission required — a/A allow · d/D deny");
+                    let mut calls = vec![call];
+                    while let Some(next) = self.pending_tools.front() {
+                        if next.kind().is_none()
+                            || matches!(
+                                next.kind(),
+                                Some(ToolKind::Todo | ToolKind::Ask | ToolKind::Plan)
+                            )
+                        {
+                            break;
+                        }
+                        if self.permissions.check(next, &cwd).is_some() {
+                            break;
+                        }
+                        calls.push(self.pending_tools.pop_front().unwrap());
+                    }
+                    crate::app::notify::desktop(
+                        "AiTUI — access needed",
+                        format!(
+                            "Allow {} pending tool call{}?",
+                            calls.len(),
+                            if calls.len() == 1 { "" } else { "s" }
+                        ),
+                    );
+                    self.overlay = Overlay::Permission(PermissionRequest { calls, selected: 0 });
+                    self.set_status(
+                        "Access — ↑↓ choose · ⏎ confirm · a allow all · d deny all · Esc cancel",
+                    );
                     return None;
                 }
             }
@@ -457,35 +630,214 @@ impl App {
         self.continue_after_tools()
     }
 
+    /// Apply a permission choice from the menu (or a quick allow/deny). Choices
+    /// broader than "once" are recorded as a session rule so the same
+    /// kind/directory/timed decision auto-applies for the rest of the session.
     pub fn resolve_permission(&mut self, perm: Permission) -> Option<Action> {
-        let call = match &self.overlay {
-            Overlay::Permission(req) => req.call.clone(),
+        let calls = match &self.overlay {
+            Overlay::Permission(req) => req.calls.clone(),
             _ => return None,
         };
         self.overlay = Overlay::None;
-        let kind = call.kind();
-        match perm {
-            Permission::Allow => self.execute_tool(call),
-            Permission::AllowAll => {
-                if let Some(k) = kind {
-                    self.permissions.remember_allow(k);
+
+        let allow = matches!(
+            perm,
+            Permission::Allow
+                | Permission::AllowKind
+                | Permission::AllowDirectory
+                | Permission::AllowTimed
+        );
+        let decision = if allow {
+            PermissionDecision::Allow
+        } else {
+            PermissionDecision::Deny
+        };
+        let cwd = self.agent_cwd();
+
+        for call in &calls {
+            match perm {
+                Permission::AllowKind | Permission::DenyKind => {
+                    if let Some(k) = call.kind() {
+                        self.permissions
+                            .remember_rule(decision, PermissionScope::Kind(k), false);
+                    }
                 }
-                self.execute_tool(call)
-            }
-            Permission::Deny => {
-                let res = ToolResult::failure(call, "Denied by user".into(), 0);
-                self.record_tool_result(res);
-                self.process_next_tool()
-            }
-            Permission::DenyAll => {
-                if let Some(k) = kind {
-                    self.permissions.remember_deny(k);
+                Permission::AllowDirectory | Permission::DenyDirectory => {
+                    if let Some(dir) = call.permission_directory(&cwd) {
+                        self.permissions.remember_rule(
+                            decision,
+                            PermissionScope::Directory(dir),
+                            false,
+                        );
+                    }
                 }
-                let res = ToolResult::failure(call, "Denied by user (all)".into(), 0);
-                self.record_tool_result(res);
-                self.process_next_tool()
+                Permission::AllowTimed | Permission::DenyTimed => {
+                    self.permissions
+                        .remember_rule(decision, PermissionScope::Timed, false);
+                }
+                Permission::Allow | Permission::Deny => {}
             }
         }
+
+        if allow {
+            let mut calls = calls;
+            let first = calls.remove(0);
+            for call in calls.into_iter().rev() {
+                self.pending_tools.push_front(call);
+            }
+            self.execute_tool(first)
+        } else {
+            for call in calls {
+                let res = ToolResult::failure(call, "Denied by user".into(), 0);
+                self.record_tool_result(res);
+            }
+            self.process_next_tool()
+        }
+    }
+
+    fn open_decision(&mut self, call: ToolCall) -> Option<Action> {
+        let question = call
+            .args
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Choose an option")
+            .to_string();
+        let options: Vec<String> = call
+            .args
+            .get("options")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if options.is_empty() {
+            self.record_tool_result(ToolResult::failure(
+                call,
+                "ask: missing non-empty 'options' array".into(),
+                0,
+            ));
+            return self.process_next_tool();
+        }
+        let multi = call
+            .args
+            .get("multi")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut chosen = BTreeSet::new();
+        if multi {
+            chosen.insert(0);
+        }
+        crate::app::notify::desktop("AiTUI — decision needed", question.clone());
+        self.overlay = Overlay::Decision(DecisionRequest {
+            call,
+            question,
+            options,
+            selected: 0,
+            chosen,
+            multi,
+        });
+        self.set_status(if multi {
+            "Decision — ↑↓ choose · space toggle · ⏎ confirm · Esc cancel"
+        } else {
+            "Decision — ↑↓ choose · ⏎ confirm · Esc cancel"
+        });
+        None
+    }
+
+    pub fn resolve_decision(&mut self) -> Option<Action> {
+        let req = match &self.overlay {
+            Overlay::Decision(req) => req.clone(),
+            _ => return None,
+        };
+        self.overlay = Overlay::None;
+        let labels = req.labels();
+        let output = if req.multi {
+            serde_json::to_string(&labels).unwrap_or_else(|_| "[]".to_string())
+        } else {
+            labels.first().cloned().unwrap_or_default()
+        };
+        self.record_tool_result(ToolResult::success(req.call, output, 0));
+        self.process_next_tool()
+    }
+
+    fn open_plan(&mut self, call: ToolCall) -> Option<Action> {
+        let Some(raw_path) = call.args.get("path").and_then(|v| v.as_str()) else {
+            self.record_tool_result(ToolResult::failure(call, "plan: missing 'path'".into(), 0));
+            return self.process_next_tool();
+        };
+        let body = call.args.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        let path = PathBuf::from(raw_path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            self.agent_cwd().join(path)
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                self.record_tool_result(ToolResult::failure(
+                    call,
+                    format!("plan: failed to create {}: {}", parent.display(), e),
+                    0,
+                ));
+                return self.process_next_tool();
+            }
+        }
+        if let Err(e) = std::fs::write(&path, body) {
+            self.record_tool_result(ToolResult::failure(
+                call,
+                format!("plan: failed to write {}: {}", path.display(), e),
+                0,
+            ));
+            return self.process_next_tool();
+        }
+        crate::app::notify::desktop("AiTUI — plan approval needed", path.display().to_string());
+        self.overlay = Overlay::Plan(PlanRequest {
+            call,
+            path: path.clone(),
+        });
+        self.set_status(format!(
+            "Plan written: {} — e edit · a accept · d deny",
+            path.display()
+        ));
+        None
+    }
+
+    pub fn resolve_plan(&mut self, approved: bool) -> Option<Action> {
+        let req = match &self.overlay {
+            Overlay::Plan(req) => req.clone(),
+            _ => return None,
+        };
+        self.overlay = Overlay::None;
+        let output = if approved {
+            match std::fs::read_to_string(&req.path) {
+                Ok(body) => format!("APPROVED\n{}", body),
+                Err(e) => {
+                    self.record_tool_result(ToolResult::failure(
+                        req.call,
+                        format!("plan: failed to read {}: {}", req.path.display(), e),
+                        0,
+                    ));
+                    return self.process_next_tool();
+                }
+            }
+        } else {
+            "DENIED".to_string()
+        };
+        self.record_tool_result(ToolResult::success(req.call, output, 0));
+        self.process_next_tool()
+    }
+
+    /// The working directory of the session whose tool round is running (falls back
+    /// to the process cwd), used for permission directory-scoping and execution.
+    fn agent_cwd(&self) -> PathBuf {
+        let sid = self.agent_sid();
+        self.sessions
+            .by_id(sid)
+            .and_then(|s| s.cwd.clone())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     /// While an agent reply is streaming, pre-run any *complete*, side-effect-free
@@ -494,16 +846,24 @@ impl App {
     /// tool round starts. Never touches tools that mutate or run commands.
     pub fn speculate_read_tools(&mut self, sid: usize) {
         let (partial, cwd) = {
-            let Some(s) = self.sessions.by_id(sid) else { return };
-            if !s.agent_mode { return; }
-            let Some(p) = s.streaming_display() else { return };
+            let Some(s) = self.sessions.by_id(sid) else {
+                return;
+            };
+            if !s.agent_mode {
+                return;
+            }
+            let Some(p) = s.streaming_display() else {
+                return;
+            };
             (p, s.cwd.clone())
         };
         // No runtime (unit tests) → nothing to spawn onto; skip speculation.
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let cwd = cwd.or_else(|| std::env::current_dir().ok()).unwrap_or_else(|| PathBuf::from("."));
+        let cwd = cwd
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
         let epoch = self.spec_epoch;
         for call in crate::agent::parser::extract_tool_calls(&partial) {
             if !is_speculatable(&call) {
@@ -527,7 +887,9 @@ impl App {
     /// complete `​```tool​```` call. Cutting here stops the model from generating a
     /// pile of redundant calls it can't get results for until the turn ends.
     pub fn should_cut_stream(&self, sid: usize) -> bool {
-        let Some(s) = self.sessions.by_id(sid) else { return false };
+        let Some(s) = self.sessions.by_id(sid) else {
+            return false;
+        };
         if !s.agent_mode || !s.is_streaming() {
             return false;
         }
@@ -554,7 +916,10 @@ impl App {
             self.record_tool_result(result);
             return self.process_next_tool();
         }
-        self.set_status(format!("⚙ Running: {}", call.summary()));
+        let summary = call.summary();
+        self.set_status(format!("⚙ Running: {}", summary));
+        self.active_tool = Some((summary, std::time::Instant::now()));
+        self.touch();
         // Run in the owning session's working directory (the process cwd tracks the
         // active session, which may differ when a background session runs tools).
         let sid = self.agent_sid();
@@ -572,19 +937,104 @@ impl App {
         None
     }
 
+    /// Apply a `todo` tool call: replace the sticky panel's task list wholesale.
+    /// Items may be `{text, status}` objects (status optional) or bare strings.
+    fn apply_todo(&mut self, call: &ToolCall) -> ToolResult {
+        let Some(arr) = call.args.get("items").and_then(|v| v.as_array()) else {
+            return ToolResult::failure(call.clone(), "todo: missing 'items' array".into(), 0);
+        };
+        self.todos = arr
+            .iter()
+            .filter_map(|it| {
+                let text = it
+                    .as_str()
+                    .or_else(|| {
+                        it.get("text")
+                            .or_else(|| it.get("content"))
+                            .and_then(|v| v.as_str())
+                    })?
+                    .trim()
+                    .to_string();
+                if text.is_empty() {
+                    return None;
+                }
+                let status = it
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .map(TodoStatus::parse)
+                    .unwrap_or(TodoStatus::Pending);
+                Some(TodoItem { text, status })
+            })
+            .collect();
+        self.touch();
+        let n = self.todos.len();
+        ToolResult::success(
+            call.clone(),
+            format!(
+                "Todo panel updated ({} item{})",
+                n,
+                if n == 1 { "" } else { "s" }
+            ),
+            0,
+        )
+    }
+
+    /// Select the mock model (adding it to the list if missing).
+    pub fn select_mock_model(&mut self) {
+        use crate::app::state::{ModelLoad, MOCK_MODEL};
+        match self.models.iter().position(|m| m == MOCK_MODEL) {
+            Some(i) => self.model_idx = i,
+            None => {
+                self.models.push(MOCK_MODEL.to_string());
+                self.model_idx = self.models.len() - 1;
+            }
+        }
+        self.model_load = ModelLoad::Loaded;
+    }
+
+    /// (Re)fetch the model list from the current endpoint: clear the list, flip to
+    /// Loading (the chip shows a spinner), and spawn the fetch. The main loop drains
+    /// `models_rx` into `ModelsLoaded`/`ModelsFailed`.
+    pub fn refresh_models(&mut self) {
+        use crate::app::state::ModelLoad;
+        let endpoint = self.config.api.endpoint.clone();
+        let key = self.config.api.api_key.clone();
+        let Ok(fetch) = crate::api::ApiClient::new(&endpoint, &key) else {
+            self.model_load = ModelLoad::Failed;
+            return;
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = tx.send(fetch.fetch_models().await);
+        });
+        self.models = Vec::new();
+        self.model_idx = 0;
+        self.model_load = ModelLoad::Loading;
+        self.models_rx = Some(rx);
+    }
+
     pub fn record_tool_result(&mut self, result: ToolResult) {
         if result.is_ok() {
             self.track_edited_file(&result.call);
         }
+        self.active_tool = None;
         let icon = result.call.kind().map(|k| k.icon()).unwrap_or("⚙");
         let status = if result.is_ok() { "ok" } else { "error" };
-        let body = format!("[tool-result] {} {} ({})\n{}", icon, result.call.summary(), status, result.text());
+        // Canonical tool name so the renderer can pick a purpose-built result view.
+        let name = result.call.kind().map(|k| k.name()).unwrap_or("");
+        let body = format!(
+            "[tool-result:{}] {} {} ({})\n{}",
+            name,
+            icon,
+            result.call.summary(),
+            status,
+            result.text()
+        );
         let sid = self.agent_sid();
         if let Some(s) = self.sessions.by_id_mut(sid) {
-            s.push_message(ChatMessage::tool(body));
-        }
-        if sid == self.sessions.active_id() {
-            self.chat.stick_bottom = true;
+            let mut msg = ChatMessage::tool(body);
+            msg.duration_ms = Some(result.duration_ms);
+            s.push_message(msg);
         }
         self.touch();
     }
@@ -592,14 +1042,21 @@ impl App {
     /// Maintain the recently-edited-files list (most recent first) from a
     /// successful mutating tool call, so the user can jump back into them.
     fn track_edited_file(&mut self, call: &ToolCall) {
-        let mutates = matches!(call.name.as_str(), "write_file" | "edit_file" | "append_file" | "delete_file");
+        use crate::agent::ToolKind;
+        let kind = call.kind();
+        let mutates = matches!(
+            kind,
+            Some(ToolKind::Write | ToolKind::Edit | ToolKind::Delete)
+        );
         if !mutates {
             return;
         }
-        let Some(path) = call.args.get("path").and_then(|v| v.as_str()) else { return };
+        let Some(path) = call.args.get("path").and_then(|v| v.as_str()) else {
+            return;
+        };
         let path = path.trim_start_matches("./").to_string();
         self.edited_files.retain(|p| p != &path);
-        if call.name == "delete_file" {
+        if kind == Some(ToolKind::Delete) {
             return; // removed from the list, nothing to add back
         }
         self.edited_files.insert(0, path);
@@ -665,7 +1122,7 @@ fn write_paste_file(text: &str) -> anyhow::Result<PathBuf> {
 fn is_speculatable(call: &ToolCall) -> bool {
     matches!(
         call.kind(),
-        Some(ToolKind::ReadFile | ToolKind::ListDir | ToolKind::SearchFiles)
+        Some(ToolKind::Read | ToolKind::List | ToolKind::Search)
     )
 }
 
@@ -682,13 +1139,24 @@ fn spec_sig(call: &ToolCall) -> u64 {
 /// Content signature for one message: role + text + the block indices the user
 /// has toggled for this message. Width and show-output are folded into the cache
 /// key globally (see `DocCache::reset_if_env_changed`), so they're not hashed here.
-fn message_sig(role: &str, text: &str, toggled: &std::collections::HashSet<(usize, usize)>, mi: usize) -> u64 {
+fn message_sig(
+    role: &str,
+    text: &str,
+    duration_ms: Option<u64>,
+    toggled: &std::collections::HashSet<(usize, usize)>,
+    mi: usize,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     role.hash(&mut h);
     text.hash(&mut h);
+    duration_ms.hash(&mut h);
     // Only this message's toggles matter; hash them in a stable order.
-    let mut bis: Vec<usize> = toggled.iter().filter(|(m, _)| *m == mi).map(|(_, b)| *b).collect();
+    let mut bis: Vec<usize> = toggled
+        .iter()
+        .filter(|(m, _)| *m == mi)
+        .map(|(_, b)| *b)
+        .collect();
     bis.sort_unstable();
     bis.hash(&mut h);
     h.finish()
@@ -703,10 +1171,21 @@ fn welcome_doc(theme: &Theme) -> Vec<RenderedLine> {
                 "# AiTUI\nYour terminal coding agent.\n\n- **@path** — mention a file into context\n- **/** — open the command palette\n- **i … :w** — type a message, then send\n- **Ctrl-A** — toggle agent mode (read/edit/run with approval)\n- **?** — full keybinding help"
                     .into(),
             )],
+            duration_ms: None,
+            first_ms: None,
+            loading: None,
+            started_at: None,
         },
     ];
     // Build with an empty toggle set; reuse the normal builder for consistent styling.
-    let mut rows = build(&intro, 70, theme, &std::collections::HashSet::new(), false, false);
+    let mut rows = build(
+        &intro,
+        70,
+        theme,
+        &std::collections::HashSet::new(),
+        false,
+        false,
+    );
     // Drop the role header for a cleaner splash.
     if !rows.is_empty() {
         rows.remove(0);

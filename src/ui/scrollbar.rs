@@ -9,7 +9,7 @@ use crate::render::theme::Theme;
 /// Draw a one-column scrollbar at `area` (a single column on the right of the
 /// transcript). The track shows the scroll thumb; coloured pips mark where each
 /// turn starts — cyan for your messages, gray for the assistant, green for tool
-/// results — so the whole conversation is glanceable at a distance.
+/// messages and assistant replies — so the whole conversation is glanceable at a distance.
 pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -23,7 +23,12 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     for i in 0..h {
         f.render_widget(
             ratatui::widgets::Paragraph::new(Span::styled("│", track_style)),
-            Rect { x: area.x, y: area.y + i as u16, width: 1, height: 1 },
+            Rect {
+                x: area.x,
+                y: area.y + i as u16,
+                width: 1,
+                height: 1,
+            },
         );
     }
 
@@ -35,11 +40,18 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let scroll = app.chat.scroll.min(total);
     let thumb_start = (scroll * h) / total.max(1);
     let thumb_len = ((h * h) / total.max(1)).max(1).min(h);
-    let thumb_style = Style::default().fg(theme.muted).add_modifier(Modifier::BOLD);
+    let thumb_style = Style::default()
+        .fg(theme.muted)
+        .add_modifier(Modifier::BOLD);
     for i in thumb_start..(thumb_start + thumb_len).min(h) {
         f.render_widget(
             ratatui::widgets::Paragraph::new(Span::styled("█", thumb_style)),
-            Rect { x: area.x, y: area.y + i as u16, width: 1, height: 1 },
+            Rect {
+                x: area.x,
+                y: area.y + i as u16,
+                width: 1,
+                height: 1,
+            },
         );
     }
 
@@ -48,14 +60,18 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         let Some(role) = row.role_start else { continue };
         let color = match role {
             "user" => theme.gutter_user,
-            "tool" => theme.gutter_tool,
-            "system" => theme.gutter_system,
-            _ => Color::White,
+            "assistant" => Color::White,
+            _ => continue,
         };
         let y = (idx * (h.saturating_sub(1))) / total.max(1);
         f.render_widget(
             ratatui::widgets::Paragraph::new(Span::styled("▐", Style::default().fg(color))),
-            Rect { x: area.x, y: area.y + y as u16, width: 1, height: 1 },
+            Rect {
+                x: area.x,
+                y: area.y + y as u16,
+                width: 1,
+                height: 1,
+            },
         );
     }
 }

@@ -26,20 +26,29 @@ impl KeySpec {
         let mut alt = false;
         loop {
             // Prefixes are ASCII; compare case-insensitively without allocating.
-            if let Some(r) = strip_prefix_ci(rest, "ctrl-").or_else(|| strip_prefix_ci(rest, "c-")) {
+            if let Some(r) = strip_prefix_ci(rest, "ctrl-").or_else(|| strip_prefix_ci(rest, "c-"))
+            {
                 ctrl = true;
                 rest = r;
-            } else if let Some(r) = strip_prefix_ci(rest, "alt-").or_else(|| strip_prefix_ci(rest, "a-")) {
+            } else if let Some(r) =
+                strip_prefix_ci(rest, "alt-").or_else(|| strip_prefix_ci(rest, "a-"))
+            {
                 alt = true;
                 rest = r;
-            } else if let Some(r) = strip_prefix_ci(rest, "shift-").or_else(|| strip_prefix_ci(rest, "s-")) {
+            } else if let Some(r) =
+                strip_prefix_ci(rest, "shift-").or_else(|| strip_prefix_ci(rest, "s-"))
+            {
                 // Shift is represented by the resulting character; nothing to record.
                 rest = r;
             } else {
                 break;
             }
         }
-        Some(KeySpec { code: parse_code(rest)?, ctrl, alt })
+        Some(KeySpec {
+            code: parse_code(rest)?,
+            ctrl,
+            alt,
+        })
     }
 
     /// Does this binding match a key event?
@@ -243,7 +252,12 @@ mod tests {
     use crossterm::event::KeyEventKind;
 
     fn ev(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
-        KeyEvent { code, modifiers: mods, kind: KeyEventKind::Press, state: crossterm::event::KeyEventState::NONE }
+        KeyEvent {
+            code,
+            modifiers: mods,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        }
     }
 
     #[test]
@@ -269,10 +283,18 @@ mod tests {
 
     #[test]
     fn parses_named_keys() {
-        assert!(KeySpec::parse("pageup").unwrap().matches(&ev(KeyCode::PageUp, KeyModifiers::NONE)));
-        assert!(KeySpec::parse("esc").unwrap().matches(&ev(KeyCode::Esc, KeyModifiers::NONE)));
-        assert!(KeySpec::parse("ctrl-home").unwrap().matches(&ev(KeyCode::Home, KeyModifiers::CONTROL)));
-        assert!(KeySpec::parse("enter").unwrap().matches(&ev(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(KeySpec::parse("pageup")
+            .unwrap()
+            .matches(&ev(KeyCode::PageUp, KeyModifiers::NONE)));
+        assert!(KeySpec::parse("esc")
+            .unwrap()
+            .matches(&ev(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(KeySpec::parse("ctrl-home")
+            .unwrap()
+            .matches(&ev(KeyCode::Home, KeyModifiers::CONTROL)));
+        assert!(KeySpec::parse("enter")
+            .unwrap()
+            .matches(&ev(KeyCode::Enter, KeyModifiers::NONE)));
     }
 
     #[test]
@@ -284,7 +306,9 @@ mod tests {
 
     #[test]
     fn case_insensitive() {
-        assert!(KeySpec::parse("CTRL-N").unwrap().matches(&ev(KeyCode::Char('n'), KeyModifiers::CONTROL)));
+        assert!(KeySpec::parse("CTRL-N")
+            .unwrap()
+            .matches(&ev(KeyCode::Char('n'), KeyModifiers::CONTROL)));
     }
 
     #[test]
@@ -293,7 +317,9 @@ mod tests {
         cfg.next_session = "this is not valid".into();
         let km = Keymap::from_config(&cfg);
         // Falls back to the default ctrl-n.
-        assert!(km.next_session.matches(&ev(KeyCode::Char('n'), KeyModifiers::CONTROL)));
+        assert!(km
+            .next_session
+            .matches(&ev(KeyCode::Char('n'), KeyModifiers::CONTROL)));
     }
 
     #[test]

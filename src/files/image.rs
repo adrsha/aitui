@@ -23,9 +23,9 @@ pub fn load_image_base64(path: &Path) -> anyhow::Result<(String, String)> {
 
     let mime = match ext.as_str() {
         "jpg" | "jpeg" => "image/jpeg",
-        "gif"          => "image/gif",
-        "webp"         => "image/webp",
-        _              => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/png",
     };
 
     // Load and optionally downscale using the `image` crate.
@@ -38,9 +38,9 @@ pub fn load_image_base64(path: &Path) -> anyhow::Result<(String, String)> {
     let mut buf = Vec::new();
     let format = match mime {
         "image/jpeg" => image::ImageFormat::Jpeg,
-        "image/gif"  => image::ImageFormat::Gif,
+        "image/gif" => image::ImageFormat::Gif,
         "image/webp" => image::ImageFormat::WebP,
-        _            => image::ImageFormat::Png,
+        _ => image::ImageFormat::Png,
     };
     img.write_to(&mut std::io::Cursor::new(&mut buf), format)
         .map_err(|e| anyhow::anyhow!("Failed to encode image: {}", e))?;

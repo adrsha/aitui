@@ -83,11 +83,19 @@ impl StreamingParser {
 /// Find the safe point up to which we can flush buffered text
 /// (i.e. not in the middle of a potential ``` marker).
 fn safe_flush_point(buf: &str) -> usize {
-    // If the buffer ends with a partial backtick sequence, hold it back
+    // If the buffer ends with a partial backtick sequence, hold it back.
+    // Guard every cut with `is_char_boundary`: a buffer ending in a multi-byte
+    // char (emoji / CJK / accents) would otherwise panic on the slice below,
+    // crashing mid-stream. The marker `"```tool\n"` is pure ASCII, so a real
+    // partial match can only start on a char boundary anyway.
     for suffix_len in (1..=7.min(buf.len())).rev() {
-        let suffix = &buf[buf.len() - suffix_len..];
+        let cut = buf.len() - suffix_len;
+        if !buf.is_char_boundary(cut) {
+            continue;
+        }
+        let suffix = &buf[cut..];
         if "```tool\n".starts_with(suffix) {
-            return buf.len() - suffix_len;
+            return cut;
         }
     }
     buf.len()
@@ -96,8 +104,14 @@ fn safe_flush_point(buf: &str) -> usize {
 fn parse_tool_json(s: &str) -> Option<ToolCall> {
     // Try strict parse first
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-        let name = v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())?;
-        let args = v.get("args").or_else(|| v.get("arguments")).cloned()
+        let name = v
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(|s| s.to_string())?;
+        let args = v
+            .get("args")
+            .or_else(|| v.get("arguments"))
+            .cloned()
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
         let id = v.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
         return Some(ToolCall { name, args, id });
@@ -158,6 +172,27 @@ pub fn strip_tool_blocks(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_flush_point_never_panics_on_multibyte_tail() {
+        // A buffer ending in a multi-byte char (emoji / CJK / accent) used to panic
+        // by slicing off a char boundary. It must return a valid boundary.
+        for tail in ["🚀", "日本語", "café", "a🚀", "```🚀"] {
+            let n = safe_flush_point(tail);
+            assert!(
+                tail.is_char_boundary(n),
+                "cut {n} off boundary for {tail:?}"
+            );
+            // Slicing at the returned point must not panic.
+            let _ = &tail[..n];
+        }
+    }
+
+    #[test]
+    fn safe_flush_point_still_holds_back_partial_marker() {
+        assert_eq!(safe_flush_point("hello ```"), "hello ".len());
+        assert_eq!(safe_flush_point("plain text"), "plain text".len());
+    }
 
     #[test]
     fn extract_tool_call_parses_valid_json() {
@@ -247,7 +282,8 @@ after"#;
     #[test]
     fn streaming_parser_extracts_tool_call() {
         let mut p = StreamingParser::new();
-        let (display, calls) = p.push("```tool\n{\"name\": \"read_file\", \"args\": {\"path\": \"x\"}}\n``` rest");
+        let (display, calls) =
+            p.push("```tool\n{\"name\": \"read_file\", \"args\": {\"path\": \"x\"}}\n``` rest");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read_file");
         assert_eq!(display, " rest");
@@ -257,7 +293,9 @@ after"#;
     fn streaming_parser_tool_json_with_id() {
         let mut p = StreamingParser::new();
         let mut all_calls = Vec::new();
-        let (_, c) = p.push(r#"before ```tool {"name":"list_dir","args":{"path":"."},"id":"call_1"} ``` after"#);
+        let (_, c) = p.push(
+            r#"before ```tool {"name":"list_dir","args":{"path":"."},"id":"call_1"} ``` after"#,
+        );
         all_calls.extend(c);
         assert_eq!(all_calls.len(), 1);
         assert_eq!(all_calls[0].name, "list_dir");
@@ -267,7 +305,8 @@ after"#;
     #[test]
     fn streaming_parser_tool_without_newline_after_marker() {
         let mut p = StreamingParser::new();
-        let (text, calls) = p.push(r#">>> ```tool {"name":"read_file","args":{"path":"x"}} ``` <<<"#);
+        let (text, calls) =
+            p.push(r#">>> ```tool {"name":"read_file","args":{"path":"x"}} ``` <<<"#);
         assert_eq!(text, ">>>  <<<");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read_file");

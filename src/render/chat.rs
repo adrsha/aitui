@@ -88,7 +88,11 @@ pub struct ChatState {
 
 impl ChatState {
     pub fn new() -> Self {
-        Self { stick_bottom: true, cache_rev: u64::MAX, ..Default::default() }
+        Self {
+            stick_bottom: true,
+            cache_rev: u64::MAX,
+            ..Default::default()
+        }
     }
 
     pub fn needs_rebuild(&self, rev: u64, width: usize) -> bool {
@@ -107,7 +111,9 @@ impl ChatState {
             // Reveal a just-toggled tool output: put the last row of that message
             // at the bottom of the viewport (its "bottom text" in focus).
             if let Some(end) = self.doc.iter().rposition(|r| r.msg == mi) {
-                self.scroll = end.saturating_sub(viewport_h.saturating_sub(1)).min(max_scroll);
+                self.scroll = end
+                    .saturating_sub(viewport_h.saturating_sub(1))
+                    .min(max_scroll);
                 self.stick_bottom = self.scroll >= max_scroll;
             }
         } else if self.stick_bottom {
@@ -188,8 +194,18 @@ mod tests {
     use crate::render::theme::Theme;
 
     fn sample_state(rows: usize) -> ChatState {
-        let body = (0..rows).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
-        let msgs = vec![DocMessage { role: "assistant".into(), blocks: vec![Block::Markdown(body)] }];
+        let body = (0..rows)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msgs = vec![DocMessage {
+            role: "assistant".into(),
+            blocks: vec![Block::Markdown(body)],
+            duration_ms: None,
+            first_ms: None,
+            loading: None,
+            started_at: None,
+        }];
         let doc = build(&msgs, 40, &Theme::default(), &HashSet::new(), false, false);
         let mut s = ChatState::new();
         s.stick_bottom = false;
@@ -227,7 +243,14 @@ mod tests {
     }
 
     fn one_row(text: &str) -> Vec<RenderedLine> {
-        let msgs = vec![DocMessage { role: "assistant".into(), blocks: vec![Block::Markdown(text.into())] }];
+        let msgs = vec![DocMessage {
+            role: "assistant".into(),
+            blocks: vec![Block::Markdown(text.into())],
+            duration_ms: None,
+            first_ms: None,
+            loading: None,
+            started_at: None,
+        }];
         build(&msgs, 40, &Theme::default(), &HashSet::new(), false, false)
     }
 

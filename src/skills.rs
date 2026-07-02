@@ -21,10 +21,12 @@ pub struct Skill {
 }
 
 fn config_base() -> PathBuf {
-    std::env::var("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".config")
-    })
+    std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".config")
+        })
 }
 
 /// Where skill files live: `$XDG_CONFIG_HOME/aitui/skills/` (or `~/.config/...`).
@@ -39,7 +41,11 @@ fn active_file() -> PathBuf {
 
 /// Persist the names of the currently-active skills so they survive a restart.
 pub fn save_active(skills: &[Skill]) {
-    let active: Vec<&str> = skills.iter().filter(|s| s.active).map(|s| s.name.as_str()).collect();
+    let active: Vec<&str> = skills
+        .iter()
+        .filter(|s| s.active)
+        .map(|s| s.name.as_str())
+        .collect();
     if let Some(parent) = active_file().parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -73,8 +79,12 @@ pub fn load() -> Vec<Skill> {
             if path.extension().and_then(|x| x.to_str()) != Some("md") {
                 continue;
             }
-            let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else { continue };
-            let Ok(body) = fs::read_to_string(&path) else { continue };
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+                continue;
+            };
+            let Ok(body) = fs::read_to_string(&path) else {
+                continue;
+            };
             let desc = body
                 .lines()
                 .map(|l| l.trim_start_matches('#').trim())
@@ -82,7 +92,12 @@ pub fn load() -> Vec<Skill> {
                 .unwrap_or("")
                 .to_string();
             let is_active = active.iter().any(|a| a == &name);
-            skills.push(Skill { name, desc, body: body.trim().to_string(), active: is_active });
+            skills.push(Skill {
+                name,
+                desc,
+                body: body.trim().to_string(),
+                active: is_active,
+            });
         }
     }
     skills.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -110,7 +125,12 @@ mod tests {
             active: false,
         };
         // Mirror the loader's desc extraction on the same body.
-        let desc = s.body.lines().map(|l| l.trim_start_matches('#').trim()).find(|l| !l.is_empty()).unwrap();
+        let desc = s
+            .body
+            .lines()
+            .map(|l| l.trim_start_matches('#').trim())
+            .find(|l| !l.is_empty())
+            .unwrap();
         assert_eq!(desc, "Title here");
     }
 }

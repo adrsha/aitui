@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::ChatMessage;
 use crate::api::models::{ContentPart, MessageContent};
+use crate::api::ChatMessage;
 
 /// Plain display/serialization text of a stored message.
 fn msg_text(m: &ChatMessage) -> String {
@@ -33,6 +33,13 @@ pub struct Session {
     /// Accumulated reasoning ("thinking") for the in-progress message, if the
     /// endpoint streams it in a separate field.
     pub pending_reasoning: Option<String>,
+    /// Wall-clock start of the currently streamed assistant response.
+    pub pending_started_at: Option<std::time::Instant>,
+    /// Wall-clock moment the first token/reasoning byte of the current response
+    /// arrived, so we can report time-to-first-result separately from total time.
+    pub pending_first_at: Option<std::time::Instant>,
+    /// Whether the current streamed assistant response comes from the mock backend.
+    pub pending_mock: bool,
     /// Agent mode: when true the session uses tool-calling prompts.
     pub agent_mode: bool,
     /// The working directory this session belongs to. Resuming a session `cd`s
@@ -49,6 +56,9 @@ impl Session {
             system_prompt: None,
             pending_assistant_text: None,
             pending_reasoning: None,
+            pending_started_at: None,
+            pending_first_at: None,
+            pending_mock: false,
             agent_mode: false,
             cwd: std::env::current_dir().ok(),
         }
@@ -58,11 +68,15 @@ impl Session {
     pub fn begin_assistant_stream(&mut self) {
         self.pending_assistant_text = Some(String::new());
         self.pending_reasoning = None;
+        self.pending_started_at = Some(std::time::Instant::now());
+        self.pending_first_at = None;
     }
 
     /// Append a content token to the in-progress assistant message.
     pub fn append_stream_token(&mut self, token: &str) {
         if let Some(text) = self.pending_assistant_text.as_mut() {
+            self.pending_first_at
+                .get_or_insert_with(std::time::Instant::now);
             text.push_str(token);
         }
     }
@@ -70,8 +84,19 @@ impl Session {
     /// Append a reasoning token to the in-progress assistant message.
     pub fn append_reasoning(&mut self, token: &str) {
         if self.pending_assistant_text.is_some() {
-            self.pending_reasoning.get_or_insert_with(String::new).push_str(token);
+            self.pending_first_at
+                .get_or_insert_with(std::time::Instant::now);
+            self.pending_reasoning
+                .get_or_insert_with(String::new)
+                .push_str(token);
         }
+    }
+
+    /// Time-to-first-result so far (ms), fixed once the first token has arrived.
+    /// None while still waiting on the very first byte.
+    pub fn pending_first_ms(&self) -> Option<u64> {
+        let (start, first) = (self.pending_started_at?, self.pending_first_at?);
+        Some(first.saturating_duration_since(start).as_millis() as u64)
     }
 
     /// Compose the on-disk/display body from reasoning + content. Reasoning is
@@ -87,10 +112,24 @@ impl Session {
     /// Finalize the streamed message and push it to history.
     pub fn finalize_assistant_stream(&mut self) {
         let reasoning = self.pending_reasoning.take();
+        let started = self.pending_started_at.take();
+        let duration_ms = started.map(|t| t.elapsed().as_millis() as u64);
+        // Time-to-first-result: first byte relative to the request start.
+        let first_ms = self
+            .pending_first_at
+            .take()
+            .zip(started)
+            .map(|(f, s)| f.saturating_duration_since(s).as_millis() as u64);
+        let is_mock = self.pending_mock;
+        self.pending_mock = false;
         if let Some(text) = self.pending_assistant_text.take() {
             let body = Self::compose(reasoning.as_deref(), &text);
             if !body.trim().is_empty() {
-                self.messages.push(ChatMessage::assistant(body));
+                let mut msg = ChatMessage::assistant(body);
+                msg.duration_ms = duration_ms;
+                msg.first_ms = first_ms;
+                msg.mock = is_mock;
+                self.messages.push(msg);
             }
         }
     }
@@ -131,6 +170,12 @@ impl Session {
         let mut i = 0;
         while i < msgs.len() {
             let m = &msgs[i];
+            // Mock assistant turns are only for the visible offline transcript; never
+            // feed them back to a live API context.
+            if m.mock {
+                i += 1;
+                continue;
+            }
             // Native: an assistant turn with fenced tool calls, immediately followed
             // by exactly that many "tool" results, is sent as structured tool_calls.
             if native && m.role == "assistant" {
@@ -146,18 +191,27 @@ impl Session {
                         n += 1;
                     }
                     if n == calls.len() {
-                        let prose = crate::agent::parser::strip_tool_blocks(&text).trim().to_string();
+                        let prose = crate::agent::parser::strip_tool_blocks(&text)
+                            .trim()
+                            .to_string();
                         let api_calls: Vec<crate::api::models::ApiToolCall> = calls
                             .iter()
                             .enumerate()
                             .map(|(k, c)| {
                                 let id = c.id.clone().unwrap_or_else(|| format!("call_{}", k));
-                                crate::api::models::ApiToolCall::function(id, &c.name, c.args.to_string())
+                                crate::api::models::ApiToolCall::function(
+                                    id,
+                                    &c.name,
+                                    c.args.to_string(),
+                                )
                             })
                             .collect();
                         out.push(ChatMessage {
                             role: "assistant".to_string(),
                             content: crate::api::models::MessageContent::Text(prose),
+                            mock: false,
+                            duration_ms: None,
+                            first_ms: None,
                             tool_calls: Some(api_calls.clone()),
                             tool_call_id: None,
                         });
@@ -166,6 +220,9 @@ impl Session {
                             out.push(ChatMessage {
                                 role: "tool".to_string(),
                                 content: result.content.clone(),
+                                mock: false,
+                                duration_ms: None,
+                                first_ms: None,
                                 tool_calls: None,
                                 tool_call_id: Some(api_call.id.clone()),
                             });
@@ -182,6 +239,9 @@ impl Session {
                 out.push(ChatMessage {
                     role: "user".to_string(),
                     content: m.content.clone(),
+                    mock: false,
+                    duration_ms: None,
+                    first_ms: None,
                     tool_calls: None,
                     tool_call_id: None,
                 });
@@ -260,6 +320,9 @@ impl From<SavedSession> for Session {
             system_prompt: s.system_prompt,
             pending_assistant_text: None,
             pending_reasoning: None,
+            pending_started_at: None,
+            pending_first_at: None,
+            pending_mock: false,
             agent_mode: false,
             cwd: s.cwd,
         }
@@ -302,7 +365,11 @@ impl SessionManager {
         let active_idx = saved.active_idx.min(saved.sessions.len() - 1);
         let next_id = saved.next_id;
         let sessions = saved.sessions.into_iter().map(Session::from).collect();
-        Self { sessions, active_idx, next_id }
+        Self {
+            sessions,
+            active_idx,
+            next_id,
+        }
     }
 
     /// Persist all sessions to disk (silently ignores errors). Serialization and
@@ -327,7 +394,9 @@ impl SessionManager {
             }
         };
         match tokio::runtime::Handle::try_current() {
-            Ok(_) => { tokio::task::spawn_blocking(write); }
+            Ok(_) => {
+                tokio::task::spawn_blocking(write);
+            }
             Err(_) => write(),
         }
     }
@@ -415,15 +484,29 @@ impl SessionManager {
     }
 
     pub fn remove_active(&mut self) {
+        self.remove_at(self.active_idx);
+    }
+
+    /// Remove the session at `idx`. The last session is never removed — it is reset
+    /// to an empty "Session 1" instead. Keeps `active_idx` pointing at a valid
+    /// session (shifts it left when a session at/before it is removed).
+    pub fn remove_at(&mut self, idx: usize) {
+        if idx >= self.sessions.len() {
+            return;
+        }
         if self.sessions.len() <= 1 {
             self.sessions[0].messages.clear();
             self.sessions[0].name = "Session 1".to_string();
             self.sessions[0].system_prompt = None;
+            self.active_idx = 0;
             return;
         }
-        self.sessions.remove(self.active_idx);
-        if self.active_idx >= self.sessions.len() {
-            self.active_idx = self.sessions.len() - 1;
+        self.sessions.remove(idx);
+        if self.active_idx > idx || self.active_idx >= self.sessions.len() {
+            self.active_idx = self
+                .active_idx
+                .saturating_sub(1)
+                .min(self.sessions.len() - 1);
         }
     }
 }
@@ -450,6 +533,22 @@ mod tests {
         assert_eq!(s.name, "Session 1");
         assert!(!s.agent_mode);
         assert!(s.messages.is_empty());
+    }
+
+    #[test]
+    fn tracks_time_to_first_result() {
+        let mut s = Session::new(1);
+        s.begin_assistant_stream();
+        // Nothing yet → time-to-first-result is unknown (header shows a live wait).
+        assert!(s.pending_first_ms().is_none());
+        s.append_stream_token("hi");
+        // First byte arrived → TTFT is now fixed.
+        assert!(s.pending_first_ms().is_some());
+        s.finalize_assistant_stream();
+        let msg = s.messages.last().unwrap();
+        assert!(msg.first_ms.is_some());
+        // Time-to-first-result can't exceed the full duration.
+        assert!(msg.first_ms.unwrap() <= msg.duration_ms.unwrap());
     }
 
     #[test]
@@ -561,7 +660,9 @@ mod tests {
         let mut s = Session::new(1);
         s.system_prompt = Some("Be helpful".into());
         let msgs = s.api_messages(false);
-        assert!(msgs.iter().any(|m| m.role == "system" && content_text(&m.content).contains("Be helpful")));
+        assert!(msgs
+            .iter()
+            .any(|m| m.role == "system" && content_text(&m.content).contains("Be helpful")));
     }
 
     #[test]
@@ -579,7 +680,10 @@ mod tests {
         let mut s = Session::new(1);
         s.push_message(ChatMessage::tool("tool output"));
         let msgs = s.api_messages(false);
-        let tool_msg = msgs.iter().find(|m| content_text(&m.content) == "tool output").unwrap();
+        let tool_msg = msgs
+            .iter()
+            .find(|m| content_text(&m.content) == "tool output")
+            .unwrap();
         assert_eq!(tool_msg.role, "user");
     }
 
@@ -594,7 +698,10 @@ mod tests {
         s.push_message(ChatMessage::tool("[tool-result] Read a.rs (ok)\ncontents"));
 
         let msgs = s.api_messages(true);
-        let a = msgs.iter().find(|m| m.role == "assistant" && m.tool_calls.is_some()).expect("native assistant");
+        let a = msgs
+            .iter()
+            .find(|m| m.role == "assistant" && m.tool_calls.is_some())
+            .expect("native assistant");
         let calls = a.tool_calls.as_ref().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "read_file");
@@ -602,7 +709,10 @@ mod tests {
         // The fenced text was stripped from the assistant content.
         assert!(!content_text(&a.content).contains("```tool"));
         // The following result is a native tool message referencing the call id.
-        let t = msgs.iter().find(|m| m.role == "tool").expect("native tool message");
+        let t = msgs
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("native tool message");
         assert_eq!(t.tool_call_id.as_deref(), Some("call_1"));
     }
 

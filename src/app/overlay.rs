@@ -52,8 +52,17 @@ impl FileBrowser {
             .collect();
         // Land the cursor on the first selected file in this directory (if any),
         // so a single Enter opens the pre-selected set.
-        let cursor = entries.iter().position(|e| selected.contains(&e.path)).unwrap_or(0);
-        Self { purpose, dir, entries, cursor, selected }
+        let cursor = entries
+            .iter()
+            .position(|e| selected.contains(&e.path))
+            .unwrap_or(0);
+        Self {
+            purpose,
+            dir,
+            entries,
+            cursor,
+            selected,
+        }
     }
 
     pub fn current(&self) -> Option<&FileEntry> {
@@ -134,8 +143,16 @@ fn read_entries(dir: &PathBuf) -> Vec<FileEntry> {
             let path = e.path();
             let is_dir = path.is_dir();
             let name = e.file_name().to_string_lossy().to_string();
-            let entry = FileEntry { name: if is_dir { format!("{}/", name) } else { name }, is_dir, path };
-            if is_dir { dirs.push(entry) } else { files.push(entry) }
+            let entry = FileEntry {
+                name: if is_dir { format!("{}/", name) } else { name },
+                is_dir,
+                path,
+            };
+            if is_dir {
+                dirs.push(entry)
+            } else {
+                files.push(entry)
+            }
         }
     }
     let key = |e: &FileEntry| e.name.to_lowercase();
@@ -158,18 +175,39 @@ pub struct Picker {
 impl Picker {
     pub fn models(items: Vec<String>) -> Self {
         let filtered = (0..items.len()).collect();
-        Self { kind: PickerKind::Model, query: String::new(), items, filtered, selected: 0, dir: PathBuf::new() }
+        Self {
+            kind: PickerKind::Model,
+            query: String::new(),
+            items,
+            filtered,
+            selected: 0,
+            dir: PathBuf::new(),
+        }
     }
 
     pub fn sessions(items: Vec<String>, active: usize) -> Self {
         let filtered = (0..items.len()).collect();
         let selected = active.min(items.len().saturating_sub(1));
-        Self { kind: PickerKind::Session, query: String::new(), items, filtered, selected, dir: PathBuf::new() }
+        Self {
+            kind: PickerKind::Session,
+            query: String::new(),
+            items,
+            filtered,
+            selected,
+            dir: PathBuf::new(),
+        }
     }
 
     pub fn skills(items: Vec<String>) -> Self {
         let filtered = (0..items.len()).collect();
-        Self { kind: PickerKind::Skill, query: String::new(), items, filtered, selected: 0, dir: PathBuf::new() }
+        Self {
+            kind: PickerKind::Skill,
+            query: String::new(),
+            items,
+            filtered,
+            selected: 0,
+            dir: PathBuf::new(),
+        }
     }
 
     /// The original (unfiltered) index of the current selection.
@@ -192,7 +230,9 @@ impl Picker {
     }
 
     pub fn selected_item(&self) -> Option<&str> {
-        self.filtered.get(self.selected).map(|&i| self.items[i].as_str())
+        self.filtered
+            .get(self.selected)
+            .map(|&i| self.items[i].as_str())
     }
     pub fn up(&mut self) {
         self.selected = self.selected.saturating_sub(1);
@@ -215,26 +255,126 @@ pub struct SlashCommand {
 
 pub fn slash_commands() -> &'static [SlashCommand] {
     &[
-        SlashCommand { name: "send", icon: "▸", desc: "Send the message", run: "w" },
-        SlashCommand { name: "agent", icon: "◇", desc: "Toggle agent (tool-using) mode", run: "agent" },
-        SlashCommand { name: "mock", icon: "⚗", desc: "Toggle offline mock/test mode", run: "mock" },
-        SlashCommand { name: "model", icon: "◆", desc: "Pick the model", run: "models" },
-        SlashCommand { name: "attach", icon: "▤", desc: "Attach a file", run: "files" },
-        SlashCommand { name: "new", icon: "+", desc: "Start a new session", run: "new" },
-        SlashCommand { name: "fork", icon: "⑂", desc: "Fork this session into a parallel branch", run: "fork" },
-        SlashCommand { name: "effort", icon: "🧠", desc: "Cycle reasoning effort (low/medium/high/off)", run: "effort" },
-        SlashCommand { name: "sessions", icon: "≡", desc: "Switch session", run: "sessions" },
-        SlashCommand { name: "skills", icon: "✦", desc: "Toggle skills (personas / instructions)", run: "skills" },
-        SlashCommand { name: "editor", icon: "⌨", desc: "Open conversation in $EDITOR", run: "editor" },
-        SlashCommand { name: "edit", icon: "✎", desc: "Open a file in $EDITOR (edited files first)", run: "edit" },
-        SlashCommand { name: "shell", icon: "▮", desc: "Drop into a shell, then return", run: "shell" },
-        SlashCommand { name: "rename", icon: "✎", desc: "Rename the current session", run: "rename " },
-        SlashCommand { name: "clear", icon: "⌫", desc: "Clear the conversation", run: "clear" },
-        SlashCommand { name: "setup", icon: "🔑", desc: "Set API endpoint URL + key", run: "setup" },
-        SlashCommand { name: "settings", icon: "⚙", desc: "Open settings", run: "settings" },
-        SlashCommand { name: "system", icon: "✦", desc: "Edit the system prompt", run: "settings" },
-        SlashCommand { name: "help", icon: "?", desc: "Keybinding help", run: "help" },
-        SlashCommand { name: "quit", icon: "⏻", desc: "Quit", run: "quit" },
+        SlashCommand {
+            name: "send",
+            icon: "▸",
+            desc: "Send the message",
+            run: "w",
+        },
+        SlashCommand {
+            name: "agent",
+            icon: "◇",
+            desc: "Toggle agent (tool-using) mode",
+            run: "agent",
+        },
+        SlashCommand {
+            name: "mock",
+            icon: "⚗",
+            desc: "Toggle offline mock/test mode",
+            run: "mock",
+        },
+        SlashCommand {
+            name: "model",
+            icon: "◆",
+            desc: "Pick the model",
+            run: "models",
+        },
+        SlashCommand {
+            name: "attach",
+            icon: "▤",
+            desc: "Attach a file",
+            run: "files",
+        },
+        SlashCommand {
+            name: "new",
+            icon: "+",
+            desc: "Start a new session",
+            run: "new",
+        },
+        SlashCommand {
+            name: "fork",
+            icon: "⑂",
+            desc: "Fork this session into a parallel branch",
+            run: "fork",
+        },
+        SlashCommand {
+            name: "effort",
+            icon: "🧠",
+            desc: "Cycle reasoning effort (low/medium/high/off)",
+            run: "effort",
+        },
+        SlashCommand {
+            name: "sessions",
+            icon: "≡",
+            desc: "Switch session",
+            run: "sessions",
+        },
+        SlashCommand {
+            name: "skills",
+            icon: "✦",
+            desc: "Toggle skills (personas / instructions)",
+            run: "skills",
+        },
+        SlashCommand {
+            name: "editor",
+            icon: "⌨",
+            desc: "Open conversation in $EDITOR",
+            run: "editor",
+        },
+        SlashCommand {
+            name: "edit",
+            icon: "✎",
+            desc: "Open a file in $EDITOR (edited files first)",
+            run: "edit",
+        },
+        SlashCommand {
+            name: "shell",
+            icon: "▮",
+            desc: "Drop into a shell, then return",
+            run: "shell",
+        },
+        SlashCommand {
+            name: "rename",
+            icon: "✎",
+            desc: "Rename the current session",
+            run: "rename ",
+        },
+        SlashCommand {
+            name: "clear",
+            icon: "⌫",
+            desc: "Clear the conversation",
+            run: "clear",
+        },
+        SlashCommand {
+            name: "setup",
+            icon: "🔑",
+            desc: "Set API endpoint URL + key",
+            run: "setup",
+        },
+        SlashCommand {
+            name: "settings",
+            icon: "⚙",
+            desc: "Open settings",
+            run: "settings",
+        },
+        SlashCommand {
+            name: "system",
+            icon: "✦",
+            desc: "Edit the system prompt",
+            run: "settings",
+        },
+        SlashCommand {
+            name: "help",
+            icon: "?",
+            desc: "Keybinding help",
+            run: "help",
+        },
+        SlashCommand {
+            name: "quit",
+            icon: "⏻",
+            desc: "Quit",
+            run: "quit",
+        },
     ]
 }
 
@@ -248,14 +388,20 @@ pub struct Palette {
 impl Palette {
     pub fn new() -> Self {
         let n = slash_commands().len();
-        Self { query: String::new(), filtered: (0..n).collect(), selected: 0 }
+        Self {
+            query: String::new(),
+            filtered: (0..n).collect(),
+            selected: 0,
+        }
     }
     pub fn refilter(&mut self) {
         let q = self.query.to_lowercase();
         self.filtered = slash_commands()
             .iter()
             .enumerate()
-            .filter(|(_, c)| q.is_empty() || c.name.contains(&q) || c.desc.to_lowercase().contains(&q))
+            .filter(|(_, c)| {
+                q.is_empty() || c.name.contains(&q) || c.desc.to_lowercase().contains(&q)
+            })
             .map(|(i, _)| i)
             .collect();
         if self.selected >= self.filtered.len() {
@@ -263,7 +409,9 @@ impl Palette {
         }
     }
     pub fn selected_cmd(&self) -> Option<&'static SlashCommand> {
-        self.filtered.get(self.selected).map(|&i| &slash_commands()[i])
+        self.filtered
+            .get(self.selected)
+            .map(|&i| &slash_commands()[i])
     }
     pub fn up(&mut self) {
         self.selected = self.selected.saturating_sub(1);
@@ -301,30 +449,108 @@ pub struct Settings {
     pub prompt_buf: String,
 }
 
-/// A pending tool call awaiting the user's permission decision.
+/// Pending tool call(s) awaiting the user's permission decision.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PermissionRequest {
-    pub call: ToolCall,
+    pub calls: Vec<ToolCall>,
     pub selected: usize,
 }
+
+impl PermissionRequest {
+    pub fn single(call: ToolCall) -> Self {
+        Self {
+            calls: vec![call],
+            selected: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecisionRequest {
+    pub call: ToolCall,
+    pub question: String,
+    pub options: Vec<String>,
+    pub selected: usize,
+    pub chosen: BTreeSet<usize>,
+    pub multi: bool,
+}
+
+impl DecisionRequest {
+    pub fn up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+    pub fn down(&mut self) {
+        if self.selected + 1 < self.options.len() {
+            self.selected += 1;
+        }
+    }
+    pub fn toggle(&mut self) {
+        if self.multi {
+            if !self.chosen.remove(&self.selected) {
+                self.chosen.insert(self.selected);
+            }
+        } else {
+            self.chosen.clear();
+            self.chosen.insert(self.selected);
+        }
+    }
+    pub fn labels(&self) -> Vec<String> {
+        if self.multi {
+            self.chosen
+                .iter()
+                .filter_map(|&i| self.options.get(i).cloned())
+                .collect()
+        } else {
+            self.options
+                .get(self.selected)
+                .cloned()
+                .into_iter()
+                .collect()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanRequest {
+    pub call: ToolCall,
+    pub path: PathBuf,
+}
+
+/// The permission menu, in display order. Four allow options then four deny
+/// options, each: once · all of this tool type · all in this directory · timed.
+pub const PERMISSION_OPTIONS: usize = 8;
 
 impl PermissionRequest {
     pub fn up(&mut self) {
         self.selected = self.selected.saturating_sub(1);
     }
     pub fn down(&mut self) {
-        if self.selected < 3 {
+        if self.selected + 1 < PERMISSION_OPTIONS {
             self.selected += 1;
         }
     }
     pub fn permission(&self) -> Permission {
         match self.selected {
             0 => Permission::Allow,
-            1 => Permission::AllowAll,
-            2 => Permission::Deny,
-            _ => Permission::DenyAll,
+            1 => Permission::AllowKind,
+            2 => Permission::AllowDirectory,
+            3 => Permission::AllowTimed,
+            4 => Permission::Deny,
+            5 => Permission::DenyKind,
+            6 => Permission::DenyDirectory,
+            _ => Permission::DenyTimed,
         }
     }
+}
+
+/// The model emitted tool call(s) while agent mode is off. Ask whether to enable
+/// agent mode and run them, or decline and let the model answer without tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRequest {
+    /// Session whose streamed reply contains the pending tool call(s).
+    pub sid: usize,
+    /// How many tool calls the model asked for.
+    pub count: usize,
 }
 
 /// The launch screen: choose to resume a saved session (which `cd`s to that
@@ -341,7 +567,10 @@ pub struct Startup {
 
 impl Startup {
     pub fn new(sessions: usize) -> Self {
-        Self { selected: 0, sessions }
+        Self {
+            selected: 0,
+            sessions,
+        }
     }
     /// Total selectable rows ("new" + each session).
     pub fn options(&self) -> usize {
@@ -370,13 +599,21 @@ pub struct ApiSetup {
 
 impl ApiSetup {
     pub fn new(endpoint: String, api_key: String) -> Self {
-        Self { endpoint, api_key, field: 0 }
+        Self {
+            endpoint,
+            api_key,
+            field: 0,
+        }
     }
     pub fn next_field(&mut self) {
         self.field = (self.field + 1) % 2;
     }
     fn current_mut(&mut self) -> &mut String {
-        if self.field == 0 { &mut self.endpoint } else { &mut self.api_key }
+        if self.field == 0 {
+            &mut self.endpoint
+        } else {
+            &mut self.api_key
+        }
     }
     pub fn push(&mut self, c: char) {
         self.current_mut().push(c);
@@ -395,10 +632,17 @@ pub enum Overlay {
     Palette(Palette),
     Settings(Settings),
     Permission(PermissionRequest),
+    Decision(DecisionRequest),
+    Plan(PlanRequest),
+    /// Model asked for tools while agent mode is off — enable & run, or decline.
+    ToolRequest(ToolRequest),
     /// Enter API endpoint + key (on a connection/base-URL failure, or `:setup`).
     ApiSetup(ApiSetup),
     /// A transient informational dialog (title + body). Dismissed by any key.
-    Notice { title: String, body: String },
+    Notice {
+        title: String,
+        body: String,
+    },
 }
 
 impl Overlay {
@@ -439,7 +683,7 @@ impl Mention {
 
 /// Seed/clear the read-only auto-approvals based on config.
 pub fn sync_auto_approvals(mem: &mut PermissionMemory, enabled: bool) {
-    let reads = [ToolKind::ReadFile, ToolKind::ListDir, ToolKind::SearchFiles];
+    let reads = [ToolKind::Read, ToolKind::List, ToolKind::Search];
     if enabled {
         for k in reads {
             mem.remember_allow(k);
@@ -458,9 +702,19 @@ mod tests {
     fn browser(entries: &[(&str, bool)]) -> FileBrowser {
         let entries = entries
             .iter()
-            .map(|(n, d)| FileEntry { name: n.to_string(), is_dir: *d, path: PathBuf::from(n) })
+            .map(|(n, d)| FileEntry {
+                name: n.to_string(),
+                is_dir: *d,
+                path: PathBuf::from(n),
+            })
             .collect();
-        FileBrowser { purpose: BrowsePurpose::Edit, dir: PathBuf::from("/x"), entries, cursor: 0, selected: BTreeSet::new() }
+        FileBrowser {
+            purpose: BrowsePurpose::Edit,
+            dir: PathBuf::from("/x"),
+            entries,
+            cursor: 0,
+            selected: BTreeSet::new(),
+        }
     }
 
     #[test]
@@ -510,9 +764,7 @@ mod tests {
 
     #[test]
     fn picker_filters_by_query() {
-        let mut p = Picker::models(vec![
-            "main.rs".into(), "lib.rs".into(), "README.md".into(),
-        ]);
+        let mut p = Picker::models(vec!["main.rs".into(), "lib.rs".into(), "README.md".into()]);
         p.query = "rs".into();
         p.refilter();
         assert_eq!(p.filtered.len(), 2);
@@ -584,53 +836,59 @@ mod tests {
 
     #[test]
     fn permission_maps_correctly() {
-        let req = PermissionRequest {
-            call: ToolCall { name: "read_file".into(), args: serde_json::json!({}), id: None },
-            selected: 0,
-        };
+        let req = PermissionRequest::single(ToolCall {
+            name: "read_file".into(),
+            args: serde_json::json!({}),
+            id: None,
+        });
         assert_eq!(req.permission(), Permission::Allow);
     }
 
     #[test]
     fn permission_selected_1_allow_all() {
-        let mut req = PermissionRequest {
-            call: ToolCall { name: "read_file".into(), args: serde_json::json!({}), id: None },
-            selected: 0,
-        };
+        let mut req = PermissionRequest::single(ToolCall {
+            name: "read_file".into(),
+            args: serde_json::json!({}),
+            id: None,
+        });
         req.down();
-        assert_eq!(req.permission(), Permission::AllowAll);
+        assert_eq!(req.permission(), Permission::AllowKind);
     }
 
     #[test]
-    fn permission_selected_2_deny() {
-        let mut req = PermissionRequest {
-            call: ToolCall { name: "read_file".into(), args: serde_json::json!({}), id: None },
-            selected: 0,
-        };
-        req.down(); req.down();
-        assert_eq!(req.permission(), Permission::Deny);
-    }
-
-    #[test]
-    fn permission_selected_3_deny_all() {
-        let mut req = PermissionRequest {
-            call: ToolCall { name: "read_file".into(), args: serde_json::json!({}), id: None },
-            selected: 0,
-        };
-        req.down(); req.down(); req.down();
-        assert_eq!(req.permission(), Permission::DenyAll);
+    fn permission_selected_maps_all_eight() {
+        let mut req = PermissionRequest::single(ToolCall {
+            name: "read_file".into(),
+            args: serde_json::json!({}),
+            id: None,
+        });
+        let expected = [
+            Permission::Allow,
+            Permission::AllowKind,
+            Permission::AllowDirectory,
+            Permission::AllowTimed,
+            Permission::Deny,
+            Permission::DenyKind,
+            Permission::DenyDirectory,
+            Permission::DenyTimed,
+        ];
+        for want in expected {
+            assert_eq!(req.permission(), want);
+            req.down();
+        }
     }
 
     #[test]
     fn permission_down_bounded() {
-        let mut req = PermissionRequest {
-            call: ToolCall { name: "read_file".into(), args: serde_json::json!({}), id: None },
-            selected: 0,
-        };
-        for _ in 0..10 {
+        let mut req = PermissionRequest::single(ToolCall {
+            name: "read_file".into(),
+            args: serde_json::json!({}),
+            id: None,
+        });
+        for _ in 0..20 {
             req.down();
         }
-        assert_eq!(req.selected, 3);
+        assert_eq!(req.selected, PERMISSION_OPTIONS - 1);
     }
 
     // ── Session picker ───────────────────────────────────────────────────────────
@@ -646,7 +904,14 @@ mod tests {
 
     #[test]
     fn mention_reset_clears_state() {
-        let mut m = Mention { active: true, query: "foo".into(), anchor_row: 1, anchor_col: 2, matches: vec!["a".into()], selected: 0 };
+        let mut m = Mention {
+            active: true,
+            query: "foo".into(),
+            anchor_row: 1,
+            anchor_col: 2,
+            matches: vec!["a".into()],
+            selected: 0,
+        };
         m.reset();
         assert!(!m.active);
         assert!(m.query.is_empty());
@@ -655,7 +920,14 @@ mod tests {
 
     #[test]
     fn mention_navigation_stays_bounded() {
-        let mut m = Mention { active: true, query: String::new(), anchor_row: 0, anchor_col: 0, matches: vec!["a".into(), "b".into()], selected: 0 };
+        let mut m = Mention {
+            active: true,
+            query: String::new(),
+            anchor_row: 0,
+            anchor_col: 0,
+            matches: vec!["a".into(), "b".into()],
+            selected: 0,
+        };
         assert_eq!(m.selected, 0);
         m.up(); // stays at 0
         assert_eq!(m.selected, 0);
@@ -696,15 +968,15 @@ mod tests {
     fn sync_approvals_adds_read_tools() {
         let mut mem = PermissionMemory::default();
         sync_auto_approvals(&mut mem, true);
-        assert!(mem.always_allow.contains(&ToolKind::ReadFile));
-        assert!(mem.always_allow.contains(&ToolKind::ListDir));
+        assert!(mem.always_allow.contains(&ToolKind::Read));
+        assert!(mem.always_allow.contains(&ToolKind::List));
     }
 
     #[test]
     fn sync_approvals_disabled_clears_read_tools() {
         let mut mem = PermissionMemory::default();
-        mem.remember_allow(ToolKind::ReadFile);
+        mem.remember_allow(ToolKind::Read);
         sync_auto_approvals(&mut mem, false);
-        assert!(!mem.always_allow.contains(&ToolKind::ReadFile));
+        assert!(!mem.always_allow.contains(&ToolKind::Read));
     }
 }

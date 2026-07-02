@@ -22,6 +22,51 @@ pub struct PanelLayout {
     pub chat: ratatui::layout::Rect,
 }
 
+/// Loading status of the model list from `/v1/models`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelLoad {
+    /// Fetch in flight — show a loading animation instead of a model name.
+    Loading,
+    /// The list arrived (or we're offline on `mock`).
+    Loaded,
+    /// The fetch failed (connection/timeout) — show a failed indicator.
+    Failed,
+}
+
+/// Progress state of one agent-declared task in the sticky todo panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Done,
+}
+
+impl TodoStatus {
+    /// Parse the model's status string; unknown/empty defaults to pending.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "in_progress" | "in-progress" | "active" | "doing" => TodoStatus::InProgress,
+            "done" | "completed" | "complete" => TodoStatus::Done,
+            _ => TodoStatus::Pending,
+        }
+    }
+    /// Status glyph for the panel.
+    pub fn glyph(&self) -> &'static str {
+        match self {
+            TodoStatus::Pending => "○",
+            TodoStatus::InProgress => "◐",
+            TodoStatus::Done => "●",
+        }
+    }
+}
+
+/// One item in the agent's task breakdown, shown in the sticky panel above input.
+#[derive(Debug, Clone)]
+pub struct TodoItem {
+    pub text: String,
+    pub status: TodoStatus,
+}
+
 /// A model stream tagged with the session it belongs to, so several sessions can
 /// generate concurrently and events route to the right one regardless of which is
 /// currently on screen.
@@ -63,6 +108,11 @@ pub struct App {
     /// The in-progress text saved when history browsing begins, restored on exit.
     pub input_draft: String,
 
+    /// Agent-declared task breakdown, shown in the sticky panel above the input.
+    /// Rewritten wholesale each time the model calls the `todo` tool; empty hides
+    /// the panel.
+    pub todos: Vec<TodoItem>,
+
     pub overlay: Overlay,
     pub mention: Mention,
 
@@ -72,6 +122,9 @@ pub struct App {
 
     pub models: Vec<String>,
     pub model_idx: usize,
+    /// Whether the `/v1/models` list is still loading, arrived, or failed — drives
+    /// the model chip's loading / failed animation.
+    pub model_load: ModelLoad,
 
     pub attachment: Option<PathBuf>,
     pub status: Option<String>,
@@ -83,8 +136,8 @@ pub struct App {
     pub last_insert: Option<char>,
     /// Show the full output of executed tools (off by default; toggled at runtime).
     pub show_output: bool,
-    /// Offline mock backend: drive the agent tools without a live API.
-    pub mock: bool,
+    /// Path to a recently generated image to display in-terminal via Kitty protocol.
+    pub pending_image: Option<PathBuf>,
     /// Files the agent has created/edited this session (relative paths, most
     /// recent first) — for quick "jump into the edited file" access.
     pub edited_files: Vec<String>,
@@ -121,6 +174,8 @@ pub struct App {
     /// background session keeps generating while you work in another (parallel).
     pub streams: Vec<StreamHandle>,
     pub agent_tool_rx: Option<mpsc::Receiver<ToolResult>>,
+    /// The tool currently executing, for the transcript header animation.
+    pub active_tool: Option<(String, std::time::Instant)>,
     pub models_rx: Option<oneshot::Receiver<anyhow::Result<Vec<String>>>>,
 
     /// Speculative tool execution: while an agent-mode reply streams, complete
@@ -150,37 +205,43 @@ pub struct App {
     pub(crate) api: Option<ApiClient>,
 }
 
-pub const MAX_AGENT_ITERATIONS: usize = 25;
+/// Runaway loop guard. Effectively unlimited: the assistant is free to take as
+/// many tool rounds as it needs. Kept at the ceiling only so a truly pathological
+/// infinite loop still can't overflow the counter (Ctrl-C cancels a round anyway).
+pub const MAX_AGENT_ITERATIONS: usize = usize::MAX;
 
 impl App {
     pub fn new(config: Config) -> anyhow::Result<Self> {
-        // Mock mode: explicit config flag, the AITUI_MOCK env var, or an empty
-        // endpoint (nothing to talk to). Lets every agent feature be tested offline.
-        let mock = config.api.mock
-            || std::env::var("AITUI_MOCK").map(|v| !v.is_empty() && v != "0").unwrap_or(false)
+        crate::agent::configure_search(crate::agent::SearchSettings {
+            provider: config.search.provider.clone(),
+            searxng_url: config.search.searxng_url.clone(),
+        });
+
+        // Force offline mock: explicit config flag, the AITUI_MOCK env var, or an
+        // empty endpoint (nothing to talk to). Mock is now just a model, so this
+        // simply means "start on the `mock` model and skip the fetch".
+        let force_mock = config.api.mock
+            || std::env::var("AITUI_MOCK")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false)
             || config.api.endpoint.trim().is_empty();
 
         let api = ApiClient::new(&config.api.endpoint, &config.api.api_key)?;
 
-        // Only fetch the model list from a real endpoint.
+        // Fetch the real model list from a live endpoint. Until it arrives the list
+        // is empty and `model_load` is Loading (the model chip shows a spinner). If
+        // forced offline, we skip the fetch and go straight to the mock-only list.
         let (models_tx, models_rx) = oneshot::channel();
-        if !mock {
+        let (models, model_idx, model_load) = if force_mock {
+            drop(models_tx);
+            (vec![MOCK_MODEL.to_string()], 0, ModelLoad::Loaded)
+        } else {
             let fetch = ApiClient::new(&config.api.endpoint, &config.api.api_key)?;
             tokio::spawn(async move {
                 let _ = models_tx.send(fetch.fetch_models().await);
             });
-        } else {
-            drop(models_tx); // no fetch; receiver resolves to Closed and is ignored
-        }
-
-        // Seed the model list with the configured default so it is selected and
-        // shown even before the real `/v1/models` list arrives (or if the default
-        // isn't in the built-in fallback list).
-        let mut models = default_models();
-        if !config.api.default_model.is_empty() && !models.contains(&config.api.default_model) {
-            models.insert(0, config.api.default_model.clone());
-        }
-        let model_idx = models.iter().position(|m| m == &config.api.default_model).unwrap_or(0);
+            (Vec::new(), 0, ModelLoad::Loading)
+        };
 
         let keymap = Keymap::from_config(&config.keybinds);
         let reasoning_effort = match config.api.reasoning_effort.trim() {
@@ -202,23 +263,25 @@ impl App {
             input_history: Vec::new(),
             input_history_idx: None,
             input_draft: String::new(),
+            todos: Vec::new(),
             overlay: Overlay::None,
             mention: Mention::default(),
             pastes: Vec::new(),
             models,
             model_idx,
+            model_load,
             attachment: None,
-            status: Some(if mock {
-                "⚗ MOCK mode — type 'help' then :w to drive the agent offline  ·  ? = keys".into()
-            } else {
+            status: Some(if model_load == ModelLoad::Loaded {
                 "i = insert  ·  @ = file  ·  / = commands  ·  :w = send  ·  ? = help".into()
+            } else {
+                "Loading models…".into()
             }),
             show_help: false,
             should_quit: false,
             yank: None,
             last_insert: None,
             show_output: false,
-            mock,
+            pending_image: None,
             edited_files: Vec::new(),
             pending_external: None,
             usage: None,
@@ -232,6 +295,7 @@ impl App {
             agent_session: None,
             agent_queue: std::collections::VecDeque::new(),
             agent_tool_rx: None,
+            active_tool: None,
             models_rx: Some(models_rx),
             spec_results: std::collections::HashMap::new(),
             spec_dispatched: std::collections::HashSet::new(),
@@ -268,7 +332,16 @@ impl App {
     }
 
     pub fn current_model(&self) -> &str {
-        self.models.get(self.model_idx).map(|s| s.as_str()).unwrap_or("unknown")
+        self.models
+            .get(self.model_idx)
+            .map(|s| s.as_str())
+            .unwrap_or(MOCK_MODEL)
+    }
+
+    /// Whether the selected model is the offline mock backend. Mock is just a model
+    /// now, so "mock mode" is simply having it selected.
+    pub fn is_mock(&self) -> bool {
+        self.current_model() == MOCK_MODEL
     }
 
     /// Whether the **active** session is mid-turn: streaming a reply, running its
@@ -281,14 +354,15 @@ impl App {
             || self.streams.iter().any(|s| s.session_id == active)
             || (self.agent_session == Some(active)
                 && (self.agent_tool_rx.is_some() || !self.pending_tools.is_empty()))
-            || matches!(self.overlay, Overlay::Permission(_))
+            || matches!(
+                self.overlay,
+                Overlay::Permission(_) | Overlay::Decision(_) | Overlay::Plan(_)
+            )
     }
 
     /// Whether *any* session is currently generating (used for the busy spinner).
     pub fn any_busy(&self) -> bool {
-        !self.streams.is_empty()
-            || self.agent_tool_rx.is_some()
-            || !self.pending_tools.is_empty()
+        !self.streams.is_empty() || self.agent_tool_rx.is_some() || !self.pending_tools.is_empty()
     }
 
     /// Invalidate the chat document cache (content or collapse changed).
@@ -346,8 +420,16 @@ impl App {
             .iter()
             .filter_map(|f| fuzzy_score(&f.to_lowercase(), &q).map(|s| (s, f)))
             .collect();
-        scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.len().cmp(&b.1.len())).then(a.1.cmp(b.1)));
-        self.mention.matches = scored.into_iter().take(50).map(|(_, f)| f.clone()).collect();
+        scored.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.1.len().cmp(&b.1.len()))
+                .then(a.1.cmp(b.1))
+        });
+        self.mention.matches = scored
+            .into_iter()
+            .take(50)
+            .map(|(_, f)| f.clone())
+            .collect();
         if self.mention.selected >= self.mention.matches.len() {
             self.mention.selected = 0;
         }
@@ -398,16 +480,9 @@ impl App {
 
 // ── Free helpers ────────────────────────────────────────────────────────────
 
-pub fn default_models() -> Vec<String> {
-    vec![
-        "gemini-2.5-flash".into(),
-        "gemini-2.5-pro".into(),
-        "claude-sonnet-4-6".into(),
-        "claude-opus-4-8".into(),
-        "gpt-4o".into(),
-        "gpt-4o-mini".into(),
-    ]
-}
+/// The offline mock backend, exposed as a selectable model. Always present in the
+/// list as the fallback when no real models exist or the endpoint is unreachable.
+pub const MOCK_MODEL: &str = "mock";
 
 /// Expand `@path` mentions in `text` into inline file-context blocks.
 pub fn expand_mentions(text: &str) -> String {
@@ -476,7 +551,18 @@ pub fn find_project_files(max: usize) -> Vec<String> {
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut out: Vec<String> = Vec::new();
     let mut stack = vec![root.clone()];
-    let skip = [".git", "target", "node_modules", ".cache", "dist", "build", ".next", ".venv", "venv", "__pycache__"];
+    let skip = [
+        ".git",
+        "target",
+        "node_modules",
+        ".cache",
+        "dist",
+        "build",
+        ".next",
+        ".venv",
+        "venv",
+        "__pycache__",
+    ];
     while let Some(dir) = stack.pop() {
         if out.len() >= max {
             break;
@@ -508,6 +594,15 @@ pub fn find_project_files(max: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn todo_status_parses_and_defaults_to_pending() {
+        assert_eq!(TodoStatus::parse("in_progress"), TodoStatus::InProgress);
+        assert_eq!(TodoStatus::parse("DONE"), TodoStatus::Done);
+        assert_eq!(TodoStatus::parse("completed"), TodoStatus::Done);
+        assert_eq!(TodoStatus::parse("whatever"), TodoStatus::Pending);
+        assert_eq!(TodoStatus::parse(""), TodoStatus::Pending);
+    }
 
     #[test]
     fn fuzzy_matches_subsequence() {

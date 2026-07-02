@@ -3,13 +3,13 @@ pub mod parser;
 pub mod tools;
 
 pub use tools::{
-    Permission, PermissionMemory, ToolCall, ToolResult, ToolRisk,
-    agent_system_prompt,
+    agent_system_prompt, Permission, PermissionDecision, PermissionMemory, PermissionScope,
+    ToolCall, ToolResult,
 };
 // Re-exported but currently unused; available for tool-schema / function-calling
 // integrations and live-stream tool parsing.
+pub use executor::{configure_search, execute, SearchSettings};
 #[allow(unused_imports)]
-pub use tools::{ToolKind, tool_schemas};
+pub use parser::{strip_tool_blocks, StreamingParser};
 #[allow(unused_imports)]
-pub use parser::{StreamingParser, strip_tool_blocks};
-pub use executor::execute;
+pub use tools::{tool_schemas, ToolKind};

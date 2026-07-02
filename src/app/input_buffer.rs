@@ -10,11 +10,19 @@ pub struct InputBuffer {
     pub col: usize,
     /// Anchor of a visual-mode selection (row, col), or None when not selecting.
     pub visual_anchor: Option<(usize, usize)>,
+    /// Line-wise visual mode (`V`): the selection always spans whole lines.
+    pub visual_line: bool,
 }
 
 impl Default for InputBuffer {
     fn default() -> Self {
-        Self { lines: vec![String::new()], row: 0, col: 0, visual_anchor: None }
+        Self {
+            lines: vec![String::new()],
+            row: 0,
+            col: 0,
+            visual_anchor: None,
+            visual_line: false,
+        }
     }
 }
 
@@ -51,18 +59,32 @@ impl InputBuffer {
     /// Start a character-wise selection anchored at the cursor.
     pub fn begin_visual(&mut self) {
         self.visual_anchor = Some((self.row, self.col));
+        self.visual_line = false;
+    }
+
+    /// Start a line-wise selection (`V`): whole lines from the anchor row.
+    pub fn begin_visual_line(&mut self) {
+        self.visual_anchor = Some((self.row, self.col));
+        self.visual_line = true;
     }
 
     pub fn end_visual(&mut self) {
         self.visual_anchor = None;
+        self.visual_line = false;
     }
 
     /// Ordered inclusive selection bounds `((r0,c0),(r1,c1))` from anchor→cursor.
+    /// In line-wise mode the columns are widened to span the full first/last line.
     pub fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
         let (ar, ac) = self.visual_anchor?;
         let a = (ar, ac);
         let b = (self.row, self.col);
-        Some(if a <= b { (a, b) } else { (b, a) })
+        let (mut lo, mut hi) = if a <= b { (a, b) } else { (b, a) };
+        if self.visual_line {
+            lo.1 = 0;
+            hi.1 = self.line_chars(hi.0).saturating_sub(1);
+        }
+        Some((lo, hi))
     }
 
     /// Whether the character cell at (row, col) is within the selection.
@@ -74,20 +96,31 @@ impl InputBuffer {
     }
 
     pub fn selection_text(&self) -> String {
-        let Some(((r0, c0), (r1, c1))) = self.selection_bounds() else { return String::new() };
+        let Some(((r0, c0), (r1, c1))) = self.selection_bounds() else {
+            return String::new();
+        };
         if r0 == r1 {
             let chars: Vec<char> = self.lines[r0].chars().collect();
             let end = (c1 + 1).min(chars.len());
-            return chars.get(c0..end).map(|s| s.iter().collect()).unwrap_or_default();
+            return chars
+                .get(c0..end)
+                .map(|s| s.iter().collect())
+                .unwrap_or_default();
         }
         let mut out = String::new();
         for r in r0..=r1 {
             let chars: Vec<char> = self.lines[r].chars().collect();
-            let (s, e) = if r == r0 { (c0, chars.len()) }
-                else if r == r1 { (0, (c1 + 1).min(chars.len())) }
-                else { (0, chars.len()) };
+            let (s, e) = if r == r0 {
+                (c0, chars.len())
+            } else if r == r1 {
+                (0, (c1 + 1).min(chars.len()))
+            } else {
+                (0, chars.len())
+            };
             out.extend(chars.get(s..e).unwrap_or(&[]).iter());
-            if r != r1 { out.push('\n'); }
+            if r != r1 {
+                out.push('\n');
+            }
         }
         out
     }
@@ -95,7 +128,9 @@ impl InputBuffer {
     /// Delete the selection (inclusive), return its text, place the cursor at the
     /// start, and clear the anchor.
     pub fn delete_selection(&mut self) -> String {
-        let Some(((r0, c0), (r1, c1))) = self.selection_bounds() else { return String::new() };
+        let Some(((r0, c0), (r1, c1))) = self.selection_bounds() else {
+            return String::new();
+        };
         let text = self.selection_text();
         if r0 == r1 {
             let from = Self::byte_idx(&self.lines[r0], c0);
@@ -127,7 +162,10 @@ impl InputBuffer {
     }
 
     fn byte_idx(line: &str, char_idx: usize) -> usize {
-        line.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(line.len())
+        line.char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(line.len())
     }
 
     pub fn insert_char(&mut self, c: char) {

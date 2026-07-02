@@ -67,22 +67,17 @@ impl App {
                 self.vim = VimMode::Insert;
                 self.update_mention();
             }
-            Action::EnterCommand => {
-                self.vim = VimMode::Command;
-                self.command.clear();
-                self.command_history_idx = None;
+            Action::EnterVisualLine => {
+                self.vim = VimMode::Visual;
+                self.input.begin_visual_line();
             }
             Action::EnterOperator(op) => self.vim = VimMode::Operator(op),
 
             // ── Input editing ───────────────────────────────────────────────
             Action::InsertChar(c) => {
-                if self.vim == VimMode::Command {
-                    self.command.push(c);
-                } else {
-                    self.input.insert_char(c);
-                    self.update_mention();
-                    self.last_insert = Some(c); // track for the jk-style chord
-                }
+                self.input.insert_char(c);
+                self.update_mention();
+                self.last_insert = Some(c); // track for the jk-style chord
             }
             Action::Newline => {
                 self.mention.reset();
@@ -90,23 +85,13 @@ impl App {
                 self.last_insert = None;
             }
             Action::Backspace => {
-                if self.vim == VimMode::Command {
-                    self.command.pop();
-                } else {
-                    self.input.backspace();
-                    self.update_mention();
-                }
+                self.input.backspace();
+                self.update_mention();
                 self.last_insert = None;
             }
             Action::DeleteWordBack => {
-                if self.vim == VimMode::Command {
-                    // Delete a word from the command line too.
-                    while self.command.ends_with(char::is_whitespace) { self.command.pop(); }
-                    while self.command.chars().next_back().is_some_and(|c| !c.is_whitespace()) { self.command.pop(); }
-                } else {
-                    self.input.delete_word_back();
-                    self.update_mention();
-                }
+                self.input.delete_word_back();
+                self.update_mention();
                 self.last_insert = None;
             }
             Action::DeleteWordForward => {
@@ -117,7 +102,6 @@ impl App {
             Action::DeleteLine => self.input.delete_line(),
             Action::YankLine => {
                 self.yank = Some(self.input.yank_line());
-                self.set_status("Line yanked");
             }
             Action::Paste => {
                 if let Some(t) = self.yank.clone() {
@@ -136,47 +120,22 @@ impl App {
             Action::LineStart => self.input.line_start(),
             Action::LineEnd => self.input.line_end(),
 
-            // ── Command line ────────────────────────────────────────────────
-            Action::CommandChar(c) => self.command.push(c),
-            Action::CommandBackspace => {
-                self.command.pop();
-            }
+            // ── Command palette ─────────────────────────────────────────────
             Action::RunCommand(cmd) => return self.run_command(&cmd),
-            Action::CommandHistoryPrev => {
-                if !self.command_history.is_empty() {
-                    let idx = match self.command_history_idx {
-                        None => self.command_history.len() - 1,
-                        Some(i) => i.saturating_sub(1),
-                    };
-                    self.command_history_idx = Some(idx);
-                    self.command = self.command_history[idx].clone();
-                }
-            }
             Action::InputHistoryPrev => self.input_history_prev(),
             Action::InputHistoryNext => self.input_history_next(),
-            Action::CommandHistoryNext => match self.command_history_idx {
-                Some(i) if i + 1 < self.command_history.len() => {
-                    self.command_history_idx = Some(i + 1);
-                    self.command = self.command_history[i + 1].clone();
-                }
-                Some(_) => {
-                    self.command_history_idx = None;
-                    self.command.clear();
-                }
-                None => {}
-            },
 
             // ── Submission / streaming ──────────────────────────────────────
             Action::Submit => return self.submit(),
             Action::AttachStream(sid, rx) => {
-                self.streams.push(crate::app::state::StreamHandle { session_id: sid, rx });
+                self.streams.push(crate::app::state::StreamHandle {
+                    session_id: sid,
+                    rx,
+                });
             }
             Action::StreamToken(sid, t) => {
                 if let Some(s) = self.sessions.by_id_mut(sid) {
                     s.append_stream_token(&t);
-                }
-                if sid == self.sessions.active_id() {
-                    self.chat.stick_bottom = true;
                 }
                 // Pre-run any complete read-only tool block already in the reply so
                 // its result is ready the instant the turn finishes.
@@ -198,9 +157,6 @@ impl App {
             Action::StreamReasoning(sid, t) => {
                 if let Some(s) = self.sessions.by_id_mut(sid) {
                     s.append_reasoning(&t);
-                }
-                if sid == self.sessions.active_id() {
-                    self.chat.stick_bottom = true;
                 }
                 self.touch();
             }
@@ -229,10 +185,6 @@ impl App {
                     let ep = self.config.api.endpoint.clone();
                     let key = self.config.api.api_key.clone();
                     self.overlay = Overlay::ApiSetup(crate::app::overlay::ApiSetup::new(ep, key));
-                } else if self.config.api.native_tools && looks_like_tools_error(&e) {
-                    self.config.api.native_tools = false;
-                    let _ = self.config.save();
-                    self.set_status("Endpoint rejected native tools — switched to fenced mode. Resend your message.");
                 } else {
                     self.set_status(format!("Stream error: {}", e));
                 }
@@ -244,7 +196,6 @@ impl App {
                 let active = self.sessions.active_id();
                 self.streams.retain(|h| h.session_id != active);
                 self.sessions.active_mut().finalize_assistant_stream();
-                self.set_status("Cancelled.");
                 self.sessions.save();
                 self.touch();
             }
@@ -276,7 +227,15 @@ impl App {
                 if inside {
                     let vp_row = (row - area.y) as usize;
                     if let Some(key) = self.chat.toggle_at_viewport_row(vp_row) {
+                        // Preserve the reading position: only reveal/stick-to-bottom
+                        // if the view was already at the bottom. When browsing up,
+                        // toggling a block leaves the scroll where it is.
+                        let at_bottom = self.chat.stick_bottom;
                         self.chat.toggle_block(key);
+                        if !at_bottom {
+                            self.chat.focus_msg = None;
+                            self.chat.stick_bottom = false;
+                        }
                         self.touch();
                     }
                 }
@@ -289,8 +248,8 @@ impl App {
 
             // ── External programs (editor / shell) ──────────────────────────
             Action::OpenEditor => {
-                self.pending_external = Some(PendingExternal::EditorText(self.conversation_markdown()));
-                self.set_status("Opening conversation in $EDITOR…");
+                self.pending_external =
+                    Some(PendingExternal::EditorText(self.conversation_markdown()));
             }
             Action::OpenEditPicker => {
                 // Toggle: a second press closes the browser.
@@ -299,27 +258,42 @@ impl App {
                 } else {
                     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                     let preselect = self.edited_files.iter().map(PathBuf::from).collect();
-                    self.overlay = Overlay::Browser(FileBrowser::open(cwd, BrowsePurpose::Edit, preselect));
-                    self.set_status("h/j/k/l navigate · space select · l/⏎ open · h up · Esc close");
+                    self.overlay =
+                        Overlay::Browser(FileBrowser::open(cwd, BrowsePurpose::Edit, preselect));
+
                 }
             }
             Action::OpenFilesInEditor(paths) => {
                 if !paths.is_empty() {
                     let n = paths.len();
                     self.pending_external = Some(PendingExternal::EditorFiles(paths));
-                    self.set_status(format!("Opening {} file(s) in $EDITOR…", n));
                 }
             }
             Action::OpenShell => {
                 self.pending_external = Some(PendingExternal::Shell);
-                self.set_status("Opening shell…");
             }
 
             // ── File browser navigation ─────────────────────────────────────
-            Action::BrowserDown => if let Overlay::Browser(b) = &mut self.overlay { b.down() },
-            Action::BrowserUp => if let Overlay::Browser(b) = &mut self.overlay { b.up() },
-            Action::BrowserParent => if let Overlay::Browser(b) = &mut self.overlay { b.parent() },
-            Action::BrowserSelect => if let Overlay::Browser(b) = &mut self.overlay { b.toggle_select() },
+            Action::BrowserDown => {
+                if let Overlay::Browser(b) = &mut self.overlay {
+                    b.down()
+                }
+            }
+            Action::BrowserUp => {
+                if let Overlay::Browser(b) = &mut self.overlay {
+                    b.up()
+                }
+            }
+            Action::BrowserParent => {
+                if let Overlay::Browser(b) = &mut self.overlay {
+                    b.parent()
+                }
+            }
+            Action::BrowserSelect => {
+                if let Overlay::Browser(b) = &mut self.overlay {
+                    b.toggle_select()
+                }
+            }
             Action::BrowserClose => self.overlay = Overlay::None,
             Action::BrowserOpen => return self.browser_open(),
 
@@ -338,7 +312,6 @@ impl App {
                 if self.config.ui.agent_default {
                     self.sessions.active_mut().agent_mode = true;
                 }
-                self.set_status(format!("New session: {}", self.sessions.active().name));
                 self.sessions.save();
                 self.chat.stick_bottom = true;
                 self.touch();
@@ -371,8 +344,10 @@ impl App {
                 if matches!(&self.overlay, Overlay::Picker(p) if p.kind == PickerKind::Session) {
                     self.overlay = Overlay::None;
                 } else {
-                    let names: Vec<String> = self.sessions.all().iter().map(|s| s.name.clone()).collect();
-                    self.overlay = Overlay::Picker(Picker::sessions(names, self.sessions.active_idx()));
+                    let names: Vec<String> =
+                        self.sessions.all().iter().map(|s| s.name.clone()).collect();
+                    self.overlay =
+                        Overlay::Picker(Picker::sessions(names, self.sessions.active_idx()));
                 }
             }
             Action::SelectSession(i) => {
@@ -386,7 +361,11 @@ impl App {
                         where_ = format!("  ({})", dir.display());
                     }
                 }
-                self.set_status(format!("Session: {}{}", self.sessions.active().name, where_));
+                self.set_status(format!(
+                    "Session: {}{}",
+                    self.sessions.active().name,
+                    where_
+                ));
                 self.chat.stick_bottom = true;
                 self.touch();
             }
@@ -395,16 +374,39 @@ impl App {
                 self.set_status(format!("Renamed: {}", name));
                 self.sessions.save();
             }
+            Action::DeleteSessionAt(idx) => {
+                let name = self
+                    .sessions
+                    .all()
+                    .get(idx)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                self.sessions.remove_at(idx);
+                self.sessions.save();
+                self.set_status(format!("Deleted: {}", name));
+                self.chat.stick_bottom = true;
+                self.touch();
+                // Keep the picker open on the refreshed list (or close it if this was
+                // opened outside the picker).
+                if matches!(&self.overlay, Overlay::Picker(p) if p.kind == PickerKind::Session) {
+                    let names: Vec<String> =
+                        self.sessions.all().iter().map(|s| s.name.clone()).collect();
+                    self.overlay =
+                        Overlay::Picker(Picker::sessions(names, self.sessions.active_idx()));
+                }
+            }
 
             // ── Skills ──────────────────────────────────────────────────────
             Action::OpenSkillPicker => {
                 if matches!(&self.overlay, Overlay::Picker(p) if p.kind == PickerKind::Skill) {
                     self.overlay = Overlay::None;
                 } else if self.skills.is_empty() {
-                    self.set_status(format!("No skills. Add .md files in {}", crate::skills::skills_dir().display()));
+                    self.set_status(format!(
+                        "No skills. Add .md files in {}",
+                        crate::skills::skills_dir().display()
+                    ));
                 } else {
                     self.overlay = Overlay::Picker(Picker::skills(self.skill_items()));
-                    self.set_status("⏎ toggle skill · Esc close · edit ~/.config/aitui/skills/");
                 }
             }
             Action::ToggleSkill(i) => {
@@ -444,35 +446,52 @@ impl App {
                     self.models.push(m.clone());
                     self.model_idx = self.models.len() - 1;
                 }
-                self.set_status(format!("Model: {}", m));
             }
             Action::NextModel => {
                 if !self.models.is_empty() {
                     self.model_idx = (self.model_idx + 1) % self.models.len();
-                    self.set_status(format!("Model: {}", self.current_model()));
                 }
             }
             Action::PrevModel => {
                 if !self.models.is_empty() {
                     self.model_idx = (self.model_idx + self.models.len() - 1) % self.models.len();
-                    self.set_status(format!("Model: {}", self.current_model()));
                 }
             }
-            Action::ModelsLoaded(models) => {
-                if !models.is_empty() {
-                    // Keep the current selection if it survived the refresh;
-                    // otherwise fall back to the configured default model, then 0.
-                    let current = self.current_model().to_string();
-                    let default = self.config.api.default_model.clone();
-                    self.models = models;
-                    self.model_idx = self
-                        .models
-                        .iter()
-                        .position(|m| m == &current)
-                        .or_else(|| self.models.iter().position(|m| m == &default))
-                        .unwrap_or(0);
-                    self.set_status(format!("Loaded {} models", self.models.len()));
+            Action::ModelsLoaded(mut models) => {
+                use crate::app::state::{ModelLoad, MOCK_MODEL};
+                // `mock` is always available as the last-resort model.
+                if !models.iter().any(|m| m == MOCK_MODEL) {
+                    models.push(MOCK_MODEL.to_string());
                 }
+                // Selection priority: whatever was already chosen (on a refresh), then
+                // the configured default (e.g. gpt-5.5) if it exists, then mock.
+                let current = self.current_model().to_string();
+                let default = self.config.api.default_model.clone();
+                self.models = models;
+                self.model_idx = self
+                    .models
+                    .iter()
+                    .position(|m| m == &current && m != MOCK_MODEL)
+                    .or_else(|| self.models.iter().position(|m| m == &default))
+                    .or_else(|| self.models.iter().position(|m| m == MOCK_MODEL))
+                    .unwrap_or(0);
+                self.model_load = ModelLoad::Loaded;
+                let real = self.models.iter().filter(|m| *m != MOCK_MODEL).count();
+                self.set_status(format!(
+                    "Loaded {} model{}",
+                    real,
+                    if real == 1 { "" } else { "s" }
+                ));
+            }
+            Action::ModelsFailed => {
+                // Connection/timeout — fall back to mock only and flag the failure.
+                use crate::app::state::{ModelLoad, MOCK_MODEL};
+                self.models = vec![MOCK_MODEL.to_string()];
+                self.model_idx = 0;
+                self.model_load = ModelLoad::Failed;
+                self.set_status(
+                    "⚠ Could not load models — using mock. Check endpoint/key, then :api",
+                );
             }
 
             // ── Files / attachment ──────────────────────────────────────────
@@ -482,13 +501,17 @@ impl App {
                     self.overlay = Overlay::None;
                 } else {
                     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                    self.overlay = Overlay::Browser(FileBrowser::open(cwd, BrowsePurpose::Attach, Vec::new()));
-                    self.set_status("h/j/k/l navigate · l/⏎ attach file · h up · Esc close");
+                    self.overlay =
+                        Overlay::Browser(FileBrowser::open(cwd, BrowsePurpose::Attach, Vec::new()));
                 }
             }
             Action::AttachFile(path) => {
                 if path.exists() {
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("?")
+                        .to_string();
                     self.attachment = Some(path);
                     self.set_status(format!("Attached: {}", name));
                 } else {
@@ -513,8 +536,17 @@ impl App {
                 if matches!(&self.overlay, Overlay::Settings(_)) {
                     self.overlay = Overlay::None;
                 } else {
-                    let prompt = self.sessions.active().system_prompt.clone().unwrap_or_default();
-                    self.overlay = Overlay::Settings(Settings { selected: 0, editing_prompt: false, prompt_buf: prompt });
+                    let prompt = self
+                        .sessions
+                        .active()
+                        .system_prompt
+                        .clone()
+                        .unwrap_or_default();
+                    self.overlay = Overlay::Settings(Settings {
+                        selected: 0,
+                        editing_prompt: false,
+                        prompt_buf: prompt,
+                    });
                 }
             }
             Action::OpenApiSetup => {
@@ -552,10 +584,29 @@ impl App {
                 });
                 self.sessions.save();
             }
-            Action::AgentPermitOnce => return self.resolve_permission(Permission::Allow),
-            Action::AgentPermitAll => return self.resolve_permission(Permission::AllowAll),
-            Action::AgentDenyOnce => return self.resolve_permission(Permission::Deny),
-            Action::AgentDenyAll => return self.resolve_permission(Permission::DenyAll),
+            Action::AgentResolvePermission => {
+                let perm = match &self.overlay {
+                    Overlay::Permission(r) => r.permission(),
+                    _ => return None,
+                };
+                return self.resolve_permission(perm);
+            }
+            Action::AgentQuickAllow => return self.resolve_permission(Permission::Allow),
+            Action::AgentQuickDeny => return self.resolve_permission(Permission::Deny),
+            Action::AgentDecisionToggle => {
+                if let Overlay::Decision(r) = &mut self.overlay {
+                    r.toggle();
+                }
+            }
+            Action::AgentResolveDecision => return self.resolve_decision(),
+            Action::AgentPlanEdit => {
+                if let Overlay::Plan(r) = &self.overlay {
+                    self.pending_external =
+                        Some(PendingExternal::EditorFiles(vec![r.path.clone()]));
+                }
+            }
+            Action::AgentPlanAccept => return self.resolve_plan(true),
+            Action::AgentPlanDeny => return self.resolve_plan(false),
             Action::AgentToolResult(result) => {
                 self.agent_tool_rx = None;
                 self.record_tool_result(result);
@@ -564,9 +615,12 @@ impl App {
             Action::AgentCancel => {
                 self.overlay = Overlay::None;
                 self.pending_tools.clear();
+                self.active_tool = None;
                 self.agent_iterations = 0;
                 self.set_status("Agent round cancelled");
             }
+            Action::AgentEnableTools => return self.enable_agent_and_run(),
+            Action::AgentDeclineTools => return self.decline_agent_tools(),
 
             // ── System prompt ───────────────────────────────────────────────
             Action::SetSystemPrompt(p) => {
@@ -593,9 +647,14 @@ impl App {
                 }
             }
             Overlay::Permission(r) => r.up(),
+            Overlay::Decision(r) => r.up(),
             Overlay::Startup(s) => s.up(),
             Overlay::ApiSetup(a) => a.next_field(),
-            Overlay::Browser(_) | Overlay::Notice { .. } | Overlay::None => {}
+            Overlay::ToolRequest(_)
+            | Overlay::Plan(_)
+            | Overlay::Browser(_)
+            | Overlay::Notice { .. }
+            | Overlay::None => {}
         }
     }
     fn picker_down(&mut self) {
@@ -608,9 +667,14 @@ impl App {
                 }
             }
             Overlay::Permission(r) => r.down(),
+            Overlay::Decision(r) => r.down(),
             Overlay::Startup(s) => s.down(),
             Overlay::ApiSetup(a) => a.next_field(),
-            Overlay::Browser(_) | Overlay::Notice { .. } | Overlay::None => {}
+            Overlay::ToolRequest(_)
+            | Overlay::Plan(_)
+            | Overlay::Browser(_)
+            | Overlay::Notice { .. }
+            | Overlay::None => {}
         }
     }
     fn picker_char(&mut self, c: char) {
@@ -659,17 +723,16 @@ impl App {
         self.config.api.api_key = key.clone();
         let _ = self.config.save();
         self.api = crate::api::ApiClient::new(&ep, &key).ok();
-        if !ep.is_empty() {
-            self.mock = false;
-        }
-        self.set_status(if ep.is_empty() {
-            "API endpoint cleared — mock mode".to_string()
+        if ep.is_empty() {
+            self.select_mock_model();
+            self.set_status("API endpoint cleared — using mock".to_string());
         } else {
-            format!("API endpoint set: {}", ep)
-        });
+            self.refresh_models();
+            self.set_status(format!("API endpoint set: {} — loading models…", ep));
+        }
     }
 
-        // ── Input history helpers (shell-style up/down) ───────────────────
+    // ── Input history helpers (shell-style up/down) ───────────────────
 
     fn input_history_prev(&mut self) {
         if self.input_history.is_empty() {
@@ -725,7 +788,9 @@ impl App {
 
     /// Open/attach the current target(s) in the file browser. Folders descend.
     fn browser_open(&mut self) -> Option<Action> {
-        let Overlay::Browser(b) = &mut self.overlay else { return None };
+        let Overlay::Browser(b) = &mut self.overlay else {
+            return None;
+        };
         if b.current().map(|e| e.is_dir).unwrap_or(false) {
             b.enter_dir();
             return None;
@@ -753,12 +818,24 @@ impl App {
         }
         match std::mem::replace(&mut self.overlay, Overlay::None) {
             Overlay::Picker(p) => match p.kind {
-                PickerKind::Model => p.selected_item().map(|m| Action::SelectModel(m.to_string())),
+                PickerKind::Model => p
+                    .selected_item()
+                    .map(|m| Action::SelectModel(m.to_string())),
                 PickerKind::Session => p.selected_index().map(Action::SelectSession),
                 PickerKind::Skill => None,
             },
-            Overlay::Palette(p) => p.selected_cmd().map(|c| Action::RunCommand(c.run.to_string())),
+            Overlay::Palette(p) => p
+                .selected_cmd()
+                .map(|c| Action::RunCommand(c.run.to_string())),
             Overlay::Permission(r) => self.resolve_permission(r.permission()),
+            Overlay::Decision(r) => {
+                self.overlay = Overlay::Decision(r);
+                self.resolve_decision()
+            }
+            Overlay::Plan(r) => {
+                self.overlay = Overlay::Plan(r);
+                self.resolve_plan(true)
+            }
             Overlay::Settings(s) => {
                 self.overlay = Overlay::Settings(s);
                 self.settings_confirm();
@@ -777,7 +854,7 @@ impl App {
                 self.apply_api_setup();
                 None
             }
-            Overlay::Notice { .. } | Overlay::None => None,
+            Overlay::ToolRequest(_) | Overlay::Notice { .. } | Overlay::None => None,
         }
     }
 
@@ -797,14 +874,20 @@ impl App {
     }
 
     fn settings_confirm(&mut self) {
-        let Overlay::Settings(s) = &self.overlay else { return };
+        let Overlay::Settings(s) = &self.overlay else {
+            return;
+        };
         let row = SettingsRow::all().get(s.selected).copied();
         match row {
             Some(SettingsRow::SystemPrompt) => {
                 if let Overlay::Settings(s) = &mut self.overlay {
                     if s.editing_prompt {
                         let buf = s.prompt_buf.clone();
-                        let prompt = if buf.trim().is_empty() { None } else { Some(buf) };
+                        let prompt = if buf.trim().is_empty() {
+                            None
+                        } else {
+                            Some(buf)
+                        };
                         s.editing_prompt = false;
                         self.sessions.active_mut().system_prompt = prompt;
                         self.sessions.save();
@@ -813,19 +896,30 @@ impl App {
                     }
                 }
             }
-            Some(SettingsRow::AgentDefault) | Some(SettingsRow::AutoApprove) => self.settings_adjust(0),
+            Some(SettingsRow::AgentDefault) | Some(SettingsRow::AutoApprove) => {
+                self.settings_adjust(0)
+            }
             _ => {}
         }
     }
 
     fn settings_adjust(&mut self, dir: i32) {
-        let Overlay::Settings(s) = &self.overlay else { return };
-        let Some(row) = SettingsRow::all().get(s.selected).copied() else { return };
+        let Overlay::Settings(s) = &self.overlay else {
+            return;
+        };
+        let Some(row) = SettingsRow::all().get(s.selected).copied() else {
+            return;
+        };
         match row {
-            SettingsRow::AgentDefault => self.config.ui.agent_default = !self.config.ui.agent_default,
+            SettingsRow::AgentDefault => {
+                self.config.ui.agent_default = !self.config.ui.agent_default
+            }
             SettingsRow::AutoApprove => {
                 self.config.ui.auto_approve_reads = !self.config.ui.auto_approve_reads;
-                crate::app::overlay::sync_auto_approvals(&mut self.permissions, self.config.ui.auto_approve_reads);
+                crate::app::overlay::sync_auto_approvals(
+                    &mut self.permissions,
+                    self.config.ui.auto_approve_reads,
+                );
             }
             SettingsRow::InputHeight => {
                 let h = self.config.ui.input_height as i32 + dir;
@@ -872,21 +966,12 @@ impl App {
             "detach" | "noattach" => return Some(Action::ClearAttachment),
             "agent" | "agentmode" => return Some(Action::ToggleAgentMode),
             "mock" | "test" | "offline" => {
-                self.mock = !self.mock;
-                self.set_status(if self.mock {
-                    "Mock mode ON — type 'help' then send to drive the agent offline"
-                } else {
-                    "Mock mode OFF — using the live API"
-                });
+                // Mock is a model now — this just selects it.
+                self.select_mock_model();
+                self.set_status("Switched to the mock model (offline)");
             }
             "native" | "nativetools" => {
-                self.config.api.native_tools = !self.config.api.native_tools;
-                let on = self.config.api.native_tools;
-                let _ = self.config.save();
-                self.set_status(format!(
-                    "Native tool-calling: {}",
-                    if on { "ON (structured tool_calls)" } else { "off (```tool fences)" }
-                ));
+                self.set_status("Tool-calling: always on (required)");
             }
             "setup" | "apikey" | "endpoint" => return Some(Action::OpenApiSetup),
             "settings" | "config" | "set" => return Some(Action::OpenSettings),
@@ -899,7 +984,14 @@ impl App {
                 if on {
                     crate::skills::save_active(&self.skills);
                 }
-                self.set_status(format!("Sticky skills: {}", if on { "ON (remembered across restarts)" } else { "off" }));
+                self.set_status(format!(
+                    "Sticky skills: {}",
+                    if on {
+                        "ON (remembered across restarts)"
+                    } else {
+                        "off"
+                    }
+                ));
             }
             "effort" | "reasoning" => {
                 // Cycle none → low → medium → high → none.
@@ -974,18 +1066,6 @@ fn looks_like_base_url_error(err: &str) -> bool {
         || e.contains("no api client")
 }
 
-fn looks_like_tools_error(err: &str) -> bool {
-    let e = err.to_lowercase();
-    let mentions_tools = e.contains("tool") || e.contains("function");
-    let rejected = e.contains("400")
-        || e.contains("not supported")
-        || e.contains("unsupported")
-        || e.contains("does not support")
-        || e.contains("unknown field")
-        || e.contains("unrecognized");
-    mentions_tools && rejected
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,11 +1097,13 @@ mod tests {
             input_history: Vec::new(),
             input_history_idx: None,
             input_draft: String::new(),
+            todos: Vec::new(),
             overlay: Overlay::None,
             mention: Mention::default(),
             pastes: Vec::new(),
-            models: vec!["gemini-2.5-flash".into(), "claude-sonnet-4-6".into()],
+            models: vec!["gpt-5.5".into(), "claude-sonnet-4-6".into(), "mock".into()],
             model_idx: 0,
+            model_load: crate::app::state::ModelLoad::Loaded,
             attachment: None,
             status: None,
             show_help: false,
@@ -1029,7 +1111,7 @@ mod tests {
             yank: None,
             last_insert: None,
             show_output: false,
-            mock: false,
+            pending_image: None,
             edited_files: Vec::new(),
             pending_external: None,
             usage: None,
@@ -1043,6 +1125,7 @@ mod tests {
             agent_session: None,
             agent_queue: VecDeque::new(),
             agent_tool_rx: None,
+            active_tool: None,
             models_rx: None,
             spec_results: std::collections::HashMap::new(),
             spec_dispatched: std::collections::HashSet::new(),
@@ -1087,12 +1170,12 @@ mod tests {
     }
 
     #[test]
-    fn enter_command_sets_mode_and_clears_buffer() {
+    fn open_command_palette_opens_overlay_without_mode_switch() {
         let mut app = test_app();
         app.command = "old".into();
-        app.apply(Action::EnterCommand);
-        assert_eq!(app.vim, VimMode::Command);
-        assert!(app.command.is_empty());
+        app.apply(Action::OpenCommandPalette);
+        assert_eq!(app.vim, VimMode::Normal);
+        assert!(matches!(app.overlay, Overlay::Palette(_)));
     }
 
     #[test]
@@ -1113,11 +1196,11 @@ mod tests {
     }
 
     #[test]
-    fn insert_char_in_command_mode_appends_to_command() {
+    fn insert_char_always_appends_to_input() {
         let mut app = test_app();
-        app.vim = VimMode::Command;
         app.apply(Action::InsertChar('w'));
-        assert_eq!(app.command, "w");
+        assert_eq!(app.input.text(), "w");
+        assert!(app.command.is_empty());
     }
 
     #[test]
@@ -1139,12 +1222,12 @@ mod tests {
     }
 
     #[test]
-    fn backspace_in_command_mode_pops_command() {
+    fn backspace_always_edits_input() {
         let mut app = test_app();
-        app.vim = VimMode::Command;
-        app.command = "wr".into();
+        app.input.paste("wr");
+        app.input.col = 2;
         app.apply(Action::Backspace);
-        assert_eq!(app.command, "w");
+        assert_eq!(app.input.text(), "w");
     }
 
     #[test]
@@ -1168,12 +1251,12 @@ mod tests {
     }
 
     #[test]
-    fn yank_line_copies_and_sets_status() {
+    fn yank_line_copies_text() {
         let mut app = test_app();
         app.input.paste("yank me");
         app.apply(Action::YankLine);
         assert_eq!(app.yank.as_deref(), Some("yank me"));
-        assert!(app.status.is_some());
+        assert!(app.status.is_none());
     }
 
     #[test]
@@ -1190,7 +1273,10 @@ mod tests {
     fn medium_paste_chips_and_expands_on_send() {
         let mut app = test_app();
         app.vim = VimMode::Insert;
-        let blob = (0..10).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+        let blob = (0..10)
+            .map(|i| format!("line{}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         app.apply(Action::PasteText(blob.clone()));
         // The composer shows a compact chip, not the raw blob.
         assert!(app.input.text().contains("[PASTED#1-10lines-"));
@@ -1198,12 +1284,22 @@ mod tests {
         assert_eq!(app.pastes.len(), 1);
         // Sending expands the chip back to the full text and clears the store.
         let _ = app.submit();
-        let sent = app.sessions.active().messages.iter().rev().find(|m| m.role == "user").unwrap();
+        let sent = app
+            .sessions
+            .active()
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .unwrap();
         let text = match &sent.content {
             crate::api::models::MessageContent::Text(t) => t.clone(),
             _ => String::new(),
         };
-        assert!(text.contains("line5"), "full pasted text must be restored on send");
+        assert!(
+            text.contains("line5"),
+            "full pasted text must be restored on send"
+        );
         assert!(app.pastes.is_empty());
     }
 
@@ -1288,9 +1384,12 @@ mod tests {
     fn toggle_skill_flips_active_and_refreshes_picker() {
         let mut app = test_app();
         app.config.ui.sticky_skills = false; // don't touch disk in tests
-        app.skills = vec![
-            crate::skills::Skill { name: "caveman".into(), desc: "terse".into(), body: "be terse".into(), active: false },
-        ];
+        app.skills = vec![crate::skills::Skill {
+            name: "caveman".into(),
+            desc: "terse".into(),
+            body: "be terse".into(),
+            active: false,
+        }];
         app.apply(Action::OpenSkillPicker);
         assert!(matches!(app.overlay, Overlay::Picker(_)));
         app.apply(Action::ToggleSkill(0));
@@ -1353,10 +1452,14 @@ mod tests {
     #[test]
     fn open_editor_sets_request() {
         let mut app = test_app();
-        app.sessions.active_mut().push_message(crate::api::ChatMessage::user("hi there"));
+        app.sessions
+            .active_mut()
+            .push_message(crate::api::ChatMessage::user("hi there"));
         app.apply(Action::OpenEditor);
         match app.pending_external {
-            Some(crate::app::state::PendingExternal::EditorText(ref t)) => assert!(t.contains("hi there")),
+            Some(crate::app::state::PendingExternal::EditorText(ref t)) => {
+                assert!(t.contains("hi there"))
+            }
             _ => panic!("expected EditorText request"),
         }
     }
@@ -1364,15 +1467,23 @@ mod tests {
     #[test]
     fn open_files_in_editor_sets_external() {
         let mut app = test_app();
-        app.apply(Action::OpenFilesInEditor(vec![std::path::PathBuf::from("src/main.rs")]));
-        assert!(matches!(app.pending_external, Some(crate::app::state::PendingExternal::EditorFiles(_))));
+        app.apply(Action::OpenFilesInEditor(vec![std::path::PathBuf::from(
+            "src/main.rs",
+        )]));
+        assert!(matches!(
+            app.pending_external,
+            Some(crate::app::state::PendingExternal::EditorFiles(_))
+        ));
     }
 
     #[test]
     fn open_shell_sets_external() {
         let mut app = test_app();
         app.apply(Action::OpenShell);
-        assert!(matches!(app.pending_external, Some(crate::app::state::PendingExternal::Shell)));
+        assert!(matches!(
+            app.pending_external,
+            Some(crate::app::state::PendingExternal::Shell)
+        ));
     }
 
     #[test]
@@ -1399,8 +1510,16 @@ mod tests {
     fn successful_write_tracks_edited_file() {
         use crate::agent::{ToolCall, ToolResult};
         let mut app = test_app();
-        let call = ToolCall { name: "write_file".into(), args: serde_json::json!({"path": "./src/x.rs"}), id: None };
-        app.apply(Action::AgentToolResult(ToolResult::success(call, "ok".into(), 1)));
+        let call = ToolCall {
+            name: "write_file".into(),
+            args: serde_json::json!({"path": "./src/x.rs"}),
+            id: None,
+        };
+        app.apply(Action::AgentToolResult(ToolResult::success(
+            call,
+            "ok".into(),
+            1,
+        )));
         assert_eq!(app.edited_files, vec!["src/x.rs".to_string()]);
     }
 
@@ -1409,11 +1528,18 @@ mod tests {
         use crate::agent::{ToolCall, ToolResult};
         let mut app = test_app();
         app.edited_files = vec!["src/x.rs".into()];
-        let call = ToolCall { name: "delete_file".into(), args: serde_json::json!({"path": "src/x.rs"}), id: None };
-        app.apply(Action::AgentToolResult(ToolResult::success(call, "deleted".into(), 1)));
+        let call = ToolCall {
+            name: "delete_file".into(),
+            args: serde_json::json!({"path": "src/x.rs"}),
+            id: None,
+        };
+        app.apply(Action::AgentToolResult(ToolResult::success(
+            call,
+            "deleted".into(),
+            1,
+        )));
         assert!(app.edited_files.is_empty());
     }
-
 
     #[test]
     fn submit_blocked_while_busy_keeps_input_and_shows_notice() {
@@ -1421,12 +1547,22 @@ mod tests {
         app.input.set_text("hello");
         // Simulate an in-flight stream for the active session → busy.
         let sid = app.sessions.active_id();
-        app.streams.push(crate::app::state::StreamHandle { session_id: sid, rx: tokio::sync::mpsc::channel(1).1 });
+        app.streams.push(crate::app::state::StreamHandle {
+            session_id: sid,
+            rx: tokio::sync::mpsc::channel(1).1,
+        });
         assert!(app.is_busy());
         let out = app.submit();
         assert!(out.is_none(), "must not start a new stream while busy");
-        assert!(matches!(app.overlay, Overlay::Notice { .. }), "a busy notice should show");
-        assert_eq!(app.input.take(), "hello", "the composed text must be preserved");
+        assert!(
+            matches!(app.overlay, Overlay::Notice { .. }),
+            "a busy notice should show"
+        );
+        assert_eq!(
+            app.input.take(),
+            "hello",
+            "the composed text must be preserved"
+        );
     }
 
     #[test]
@@ -1437,8 +1573,16 @@ mod tests {
         let _ = app.submit();
         // The user message was pushed (a real stream would attach in the app; the
         // test harness has no API client so the turn finalizes immediately).
-        assert!(app.sessions.active().messages.iter().any(|m| m.role == "user"));
-        assert!(!matches!(app.overlay, Overlay::Notice { .. }), "idle send must not show the busy notice");
+        assert!(app
+            .sessions
+            .active()
+            .messages
+            .iter()
+            .any(|m| m.role == "user"));
+        assert!(
+            !matches!(app.overlay, Overlay::Notice { .. }),
+            "idle send must not show the busy notice"
+        );
     }
 
     #[test]
@@ -1452,13 +1596,19 @@ mod tests {
             id: None,
         });
         let _ = app.process_next_tool();
-        assert!(matches!(app.overlay, Overlay::Permission(_)), "write should prompt for permission");
+        assert!(
+            matches!(app.overlay, Overlay::Permission(_)),
+            "write should prompt for permission"
+        );
     }
 
     #[test]
     fn dismiss_notice_closes_it() {
         let mut app = test_app();
-        app.overlay = Overlay::Notice { title: "t".into(), body: "b".into() };
+        app.overlay = Overlay::Notice {
+            title: "t".into(),
+            body: "b".into(),
+        };
         app.apply(Action::DismissNotice);
         assert!(matches!(app.overlay, Overlay::None));
     }
@@ -1489,7 +1639,9 @@ mod tests {
     #[test]
     fn command_clear_clears_messages() {
         let mut app = test_app();
-        app.sessions.active_mut().push_message(crate::api::ChatMessage::user("test"));
+        app.sessions
+            .active_mut()
+            .push_message(crate::api::ChatMessage::user("test"));
         app.apply(Action::RunCommand("clear".into()));
         assert!(app.sessions.active().messages.is_empty());
     }
@@ -1510,21 +1662,6 @@ mod tests {
         app.apply(Action::RunCommand("w".into()));
         app.apply(Action::RunCommand("w".into()));
         assert_eq!(app.command_history.len(), 1);
-    }
-
-    #[test]
-    fn command_history_navigation() {
-        let mut app = test_app();
-        app.apply(Action::RunCommand("w".into()));
-        app.apply(Action::RunCommand("q".into()));
-        app.apply(Action::CommandHistoryPrev);
-        assert_eq!(app.command, "q");
-        app.apply(Action::CommandHistoryPrev);
-        assert_eq!(app.command, "w");
-        app.apply(Action::CommandHistoryNext);
-        assert_eq!(app.command, "q");
-        app.apply(Action::CommandHistoryNext);
-        assert!(app.command.is_empty());
     }
 
     #[test]
@@ -1557,17 +1694,27 @@ mod tests {
     fn speculative_result_is_used_without_respawning() {
         use crate::agent::{ToolCall, ToolResult};
         let mut app = test_app();
-        let call = ToolCall { name: "read_file".into(), args: serde_json::json!({"path": "x"}), id: None };
+        let call = ToolCall {
+            name: "read_file".into(),
+            args: serde_json::json!({"path": "x"}),
+            id: None,
+        };
         app.permissions.remember_allow(call.kind().unwrap());
         // A result pre-run while the reply streamed is stashed under its call sig.
-        app.store_spec_result(app.spec_epoch, ToolResult::success(call.clone(), "file contents".into(), 1));
+        app.store_spec_result(
+            app.spec_epoch,
+            ToolResult::success(call.clone(), "file contents".into(), 1),
+        );
         app.pending_tools.push_back(call);
         app.agent_session = Some(app.sessions.active_id());
 
         let _ = app.process_next_tool();
 
         // The cached result was used directly — no async tool execution spawned.
-        assert!(app.agent_tool_rx.is_none(), "must not respawn a pre-run tool");
+        assert!(
+            app.agent_tool_rx.is_none(),
+            "must not respawn a pre-run tool"
+        );
         assert!(
             app.sessions.active().messages.iter().any(|m| m.role == "tool"
                 && matches!(&m.content, crate::api::models::MessageContent::Text(t) if t.contains("file contents"))),
@@ -1579,20 +1726,18 @@ mod tests {
     fn stale_epoch_speculative_result_is_dropped() {
         use crate::agent::{ToolCall, ToolResult};
         let mut app = test_app();
-        let call = ToolCall { name: "read_file".into(), args: serde_json::json!({"path": "x"}), id: None };
+        let call = ToolCall {
+            name: "read_file".into(),
+            args: serde_json::json!({"path": "x"}),
+            id: None,
+        };
         let stale = app.spec_epoch;
         app.spec_epoch = app.spec_epoch.wrapping_add(1); // turn moved on
         app.store_spec_result(stale, ToolResult::success(call, "old".into(), 1));
-        assert!(app.spec_results.is_empty(), "a result from a past turn must be dropped");
-    }
-
-    #[test]
-    fn tools_error_detection() {
-        assert!(looks_like_tools_error("API error 400: model does not support tools"));
-        assert!(looks_like_tools_error("unknown field `tools`, expected one of ..."));
-        assert!(looks_like_tools_error("function calling is unsupported here"));
-        assert!(!looks_like_tools_error("API error 500: internal error"));
-        assert!(!looks_like_tools_error("connection refused"));
+        assert!(
+            app.spec_results.is_empty(),
+            "a result from a past turn must be dropped"
+        );
     }
 
     #[test]
@@ -1623,17 +1768,18 @@ mod tests {
 
     #[test]
     fn base_url_error_detection() {
-        assert!(looks_like_base_url_error("Request failed: builder error: relative url without a base"));
+        assert!(looks_like_base_url_error(
+            "Request failed: builder error: relative url without a base"
+        ));
         assert!(looks_like_base_url_error("No API client"));
         assert!(!looks_like_base_url_error("API error 500: internal"));
     }
 
     #[test]
-    fn native_command_toggles_config() {
+    fn native_command_is_noop() {
         let mut app = test_app();
-        let before = app.config.api.native_tools;
         app.apply(Action::RunCommand("native".into()));
-        assert_eq!(app.config.api.native_tools, !before);
+        assert!(app.status.unwrap().contains("always on"));
     }
 
     #[test]
@@ -1650,10 +1796,13 @@ mod tests {
 
     #[test]
     fn next_model_cycles_forward() {
+        // test_app() has 3 models: gpt-5.5, claude-sonnet-4-6, mock.
         let mut app = test_app();
         assert_eq!(app.model_idx, 0);
         app.apply(Action::NextModel);
         assert_eq!(app.model_idx, 1);
+        app.apply(Action::NextModel);
+        assert_eq!(app.model_idx, 2);
         app.apply(Action::NextModel);
         assert_eq!(app.model_idx, 0); // wraps
     }
@@ -1662,16 +1811,51 @@ mod tests {
     fn prev_model_cycles_backward() {
         let mut app = test_app();
         app.apply(Action::PrevModel);
-        assert_eq!(app.model_idx, 1);
+        assert_eq!(app.model_idx, 2); // wraps to last
     }
 
     #[test]
     fn select_model_finds_or_appends() {
         let mut app = test_app();
-        app.apply(Action::SelectModel("gemini-2.5-flash".into()));
+        app.apply(Action::SelectModel("gpt-5.5".into()));
         assert_eq!(app.model_idx, 0);
         app.apply(Action::SelectModel("new-model".into()));
-        assert_eq!(app.model_idx, 2);
+        assert_eq!(app.model_idx, 3);
+    }
+
+    #[test]
+    fn models_loaded_appends_mock_and_selects_default() {
+        use crate::app::state::ModelLoad;
+        let mut app = test_app();
+        app.config.api.default_model = "gpt-5.5".into();
+        app.apply(Action::ModelsLoaded(vec![
+            "gpt-5.4".into(),
+            "gpt-5.5".into(),
+        ]));
+        assert!(
+            app.models.iter().any(|m| m == "mock"),
+            "mock always present"
+        );
+        assert_eq!(app.current_model(), "gpt-5.5");
+        assert_eq!(app.model_load, ModelLoad::Loaded);
+    }
+
+    #[test]
+    fn models_loaded_falls_back_to_mock_when_default_absent() {
+        let mut app = test_app();
+        app.config.api.default_model = "does-not-exist".into();
+        app.apply(Action::ModelsLoaded(vec!["gpt-5.4".into()]));
+        assert_eq!(app.current_model(), "mock");
+    }
+
+    #[test]
+    fn models_failed_uses_mock_only() {
+        use crate::app::state::ModelLoad;
+        let mut app = test_app();
+        app.apply(Action::ModelsFailed);
+        assert_eq!(app.models, vec!["mock".to_string()]);
+        assert_eq!(app.model_load, ModelLoad::Failed);
+        assert!(app.is_mock());
     }
 
     // ── Overlays ───────────────────────────────────────────────────────────────
@@ -1750,7 +1934,12 @@ mod tests {
     fn chat_click_toggles_individual_block_header() {
         use ratatui::layout::Rect;
         let mut app = test_app();
-        app.layout.chat = Rect { x: 0, y: 0, width: 80, height: 24 };
+        app.layout.chat = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
         let (rows, header_idx, key) = collapsible_tool_doc();
         app.chat.stick_bottom = false;
         app.chat.scroll = 0;
@@ -1759,32 +1948,81 @@ mod tests {
 
         assert!(!app.chat.toggled.contains(&key));
         app.apply(Action::ChatClick(5, header_idx as u16)); // click the header row
-        assert!(app.chat.toggled.contains(&key), "click should flip the block");
-        assert_eq!(app.chat.focus_msg, Some(key.0), "click should focus that message");
+        assert!(
+            app.chat.toggled.contains(&key),
+            "click should flip the block"
+        );
+        // Browsing (not at bottom): the click must NOT jump/reveal — scroll stays put.
+        assert_eq!(
+            app.chat.focus_msg, None,
+            "click while browsing must not force a scroll"
+        );
+        assert!(
+            !app.chat.stick_bottom,
+            "click while browsing must not stick to bottom"
+        );
         app.apply(Action::ChatClick(5, header_idx as u16));
         assert!(!app.chat.toggled.contains(&key), "second click flips back");
+    }
+
+    #[test]
+    fn chat_click_at_bottom_still_reveals() {
+        use ratatui::layout::Rect;
+        let mut app = test_app();
+        app.layout.chat = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let (rows, header_idx, key) = collapsible_tool_doc();
+        app.chat.stick_bottom = true; // already at the bottom
+        app.chat.set_doc(rows, 1, 80, 24);
+        app.chat.scroll = 0;
+        app.apply(Action::ChatClick(5, header_idx as u16));
+        assert_eq!(
+            app.chat.focus_msg,
+            Some(key.0),
+            "at bottom, a click still reveals the block"
+        );
     }
 
     #[test]
     fn chat_click_on_non_header_row_does_not_toggle() {
         use ratatui::layout::Rect;
         let mut app = test_app();
-        app.layout.chat = Rect { x: 0, y: 0, width: 80, height: 24 };
+        app.layout.chat = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
         let (rows, header_idx, _key) = collapsible_tool_doc();
-        assert!(header_idx > 0, "there should be a role-label row before the header");
+        assert!(
+            header_idx > 0,
+            "there should be a role-label row before the header"
+        );
         assert!(rows[0].toggle.is_none());
         app.chat.stick_bottom = false;
         app.chat.set_doc(rows, 1, 80, 24);
         app.chat.scroll = 0;
         app.apply(Action::ChatClick(3, 0));
-        assert!(app.chat.toggled.is_empty(), "clicking a non-header row does nothing");
+        assert!(
+            app.chat.toggled.is_empty(),
+            "clicking a non-header row does nothing"
+        );
     }
 
     #[test]
     fn chat_click_outside_pane_is_ignored() {
         use ratatui::layout::Rect;
         let mut app = test_app();
-        app.layout.chat = Rect { x: 0, y: 0, width: 80, height: 24 };
+        app.layout.chat = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
         let (rows, _idx, _key) = collapsible_tool_doc();
         app.chat.set_doc(rows, 1, 80, 24);
         app.apply(Action::ChatClick(5, 100)); // row 100 is below the pane
@@ -1793,17 +2031,43 @@ mod tests {
 
     /// A document whose only collapsible header is a long (>6 line) tool result.
     /// Returns the rows, the header's row index, and its `(msg, block)` key.
-    fn collapsible_tool_doc() -> (Vec<crate::render::document::RenderedLine>, usize, (usize, usize)) {
+    fn collapsible_tool_doc() -> (
+        Vec<crate::render::document::RenderedLine>,
+        usize,
+        (usize, usize),
+    ) {
         use crate::domain::blocks::Block;
         use crate::render::document::{build, DocMessage};
         use std::collections::HashSet;
-        let output = (0..10).map(|i| format!("out {}", i)).collect::<Vec<_>>().join("\n");
+        let output = (0..10)
+            .map(|i| format!("out {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let msgs = vec![DocMessage {
             role: "tool".into(),
-            blocks: vec![Block::ToolResult { ok: true, summary: "Shell x".into(), output }],
+            blocks: vec![Block::ToolResult {
+                ok: true,
+                name: Some("shell".into()),
+                summary: "shell(x)".into(),
+                output,
+            }],
+            duration_ms: None,
+            first_ms: None,
+            loading: None,
+            started_at: None,
         }];
-        let rows = build(&msgs, 80, &crate::render::theme::Theme::default(), &HashSet::new(), false, false);
-        let idx = rows.iter().position(|r| r.toggle.is_some()).expect("a collapsible header");
+        let rows = build(
+            &msgs,
+            80,
+            &crate::render::theme::Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        let idx = rows
+            .iter()
+            .position(|r| r.toggle.is_some())
+            .expect("a collapsible header");
         let key = rows[idx].toggle.unwrap();
         (rows, idx, key)
     }
@@ -1821,7 +2085,9 @@ mod tests {
     #[test]
     fn attach_missing_file_shows_error() {
         let mut app = test_app();
-        app.apply(Action::AttachFile(std::path::PathBuf::from("/must/not/exist/xyz")));
+        app.apply(Action::AttachFile(std::path::PathBuf::from(
+            "/must/not/exist/xyz",
+        )));
         assert!(app.attachment.is_none());
         assert!(app.status.as_deref().unwrap().contains("Not found"));
     }
@@ -1838,7 +2104,10 @@ mod tests {
 
     fn push_active_stream(app: &mut App) {
         let sid = app.sessions.active_id();
-        app.streams.push(crate::app::state::StreamHandle { session_id: sid, rx: tokio::sync::mpsc::channel(1).1 });
+        app.streams.push(crate::app::state::StreamHandle {
+            session_id: sid,
+            rx: tokio::sync::mpsc::channel(1).1,
+        });
     }
 
     #[test]
@@ -1848,7 +2117,10 @@ mod tests {
         let sid = app.sessions.active_id();
         let rev = app.content_rev;
         app.apply(Action::StreamToken(sid, "hello".into()));
-        assert_eq!(app.sessions.active().streaming_display().as_deref(), Some("hello"));
+        assert_eq!(
+            app.sessions.active().streaming_display().as_deref(),
+            Some("hello")
+        );
         assert_ne!(app.content_rev, rev);
     }
 
@@ -1864,14 +2136,22 @@ mod tests {
             "```tool\n{\"name\":\"list_dir\",\"args\":{\"path\":\".\"}}\n```".into(),
         ));
         // The stream was cut: flag set for the main loop, message finalized, handle gone.
-        assert_eq!(app.cut_stream, Some(sid), "a complete tool call must cut the stream");
+        assert_eq!(
+            app.cut_stream,
+            Some(sid),
+            "a complete tool call must cut the stream"
+        );
         assert!(!app.sessions.active().is_streaming());
         assert!(app.streams.is_empty());
         assert!(
-            app.sessions.active().messages.last().is_some_and(|m| matches!(
-                &m.content,
-                crate::api::models::MessageContent::Text(t) if t.contains("list_dir")
-            )),
+            app.sessions
+                .active()
+                .messages
+                .last()
+                .is_some_and(|m| matches!(
+                    &m.content,
+                    crate::api::models::MessageContent::Text(t) if t.contains("list_dir")
+                )),
             "the finalized turn keeps the tool call",
         );
     }
@@ -1886,7 +2166,10 @@ mod tests {
             sid,
             "```tool\n{\"name\":\"list_dir\",\"args\":{\"path\":\".\"}}\n```".into(),
         ));
-        assert_eq!(app.cut_stream, None, "non-agent mode must keep streaming normally");
+        assert_eq!(
+            app.cut_stream, None,
+            "non-agent mode must keep streaming normally"
+        );
         assert!(app.sessions.active().is_streaming());
     }
 
@@ -1913,12 +2196,19 @@ mod tests {
     #[test]
     fn fork_duplicates_active_session() {
         let mut app = test_app();
-        app.sessions.active_mut().push_message(crate::api::ChatMessage::user("hi"));
+        app.sessions
+            .active_mut()
+            .push_message(crate::api::ChatMessage::user("hi"));
         let before = app.sessions.all().len();
         app.apply(Action::ForkSession);
         assert_eq!(app.sessions.all().len(), before + 1);
         // The fork carries the original's messages and is now active.
-        assert!(app.sessions.active().messages.iter().any(|m| m.role == "user"));
+        assert!(app
+            .sessions
+            .active()
+            .messages
+            .iter()
+            .any(|m| m.role == "user"));
         assert!(app.sessions.active().name.contains("fork"));
     }
 
@@ -1933,7 +2223,14 @@ mod tests {
         let b = app.sessions.active_id();
         assert_ne!(a, b);
         app.apply(Action::StreamToken(a, "from-a".into()));
-        assert_eq!(app.sessions.by_id(a).unwrap().streaming_display().as_deref(), Some("from-a"));
+        assert_eq!(
+            app.sessions
+                .by_id(a)
+                .unwrap()
+                .streaming_display()
+                .as_deref(),
+            Some("from-a")
+        );
         assert!(app.sessions.by_id(b).unwrap().streaming_display().is_none());
     }
 
@@ -1943,7 +2240,10 @@ mod tests {
     fn set_system_prompt_updates_session() {
         let mut app = test_app();
         app.apply(Action::SetSystemPrompt(Some("Be concise".into())));
-        assert_eq!(app.sessions.active().system_prompt.as_deref(), Some("Be concise"));
+        assert_eq!(
+            app.sessions.active().system_prompt.as_deref(),
+            Some("Be concise")
+        );
     }
 
     #[test]
@@ -1953,5 +2253,4 @@ mod tests {
         app.apply(Action::SetSystemPrompt(None));
         assert!(app.sessions.active().system_prompt.is_none());
     }
-
 }
