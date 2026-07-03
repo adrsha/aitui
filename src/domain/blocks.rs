@@ -99,6 +99,15 @@ fn push_thinking(inner: &str, blocks: &mut Vec<Block>) {
     }
 }
 
+/// The body of the last fenced code block in `text`, if any — used by `:copy-code`
+/// to grab the most recent code snippet the assistant produced.
+pub fn last_code_block(text: &str) -> Option<String> {
+    parse_blocks(text).into_iter().rev().find_map(|b| match b {
+        Block::Code { code, .. } => Some(code),
+        _ => None,
+    })
+}
+
 #[derive(Debug, Clone)]
 enum Marker {
     /// Opening tag length + matching close tag.
@@ -237,16 +246,11 @@ fn find_closing_fence(body: &str, allow_midline: bool) -> Option<usize> {
 
 /// Parse the JSON inside a ```tool fence into a [`ToolCall`], accepting both
 /// `args` and `arguments` keys.
+/// Delegate to the one canonical tool-JSON parser so the block parser (which gates
+/// execution) accepts exactly what the stream-cut parser accepts — never stricter,
+/// or a cut fence would render as a dead code block instead of running.
 fn parse_tool_json(s: &str) -> Option<ToolCall> {
-    let v: serde_json::Value = serde_json::from_str(s.trim()).ok()?;
-    let name = v.get("name").and_then(|n| n.as_str())?.to_string();
-    let args = v
-        .get("args")
-        .or_else(|| v.get("arguments"))
-        .cloned()
-        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-    let id = v.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
-    Some(ToolCall { name, args, id })
+    crate::agent::parser::parse_tool_json(s)
 }
 
 /// Parse a stored tool-result message body of the form
@@ -270,7 +274,7 @@ pub fn parse_tool_result(text: &str) -> Block {
         .trim_end_matches("(error)")
         .trim()
         .to_string();
-    let output = text.splitn(2, '\n').nth(1).unwrap_or("").to_string();
+    let output = text.split_once('\n').map(|x| x.1).unwrap_or("").to_string();
     Block::ToolResult {
         ok,
         name,
@@ -293,6 +297,72 @@ mod tests {
     fn empty_or_whitespace_yields_no_blocks() {
         assert!(parse_blocks("").is_empty());
         assert!(parse_blocks("   \n  \n").is_empty());
+    }
+
+    /// Collect the tool calls `parse_blocks` (the execution gate) finds in `text`.
+    fn block_tool_calls(text: &str) -> Vec<crate::agent::tools::ToolCall> {
+        parse_blocks(text)
+            .into_iter()
+            .filter_map(|b| match b {
+                Block::ToolCall(c) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unclosed_tool_fence_is_still_a_runnable_toolcall() {
+        // Regression: the stream-cut parser recovers an unclosed fence, so the block
+        // parser (execution gate) must too — otherwise the cut fires but nothing runs
+        // and the fence renders as dead text.
+        let text = "sure:\n```tool\n{\"name\":\"list\",\"args\":{\"path\":\".\"}}";
+        let calls = block_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "list");
+    }
+
+    #[test]
+    fn tool_fence_with_trailing_prose_still_runs() {
+        let text = "```tool\n{\"name\":\"read\",\"args\":{\"path\":\"a.rs\"}}\nnow reading it";
+        let calls = block_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+    }
+
+    #[test]
+    fn leaked_think_then_tool_block_runs() {
+        // The exact failing shape: leaked <think> CoT followed by a tool fence whose
+        // JSON has fields in a non-standard order (name last).
+        let text = "<think>deciding</think>\n\n```tool\n{\"args\":{\"path\":\".\"},\"id\":\"c1\",\"name\":\"list\"}\n```";
+        let calls = block_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "list");
+        assert_eq!(calls[0].id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn block_parser_agrees_with_stream_cut_parser() {
+        // The two parsers must never disagree about whether a fence is runnable.
+        for text in [
+            "```tool\n{\"name\":\"list\",\"args\":{\"path\":\".\"}}\n```",
+            "```tool\n{\"name\":\"list\",\"args\":{\"path\":\".\"}}", // unclosed
+            "prose ```tool {\"name\":\"read\",\"args\":{\"path\":\"x\"}} ``` more",
+            "<think>x</think>\n```tool\n{\"name\":\"shell\",\"args\":{\"command\":\"ls\"}} trailing",
+        ] {
+            let via_blocks = block_tool_calls(text).len();
+            let via_stream = crate::agent::parser::extract_tool_calls(text).len();
+            assert_eq!(via_blocks, via_stream, "parsers disagree on: {text:?}");
+            assert_eq!(via_blocks, 1, "expected one call in: {text:?}");
+        }
+    }
+
+    #[test]
+    fn last_code_block_returns_final_snippet() {
+        let text = "intro\n```py\nprint(1)\n```\nmid\n```rust\nfn main() {}\n```\nend";
+        assert_eq!(last_code_block(text).as_deref(), Some("fn main() {}"));
+        // No fenced code → None.
+        assert_eq!(last_code_block("just prose, `inline` only"), None);
+        assert_eq!(last_code_block(""), None);
     }
 
     #[test]

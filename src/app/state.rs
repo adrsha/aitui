@@ -34,7 +34,8 @@ pub enum ModelLoad {
 }
 
 /// Progress state of one agent-declared task in the sticky todo panel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
     Pending,
     InProgress,
@@ -61,7 +62,7 @@ impl TodoStatus {
 }
 
 /// One item in the agent's task breakdown, shown in the sticky panel above input.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
     pub text: String,
     pub status: TodoStatus,
@@ -83,6 +84,10 @@ pub enum PendingExternal {
     EditorFiles(Vec<PathBuf>),
     /// Write text to a temp file and open it in `$EDITOR` (e.g. the conversation).
     EditorText(String),
+    /// Open an already-written temp file in `$EDITOR`, then read its edited
+    /// contents back (the file is written before this is set). Used to edit a
+    /// pending permission batch; the contents return via `AgentPermissionEdited`.
+    EditReadback(PathBuf),
     /// Drop into an interactive `$SHELL`.
     Shell,
 }
@@ -108,11 +113,6 @@ pub struct App {
     /// The in-progress text saved when history browsing begins, restored on exit.
     pub input_draft: String,
 
-    /// Agent-declared task breakdown, shown in the sticky panel above the input.
-    /// Rewritten wholesale each time the model calls the `todo` tool; empty hides
-    /// the panel.
-    pub todos: Vec<TodoItem>,
-
     pub overlay: Overlay,
     pub mention: Mention,
 
@@ -128,6 +128,9 @@ pub struct App {
 
     pub attachment: Option<PathBuf>,
     pub status: Option<String>,
+    /// Whether the terminal reports AiTUI as focused; desktop notifications are
+    /// suppressed while true so permission prompts do not double-notify onscreen.
+    pub focused: bool,
     pub show_help: bool,
     pub should_quit: bool,
     pub yank: Option<String>,
@@ -138,6 +141,9 @@ pub struct App {
     pub show_output: bool,
     /// Path to a recently generated image to display in-terminal via Kitty protocol.
     pub pending_image: Option<PathBuf>,
+    /// Text queued for the system clipboard, flushed once (via OSC 52) by the
+    /// renderer — mirrors `pending_image`, keeping raw stdout writes in the UI layer.
+    pub pending_clipboard: Option<String>,
     /// Files the agent has created/edited this session (relative paths, most
     /// recent first) — for quick "jump into the edited file" access.
     pub edited_files: Vec<String>,
@@ -263,7 +269,6 @@ impl App {
             input_history: Vec::new(),
             input_history_idx: None,
             input_draft: String::new(),
-            todos: Vec::new(),
             overlay: Overlay::None,
             mention: Mention::default(),
             pastes: Vec::new(),
@@ -276,12 +281,14 @@ impl App {
             } else {
                 "Loading models…".into()
             }),
+            focused: true,
             show_help: false,
             should_quit: false,
             yank: None,
             last_insert: None,
             show_output: false,
             pending_image: None,
+            pending_clipboard: None,
             edited_files: Vec::new(),
             pending_external: None,
             usage: None,
@@ -323,6 +330,14 @@ impl App {
         if resumable {
             let n = app.sessions.all().len();
             app.overlay = Overlay::Startup(crate::app::overlay::Startup::new(n));
+        } else {
+            // No launch screen: we drop straight into the active session, so it
+            // should operate where the binary was launched — not the stale folder
+            // a previous run saved. (Resuming via the launch screen `cd`s on
+            // purpose; that path is unaffected.)
+            if let Ok(cwd) = std::env::current_dir() {
+                app.sessions.active_mut().cwd = Some(cwd);
+            }
         }
         Ok(app)
     }
@@ -497,7 +512,7 @@ pub fn expand_mentions(text: &str) -> String {
                 j += 1;
             }
             let token: String = chars[i + 1..j].iter().collect();
-            let token = token.trim_end_matches(|c| matches!(c, '.' | ',' | ')' | ':' | ';'));
+            let token = token.trim_end_matches(['.', ',', ')', ':', ';']);
             if !token.is_empty() && !paths.iter().any(|p| p == token) {
                 paths.push(token.to_string());
             }

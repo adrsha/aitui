@@ -16,7 +16,15 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
+    /// Never written to config.toml — set via AITUI_ENDPOINT/BIG_THINKER_URL or
+    /// entered in the ApiSetup overlay for the current run only. `default` lets
+    /// old config files that still have this key keep loading.
+    #[serde(default, skip_serializing)]
     pub endpoint: String,
+    /// Never written to config.toml — set via AITUI_API_KEY/BIG_THINKER_API_KEY
+    /// or entered in the ApiSetup overlay for the current run only. `default`
+    /// lets old config files that still have this key keep loading.
+    #[serde(default, skip_serializing)]
     pub api_key: String,
     pub default_model: String,
     /// Offline test mode: interpret messages locally and drive the agent tools
@@ -70,6 +78,14 @@ pub struct UiConfig {
     /// to `~/.config/aitui/active_skills.json`). Toggle with `:sticky`.
     #[serde(default = "default_true")]
     pub sticky_skills: bool,
+    /// Assumed model context window (tokens), used to draw the context-budget gauge
+    /// next to the token counter. A round default that fits most modern models.
+    #[serde(default = "default_context_window")]
+    pub context_window: u32,
+}
+
+fn default_context_window() -> u32 {
+    128_000
 }
 
 fn default_search_provider() -> String {
@@ -314,6 +330,7 @@ impl Default for UiConfig {
             agent_default: true,
             auto_approve_reads: true,
             sticky_skills: true,
+            context_window: default_context_window(),
         }
     }
 }
@@ -356,8 +373,20 @@ impl Config {
         let raw = fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("Failed to read config at {}: {}", path.display(), e))?;
 
-        let mut cfg: Config = toml::from_str(&raw)
-            .map_err(|e| anyhow::anyhow!("Failed to parse config at {}: {}", path.display(), e))?;
+        // A malformed config must not brick launch: warn and fall back to defaults
+        // rather than exiting. Env overrides below still apply, so a usable endpoint
+        // can be supplied even with a broken file.
+        let mut cfg: Config = match toml::from_str(&raw) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!(
+                    "AiTUI: ignoring invalid config at {} ({}); using defaults",
+                    path.display(),
+                    e
+                );
+                Config::default()
+            }
+        };
 
         // Environment variables override the config file when present, so
         // secrets can stay out of disk entirely if the user prefers.
@@ -410,10 +439,39 @@ impl Config {
         let raw = toml::to_string_pretty(self)
             .map_err(|e| anyhow::anyhow!("Failed to serialize config: {}", e))?;
 
-        fs::write(&path, raw)
+        // Atomic write (temp + rename) so a crash mid-save can't truncate config.toml
+        // and brick the next launch — the old file survives until the new one lands.
+        atomic_write(&path, raw.as_bytes())
             .map_err(|e| anyhow::anyhow!("Failed to write config to {}: {}", path.display(), e))?;
 
         Ok(())
+    }
+}
+
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.tmp.{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("config"),
+        std::process::id()
+    ));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
     }
 }
 
@@ -425,4 +483,35 @@ fn config_path() -> PathBuf {
             PathBuf::from(home).join(".config")
         });
     base.join("aitui").join("config.toml")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_write_roundtrips_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("aitui_cfg_atomic_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        atomic_write(&path, b"a = 1").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a = 1");
+        atomic_write(&path, b"a = 2").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a = 2");
+        let temps = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(temps, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_config_falls_back_to_default() {
+        // Garbage TOML must parse-fail into defaults, never panic.
+        let bad = "this is not [valid toml";
+        let cfg: Config = toml::from_str(bad).unwrap_or_default();
+        assert_eq!(cfg.ui.input_height, Config::default().ui.input_height);
+    }
 }

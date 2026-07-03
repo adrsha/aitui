@@ -19,7 +19,14 @@ impl App {
 
     pub fn apply(&mut self, action: Action) -> Option<Action> {
         match action {
-            Action::Quit => self.should_quit = true,
+            Action::Quit => {
+                // Persist the live composer draft with the session before exiting.
+                self.stash_draft();
+                self.sessions.save();
+                self.should_quit = true;
+            }
+            Action::FocusGained => self.focused = true,
+            Action::FocusLost => self.focused = false,
             Action::Resize => {}
             Action::ToggleHelp => self.show_help = !self.show_help,
 
@@ -43,27 +50,21 @@ impl App {
             }
             Action::VisualYank => {
                 let sel = self.input.selection_text();
-                if !sel.is_empty() {
-                    self.yank = Some(sel);
-                }
+                self.set_yank(sel);
                 self.input.end_visual();
                 self.vim = VimMode::Normal;
                 self.input.clamp_normal();
             }
             Action::VisualDelete => {
                 let sel = self.input.delete_selection();
-                if !sel.is_empty() {
-                    self.yank = Some(sel);
-                }
+                self.set_yank(sel);
                 self.vim = VimMode::Normal;
                 self.input.clamp_normal();
                 self.update_mention();
             }
             Action::VisualChange => {
                 let sel = self.input.delete_selection();
-                if !sel.is_empty() {
-                    self.yank = Some(sel);
-                }
+                self.set_yank(sel);
                 self.vim = VimMode::Insert;
                 self.update_mention();
             }
@@ -101,7 +102,8 @@ impl App {
             Action::DeleteAt => self.input.delete_at(),
             Action::DeleteLine => self.input.delete_line(),
             Action::YankLine => {
-                self.yank = Some(self.input.yank_line());
+                let line = self.input.yank_line();
+                self.set_yank(line);
             }
             Action::Paste => {
                 if let Some(t) = self.yank.clone() {
@@ -127,6 +129,10 @@ impl App {
 
             // ── Submission / streaming ──────────────────────────────────────
             Action::Submit => return self.submit(),
+            Action::RetryLast => return self.retry_last(),
+            Action::EditLast => self.edit_last(),
+            Action::CopyLastReply => self.copy_last_reply(),
+            Action::CopyLastCode => self.copy_last_code(),
             Action::AttachStream(sid, rx) => {
                 self.streams.push(crate::app::state::StreamHandle {
                     session_id: sid,
@@ -166,6 +172,13 @@ impl App {
                     s.finalize_assistant_stream();
                 }
                 self.streams.retain(|h| h.session_id != sid);
+                // StreamToken may have already cut this same stream early (tool call
+                // detected) and queued a round via `cut_stream`. We're starting the
+                // round right here, so clear that flag or main.rs would start it a
+                // second time on the next pass, re-running every tool call.
+                if self.cut_stream == Some(sid) {
+                    self.cut_stream = None;
+                }
                 self.status = None;
                 self.sessions.save();
                 self.touch();
@@ -185,6 +198,25 @@ impl App {
                     let ep = self.config.api.endpoint.clone();
                     let key = self.config.api.api_key.clone();
                     self.overlay = Overlay::ApiSetup(crate::app::overlay::ApiSetup::new(ep, key));
+                } else if looks_like_context_overflow(&e) {
+                    // Safety net: the proactive window still overflowed the model's
+                    // real context. Drop the oldest turns and resend automatically.
+                    // compact_history shrinks each time and returns false once only
+                    // the current turn is left, so this can't loop forever.
+                    let compacted = self
+                        .sessions
+                        .by_id_mut(sid)
+                        .map(|s| s.compact_history())
+                        .unwrap_or(false);
+                    if compacted {
+                        self.set_status("Context full — summarized older messages and retrying…");
+                        self.sessions.save();
+                        self.touch();
+                        return self.begin_stream_for(sid);
+                    }
+                    self.set_status(
+                        "Context full and this turn alone is too large — shorten it or :clear.",
+                    );
                 } else {
                     self.set_status(format!("Stream error: {}", e));
                 }
@@ -265,7 +297,6 @@ impl App {
             }
             Action::OpenFilesInEditor(paths) => {
                 if !paths.is_empty() {
-                    let n = paths.len();
                     self.pending_external = Some(PendingExternal::EditorFiles(paths));
                 }
             }
@@ -331,12 +362,16 @@ impl App {
                 self.touch();
             }
             Action::NextSession => {
+                self.stash_draft();
                 self.sessions.select_next();
+                self.load_active_draft();
                 self.chat.stick_bottom = true;
                 self.touch();
             }
             Action::PrevSession => {
+                self.stash_draft();
                 self.sessions.select_prev();
+                self.load_active_draft();
                 self.chat.stick_bottom = true;
                 self.touch();
             }
@@ -351,7 +386,9 @@ impl App {
                 }
             }
             Action::SelectSession(i) => {
+                self.stash_draft();
                 self.sessions.select(i);
+                self.load_active_draft();
                 // Resume in the session's own folder so file tools / @-mentions
                 // resolve against the right project.
                 let cwd = self.sessions.active().cwd.clone();
@@ -599,6 +636,32 @@ impl App {
                 }
             }
             Action::AgentResolveDecision => return self.resolve_decision(),
+            Action::AgentPermScrollUp => {
+                if let Overlay::Permission(r) = &mut self.overlay {
+                    r.scroll_up();
+                    self.touch();
+                }
+            }
+            Action::AgentPermScrollDown => {
+                if let Overlay::Permission(r) = &mut self.overlay {
+                    r.scroll_down();
+                    self.touch();
+                }
+            }
+            Action::AgentPermissionEdit => {
+                if let Overlay::Permission(r) = &self.overlay {
+                    // Write the batch to a temp file and open $EDITOR; the edited
+                    // contents come back as AgentPermissionEdited on return.
+                    let path = std::env::temp_dir()
+                        .join(format!("aitui-commands-{}.txt", std::process::id()));
+                    if std::fs::write(&path, r.edit_buffer()).is_ok() {
+                        self.pending_external = Some(PendingExternal::EditReadback(path));
+                    } else {
+                        self.set_status("Couldn't open editor — temp file write failed");
+                    }
+                }
+            }
+            Action::AgentPermissionEdited(text) => return self.apply_permission_edits(&text),
             Action::AgentPlanEdit => {
                 if let Overlay::Plan(r) = &self.overlay {
                     self.pending_external =
@@ -732,24 +795,19 @@ impl App {
         }
     }
 
-    // ── Input history helpers (shell-style up/down) ───────────────────
-
     fn input_history_prev(&mut self) {
         if self.input_history.is_empty() {
             return;
         }
-        // First press: save the live draft and move to the newest entry.
-        if self.input_history_idx.is_none() {
-            self.input_draft = self.input.text();
-            self.input_history_idx = Some(self.input_history.len() - 1);
-        } else {
-            let i = self.input_history_idx.unwrap();
-            if i > 0 {
-                self.input_history_idx = Some(i - 1);
+        let idx = match self.input_history_idx {
+            None => {
+                self.input_draft = self.input.text();
+                self.input_history.len() - 1
             }
-        }
-        let text = self.input_history[self.input_history_idx.unwrap()].clone();
-        self.input.set_text(&text);
+            Some(i) => i.saturating_sub(1),
+        };
+        self.input_history_idx = Some(idx);
+        self.input.set_text(&self.input_history[idx]);
         self.mention.reset();
     }
 
@@ -932,6 +990,16 @@ impl App {
 
     // ── : commands ──────────────────────────────────────────────────────────
 
+    /// Set the internal yank register and mirror it to the system clipboard, so a
+    /// vim `y`/`d` copies out of the app too. No-op on empty text.
+    fn set_yank(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        self.pending_clipboard = Some(text.clone());
+        self.yank = Some(text);
+    }
+
     fn run_command(&mut self, cmd: &str) -> Option<Action> {
         let cmd = cmd.trim().to_string();
         self.vim = VimMode::Normal;
@@ -1021,6 +1089,10 @@ impl App {
                     self.reasoning_effort.as_deref().unwrap_or("off")
                 ));
             }
+            "retry" | "r" | "regen" | "regenerate" => return Some(Action::RetryLast),
+            "edit-last" | "el" | "redo" => return Some(Action::EditLast),
+            "copy" | "y" | "yank" => return Some(Action::CopyLastReply),
+            "copy-code" | "yc" | "code" => return Some(Action::CopyLastCode),
             "editor" | "history" => return Some(Action::OpenEditor),
             "edit" | "e" | "edited" => return Some(Action::OpenEditPicker),
             "shell" | "term" | "terminal" | "sh" => return Some(Action::OpenShell),
@@ -1030,7 +1102,7 @@ impl App {
                 return Some(Action::SelectModel(other[6..].trim().to_string()))
             }
             other if other.starts_with("edit ") || other.starts_with("e ") => {
-                let p = other.splitn(2, ' ').nth(1).unwrap_or("").trim();
+                let p = other.split_once(' ').map(|x| x.1).unwrap_or("").trim();
                 if !p.is_empty() {
                     return Some(Action::OpenFilesInEditor(vec![PathBuf::from(p)]));
                 }
@@ -1066,6 +1138,20 @@ fn looks_like_base_url_error(err: &str) -> bool {
         || e.contains("no api client")
 }
 
+/// Whether a stream error is the endpoint rejecting the request for exceeding the
+/// model's context window. Providers word this differently (OpenAI, Anthropic-
+/// compatible gateways, vLLM, …) so match the common phrasings.
+fn looks_like_context_overflow(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("context length")
+        || e.contains("context_length")
+        || e.contains("context window")
+        || e.contains("maximum context")
+        || e.contains("too many tokens")
+        || e.contains("reduce the length")
+        || e.contains("prompt is too long")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1097,7 +1183,6 @@ mod tests {
             input_history: Vec::new(),
             input_history_idx: None,
             input_draft: String::new(),
-            todos: Vec::new(),
             overlay: Overlay::None,
             mention: Mention::default(),
             pastes: Vec::new(),
@@ -1106,12 +1191,14 @@ mod tests {
             model_load: crate::app::state::ModelLoad::Loaded,
             attachment: None,
             status: None,
+            focused: true,
             show_help: false,
             should_quit: false,
             yank: None,
             last_insert: None,
             show_output: false,
             pending_image: None,
+            pending_clipboard: None,
             edited_files: Vec::new(),
             pending_external: None,
             usage: None,
@@ -1583,6 +1670,164 @@ mod tests {
             !matches!(app.overlay, Overlay::Notice { .. }),
             "idle send must not show the busy notice"
         );
+    }
+
+    #[test]
+    fn copy_last_reply_queues_clipboard() {
+        let mut app = test_app();
+        app.sessions
+            .active_mut()
+            .push_message(crate::api::ChatMessage::user("q"));
+        app.sessions
+            .active_mut()
+            .push_message(crate::api::ChatMessage::assistant("the answer"));
+        app.apply(Action::CopyLastReply);
+        assert_eq!(app.pending_clipboard.as_deref(), Some("the answer"));
+    }
+
+    #[test]
+    fn copy_last_code_extracts_fenced_block() {
+        let mut app = test_app();
+        app.sessions
+            .active_mut()
+            .push_message(crate::api::ChatMessage::assistant(
+                "here:\n```rust\nfn f() {}\n```\ndone",
+            ));
+        app.apply(Action::CopyLastCode);
+        assert_eq!(app.pending_clipboard.as_deref(), Some("fn f() {}"));
+    }
+
+    #[test]
+    fn retry_command_trims_reply_and_resends() {
+        let mut app = test_app();
+        app.sessions
+            .active_mut()
+            .push_message(crate::api::ChatMessage::user("hello"));
+        app.sessions
+            .active_mut()
+            .push_message(crate::api::ChatMessage::assistant("old reply"));
+        // `:retry` maps to a follow-up Action::RetryLast; the main loop re-applies
+        // returned actions, so chain it here too.
+        if let Some(follow) = app.apply(Action::RunCommand("retry".into())) {
+            let _ = app.apply(follow);
+        }
+        // The stale reply is gone and the user message remains for the resend.
+        // (A fresh turn may append a new assistant message in the API-less harness.)
+        assert!(app
+            .sessions
+            .active()
+            .messages
+            .iter()
+            .any(|m| m.role == "user"));
+        assert_ne!(
+            app.sessions.active().last_assistant_text().as_deref(),
+            Some("old reply")
+        );
+    }
+
+    #[test]
+    fn edit_last_pulls_message_into_composer() {
+        let mut app = test_app();
+        app.sessions
+            .active_mut()
+            .push_message(crate::api::ChatMessage::user("draft text"));
+        app.sessions
+            .active_mut()
+            .push_message(crate::api::ChatMessage::assistant("reply"));
+        app.apply(Action::EditLast);
+        assert_eq!(app.input.text(), "draft text");
+        assert_eq!(app.vim, VimMode::Insert);
+        assert!(app.sessions.active().messages.is_empty());
+    }
+
+    #[test]
+    fn vim_yank_mirrors_to_system_clipboard() {
+        let mut app = test_app();
+        app.input.set_text("copy this line");
+        app.apply(Action::YankLine);
+        assert_eq!(app.yank.as_deref(), Some("copy this line"));
+        assert_eq!(app.pending_clipboard.as_deref(), Some("copy this line"));
+    }
+
+    fn tool_msg_text(app: &App) -> String {
+        use crate::api::models::MessageContent;
+        match &app.sessions.active().messages.last().unwrap().content {
+            MessageContent::Text(t) => t.clone(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn ask_tool_opens_decision_and_records_choice() {
+        let mut app = test_app();
+        app.pending_tools.push_back(crate::agent::ToolCall {
+            name: "ask".into(),
+            args: serde_json::json!({"question": "Pick one", "options": ["A", "B", "C"]}),
+            id: None,
+        });
+        let _ = app.process_next_tool();
+        match &mut app.overlay {
+            Overlay::Decision(r) => r.selected = 2, // choose "C"
+            other => panic!("expected decision overlay, got {:?}", other),
+        }
+        let _ = app.resolve_decision();
+        assert!(matches!(app.overlay, Overlay::None));
+        let last = app.sessions.active().messages.last().unwrap();
+        assert_eq!(last.role, "tool");
+        assert!(tool_msg_text(&app).contains('C'));
+    }
+
+    #[test]
+    fn ask_tool_without_options_records_error() {
+        let mut app = test_app();
+        app.pending_tools.push_back(crate::agent::ToolCall {
+            name: "ask".into(),
+            args: serde_json::json!({"question": "Pick"}),
+            id: None,
+        });
+        let _ = app.process_next_tool();
+        // No overlay raised; an error result was recorded instead.
+        assert!(!matches!(app.overlay, Overlay::Decision(_)));
+        assert!(tool_msg_text(&app).contains("options"));
+    }
+
+    #[test]
+    fn plan_tool_writes_file_and_approval_feeds_body_back() {
+        let mut app = test_app();
+        let path = std::env::temp_dir().join("aitui_test_plan.md");
+        let _ = std::fs::remove_file(&path);
+        app.pending_tools.push_back(crate::agent::ToolCall {
+            name: "plan".into(),
+            args: serde_json::json!({
+                "path": path.to_string_lossy(),
+                "body": "step one\nstep two",
+            }),
+            id: None,
+        });
+        let _ = app.process_next_tool();
+        assert!(matches!(app.overlay, Overlay::Plan(_)));
+        assert!(path.exists(), "plan file should be written");
+        let _ = app.resolve_plan(true);
+        let out = tool_msg_text(&app);
+        assert!(out.contains("APPROVED"));
+        assert!(out.contains("step one"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn plan_denial_records_denied() {
+        let mut app = test_app();
+        let path = std::env::temp_dir().join("aitui_test_plan_deny.md");
+        let _ = std::fs::remove_file(&path);
+        app.pending_tools.push_back(crate::agent::ToolCall {
+            name: "plan".into(),
+            args: serde_json::json!({"path": path.to_string_lossy(), "body": "x"}),
+            id: None,
+        });
+        let _ = app.process_next_tool();
+        let _ = app.resolve_plan(false);
+        assert!(tool_msg_text(&app).contains("DENIED"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -21,6 +21,17 @@ fn spinner_frame() -> &'static str {
     SPINNER[((ms / 90) as usize) % SPINNER.len()]
 }
 
+/// Format the busy chip's text: spinner + elapsed time, plus time-to-first-result
+/// once known. Kept pure so the formatting is unit-testable.
+fn working_label(spinner: &str, elapsed_ms: Option<u64>, first_ms: Option<u64>) -> String {
+    let secs = |ms: u64| format!("{:.1}s", ms as f64 / 1000.0);
+    match (elapsed_ms, first_ms) {
+        (None, _) => format!("{} working", spinner),
+        (Some(e), None) => format!("{} working {}", spinner, secs(e)),
+        (Some(e), Some(f)) => format!("{} working {} ·first {}", spinner, secs(e), secs(f)),
+    }
+}
+
 /// A solid background "chip": ` text ` with a coloured background and a readable
 /// foreground, so each status reads as a distinct badge rather than dim text.
 fn chip(text: impl Into<String>, bg: Color) -> Span<'static> {
@@ -64,9 +75,15 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     left.push(chip(mode_label, mode_bg));
     left.push(Span::raw(" "));
 
-    // Busy indicator, as an animated spinner chip (no "generating" word).
+    // Busy indicator: animated spinner + a live elapsed timer, plus time-to-first-
+    // result once the first token lands. Timings come from the active session's
+    // in-flight stream (None when the busy session is a background one).
     if busy {
-        left.push(chip(format!("{} working", spinner_frame()), theme.accent));
+        let elapsed_ms = session
+            .pending_started_at
+            .map(|t| t.elapsed().as_millis() as u64);
+        let label = working_label(spinner_frame(), elapsed_ms, session.pending_first_ms());
+        left.push(chip(label, theme.accent));
         left.push(Span::raw(" "));
     }
 
@@ -136,4 +153,22 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     ));
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::working_label;
+
+    #[test]
+    fn working_label_shows_elapsed_then_first() {
+        // Before the stream starts (no elapsed): plain "working".
+        assert_eq!(working_label("⠋", None, None), "⠋ working");
+        // Streaming, no first token yet: spinner + elapsed.
+        assert_eq!(working_label("⠋", Some(2500), None), "⠋ working 2.5s");
+        // First token landed: elapsed + time-to-first-result.
+        assert_eq!(
+            working_label("⠋", Some(4200), Some(800)),
+            "⠋ working 4.2s ·first 0.8s"
+        );
+    }
 }

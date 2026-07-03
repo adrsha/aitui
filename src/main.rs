@@ -19,6 +19,10 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let _guard = rt.enter();
 
+    // Restore the terminal on panic *before* the default hook prints, so a crash
+    // anywhere in the loop can't leave the user's shell in raw mode.
+    tui::install_panic_hook();
+
     let config = config::Config::load()?;
     let mut app = app::App::new(config)?;
     let mut terminal = tui::init()?;
@@ -53,7 +57,10 @@ fn run(
 
         // ── 1b. Pending external program: suspend TUI, run it, restore ───
         if let Some(ext) = app.pending_external.take() {
-            run_external(terminal, ext)?;
+            let follow_up = run_external(terminal, ext)?;
+            if let Some(action) = follow_up {
+                dispatch(app, vec![action]);
+            }
             app.touch();
             dirty = true;
             continue;
@@ -170,7 +177,12 @@ fn dispatch(app: &mut app::App, actions: Vec<Action>) {
 
 /// Suspend the TUI, run an external program (editor or shell), then restore the
 /// terminal. The TUI is always re-entered afterwards, even if the program failed.
-fn run_external(terminal: &mut tui::Tui, ext: app::state::PendingExternal) -> anyhow::Result<()> {
+/// Returns an optional follow-up action to dispatch (e.g. the edited permission
+/// buffer read back from the temp file).
+fn run_external(
+    terminal: &mut tui::Tui,
+    ext: app::state::PendingExternal,
+) -> anyhow::Result<Option<Action>> {
     // Leave our alternate screen / raw mode so the child owns the terminal.
     tui::restore()?;
     let result = run_external_inner(ext);
@@ -180,7 +192,7 @@ fn run_external(terminal: &mut tui::Tui, ext: app::state::PendingExternal) -> an
     result
 }
 
-fn run_external_inner(ext: app::state::PendingExternal) -> anyhow::Result<()> {
+fn run_external_inner(ext: app::state::PendingExternal) -> anyhow::Result<Option<Action>> {
     use app::state::PendingExternal;
     use std::io::Write;
     use std::process::Command;
@@ -200,7 +212,7 @@ fn run_external_inner(ext: app::state::PendingExternal) -> anyhow::Result<()> {
     match ext {
         PendingExternal::EditorFiles(paths) => {
             if paths.is_empty() {
-                return Ok(());
+                return Ok(None);
             }
             let ed = editor();
             let mut cmd = Command::new(&ed);
@@ -224,6 +236,17 @@ fn run_external_inner(ext: app::state::PendingExternal) -> anyhow::Result<()> {
             let _ = std::fs::remove_file(&path);
             status.map_err(|e| anyhow::anyhow!("Failed to launch {ed}: {e}"))?;
         }
+        PendingExternal::EditReadback(path) => {
+            let ed = editor();
+            // No `+` jump — open at the top so the whole batch is in view.
+            Command::new(&ed)
+                .arg(&path)
+                .status()
+                .map_err(|e| anyhow::anyhow!("Failed to launch {ed}: {e}"))?;
+            let contents = std::fs::read_to_string(&path).unwrap_or_default();
+            let _ = std::fs::remove_file(&path);
+            return Ok(Some(Action::AgentPermissionEdited(contents)));
+        }
         PendingExternal::Shell => {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
             println!("\n[AiTUI] Shell — type 'exit' to return.\n");
@@ -232,5 +255,5 @@ fn run_external_inner(ext: app::state::PendingExternal) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("Failed to launch {shell}: {e}"))?;
         }
     }
-    Ok(())
+    Ok(None)
 }

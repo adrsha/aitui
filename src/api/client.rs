@@ -399,7 +399,15 @@ struct AccCall {
 
 /// Merge a batch of streamed `tool_calls` fragments into the by-index accumulator.
 fn accumulate_tool_calls(acc: &mut Vec<AccCall>, deltas: Vec<super::models::ToolCallDelta>) {
+    // A single turn never has anywhere near this many parallel tool calls. The
+    // index is server-controlled, so cap it: a bogus huge value would otherwise
+    // make `resize_with` attempt a multi-gigabyte allocation (OOM) — and `+1`
+    // could overflow `usize`.
+    const MAX_TOOL_CALLS: usize = 256;
     for d in deltas {
+        if d.index >= MAX_TOOL_CALLS {
+            continue;
+        }
         if d.index >= acc.len() {
             acc.resize_with(d.index + 1, AccCall::default);
         }
@@ -486,6 +494,35 @@ mod tests {
         assert_eq!(calls[0].name, "read_file");
         assert_eq!(calls[0].args.get("path").unwrap(), "a.rs");
         assert_eq!(calls[0].id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn accumulate_ignores_absurd_index_without_oom() {
+        // A server (or bug) sending a huge index must not trigger a giant
+        // allocation or an overflow panic — the delta is dropped.
+        let mut acc = Vec::new();
+        accumulate_tool_calls(
+            &mut acc,
+            vec![ToolCallDelta {
+                index: usize::MAX,
+                id: Some("x".into()),
+                function: Some(FnDelta {
+                    name: Some("read".into()),
+                    arguments: None,
+                }),
+            }],
+        );
+        assert!(acc.is_empty());
+        // A reasonable index right at the cap boundary is also rejected.
+        accumulate_tool_calls(
+            &mut acc,
+            vec![ToolCallDelta {
+                index: 10_000,
+                id: None,
+                function: None,
+            }],
+        );
+        assert!(acc.is_empty());
     }
 
     #[test]

@@ -358,14 +358,38 @@ fn render_settings(f: &mut Frame, app: &App, settings: &Settings, theme: &Theme)
 // ── Permission prompt ─────────────────────────────────────────────────────────
 
 fn render_permission(f: &mut Frame, req: &crate::app::overlay::PermissionRequest, theme: &Theme) {
-    let call_rows = req.calls.len().min(5) as u16;
-    let area = centered_fixed(78, 17 + call_rows.saturating_sub(1), f.area());
+    // A tall, wide modal so a whole batch of commands is visible (scroll for more).
+    let area = centered_fixed(100, f.area().height.saturating_sub(2), f.area());
     let inner = panel(f, area, " Access Request ", theme);
+    let cwd = std::env::current_dir().unwrap_or_default();
 
-    let title = if req.calls.len() == 1 {
-        "The assistant wants access:".to_string()
+    // ── Layout: title (1) · blank · command list (flex) · blank · options (8) · legend (1)
+    const OPTIONS: u16 = 8;
+    let list_h = inner.height.saturating_sub(2 + OPTIONS + 2).max(3);
+
+    // ── Command list (scrollable, syntax-highlighted, all fields) ───────────────
+    let all_lines = command_lines(&req.calls, theme, &cwd, inner.width as usize);
+    let total = all_lines.len();
+    let max_start = total.saturating_sub(list_h as usize);
+    let start = req.scroll.min(max_start);
+    let end = (start + list_h as usize).min(total);
+
+    let count = req.calls.len();
+    let title = if total > list_h as usize {
+        format!(
+            "Assistant wants to run {} call{} — lines {}–{} of {}",
+            count,
+            if count == 1 { "" } else { "s" },
+            start + 1,
+            end,
+            total
+        )
     } else {
-        format!("The assistant wants access for {} calls:", req.calls.len())
+        format!(
+            "Assistant wants to run {} call{}:",
+            count,
+            if count == 1 { "" } else { "s" }
+        )
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -374,65 +398,28 @@ fn render_permission(f: &mut Frame, req: &crate::app::overlay::PermissionRequest
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
         ))),
-        Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: 1,
-        },
+        Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
     );
 
-    let cwd = std::env::current_dir().unwrap_or_default();
-    for (i, call) in req.calls.iter().take(5).enumerate() {
-        let kind = call.kind();
-        let icon = kind.map(|k| k.icon()).unwrap_or("⚙");
-        let risk = kind.map(|k| k.risk().label()).unwrap_or("UNKNOWN");
-        let target = call
-            .args
-            .get("command")
-            .or_else(|| call.args.get("path"))
-            .or_else(|| call.args.get("from"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("—");
-        let scope = call
-            .permission_directory(&cwd)
-            .map(|d| d.display().to_string())
-            .unwrap_or_else(|| "network / external".to_string());
-        let y = inner.y + 2 + i as u16;
+    f.render_widget(
+        Paragraph::new(all_lines[start..end].to_vec()),
+        Rect { x: inner.x, y: inner.y + 2, width: inner.width, height: list_h },
+    );
+    // Scroll affordances at the list's edges.
+    if start > 0 {
         f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!(" {} {}", icon, call.summary()),
-                    Style::default().fg(theme.text),
-                ),
-                Span::styled(
-                    format!(" · target: {} · risk: {} · scope: {}", target, risk, scope),
-                    Style::default().fg(theme.faint),
-                ),
-            ])),
-            Rect {
-                x: inner.x,
-                y,
-                width: inner.width,
-                height: 1,
-            },
+            Paragraph::new(Line::from(Span::styled("▲ more (PgUp)", Style::default().fg(theme.faint)))),
+            Rect { x: inner.x + inner.width.saturating_sub(14), y: inner.y + 2, width: 14, height: 1 },
         );
     }
-    if req.calls.len() > 5 {
+    if end < total {
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!("  …and {} more", req.calls.len() - 5),
-                Style::default().fg(theme.faint),
-            ))),
-            Rect {
-                x: inner.x,
-                y: inner.y + 7,
-                width: inner.width,
-                height: 1,
-            },
+            Paragraph::new(Line::from(Span::styled("▼ more (PgDn)", Style::default().fg(theme.faint)))),
+            Rect { x: inner.x + inner.width.saturating_sub(14), y: inner.y + 1 + list_h, width: 14, height: 1 },
         );
     }
 
+    // ── Allow/deny options ──────────────────────────────────────────────────────
     let first = req.calls.first();
     let kind_name = first
         .and_then(|c| c.kind())
@@ -456,7 +443,7 @@ fn render_permission(f: &mut Frame, req: &crate::app::overlay::PermissionRequest
         format!("    Deny all in  {}/  (this session)", dir),
         "    Deny everything (this session)".to_string(),
     ];
-    let start_y = inner.y + 4 + call_rows;
+    let start_y = inner.y + 3 + list_h;
     for (i, opt) in options.iter().enumerate() {
         let y = start_y + i as u16;
         if y >= inner.y + inner.height {
@@ -469,13 +456,132 @@ fn render_permission(f: &mut Frame, req: &crate::app::overlay::PermissionRequest
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(format!("  {}", opt), style))),
-            Rect {
-                x: inner.x,
-                y,
-                width: inner.width,
-                height: 1,
-            },
+            Rect { x: inner.x, y, width: inner.width, height: 1 },
         );
+    }
+
+    // ── Shortcut legend (always visible) ────────────────────────────────────────
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "↑↓ option · PgUp/PgDn scroll · a allow · d deny · e edit in $EDITOR · ⏎ run · Esc cancel",
+            Style::default().fg(theme.accent),
+        ))),
+        Rect {
+            x: inner.x,
+            y: inner.y + inner.height.saturating_sub(1),
+            width: inner.width,
+            height: 1,
+        },
+    );
+}
+
+/// Build the flat, styled, scrollable line list for a permission batch: a bold
+/// header per call plus every editable field, with shell commands / file content
+/// syntax-highlighted so the user can read exactly what will run.
+fn command_lines(
+    calls: &[crate::agent::ToolCall],
+    theme: &Theme,
+    cwd: &std::path::Path,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for (i, call) in calls.iter().enumerate() {
+        let kind = call.kind();
+        let icon = kind.map(|k| k.icon()).unwrap_or("⚙");
+        let risk = kind.map(|k| k.risk().label()).unwrap_or("UNKNOWN");
+        let name = kind.map(|k| k.name()).unwrap_or(call.name.as_str()).to_string();
+        let scope = call
+            .permission_directory(cwd)
+            .map(|d| d.display().to_string())
+            .unwrap_or_else(|| "network / external".to_string());
+        out.push(Line::from(vec![
+            Span::styled(
+                format!("▸ {} {}. {}", icon, i + 1, name),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("   risk: {} · {}", risk, scope),
+                Style::default().fg(theme.faint),
+            ),
+        ]));
+        for key in call.editable_arg_keys() {
+            let Some(val) = call.get_arg(key) else { continue };
+            out.push(Line::from(Span::styled(
+                format!("    {}:", key),
+                Style::default().fg(theme.faint),
+            )));
+            let lang = value_lang(call, key);
+            out.extend(value_lines(&lang, val, 6, width, theme));
+        }
+        out.push(Line::from(String::new()));
+    }
+    out
+}
+
+/// The highlight language for an editable field: shell commands as bash, an
+/// edit/write's body by the target file's extension, everything else plain.
+fn value_lang(call: &crate::agent::ToolCall, key: &str) -> String {
+    match key {
+        "command" => "bash".to_string(),
+        "content" | "old" | "new" => call
+            .get_arg("path")
+            .and_then(|p| p.rsplit('.').next())
+            .map(|e| e.to_string())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Render a field value (possibly multi-line) as indented, width-clipped, syntax-
+/// highlighted lines. Falls back to a plain accent colour when `lang` has no
+/// grammar. Each source line becomes one row (horizontal overflow is clipped —
+/// `e` opens the full text in `$EDITOR`).
+fn value_lines(
+    lang: &str,
+    value: &str,
+    indent: usize,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let pad = " ".repeat(indent);
+    let avail = width.saturating_sub(indent).max(4);
+    let hl = if lang.is_empty() {
+        None
+    } else {
+        crate::render::highlight::highlight(value, lang, theme)
+    };
+    match hl {
+        Some(hl_lines) => hl_lines
+            .into_iter()
+            .map(|segs| {
+                let mut spans = vec![Span::raw(pad.clone())];
+                let mut used = 0usize;
+                for (text, style) in segs {
+                    if used >= avail {
+                        break;
+                    }
+                    let take = avail - used;
+                    let clipped: String = text.chars().take(take).collect();
+                    used += clipped.chars().count();
+                    spans.push(Span::styled(clipped, style));
+                }
+                Line::from(spans)
+            })
+            .collect(),
+        None => value
+            .split('\n')
+            .map(|src| {
+                let clipped: String = if src.chars().count() > avail {
+                    src.chars().take(avail.saturating_sub(1)).collect::<String>() + "…"
+                } else {
+                    src.to_string()
+                };
+                Line::from(vec![
+                    Span::raw(pad.clone()),
+                    Span::styled(clipped, Style::default().fg(theme.accent)),
+                ])
+            })
+            .collect(),
     }
 }
 

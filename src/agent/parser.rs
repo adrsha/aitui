@@ -101,22 +101,73 @@ fn safe_flush_point(buf: &str) -> usize {
     buf.len()
 }
 
-fn parse_tool_json(s: &str) -> Option<ToolCall> {
-    // Try strict parse first
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-        let name = v
-            .get("name")
-            .and_then(|n| n.as_str())
-            .map(|s| s.to_string())?;
-        let args = v
-            .get("args")
-            .or_else(|| v.get("arguments"))
-            .cloned()
-            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-        let id = v.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
-        return Some(ToolCall { name, args, id });
+/// Parse a `name`/`args` tool-call object out of `s`, tolerating trailing prose or
+/// a missing closing fence by falling back to the first balanced `{...}` object.
+///
+/// This is the single canonical tool-JSON parser: the stream-cut decision
+/// (`extract_tool_calls`) and the execution decision (`domain::blocks`) both go
+/// through it, so they can never disagree about whether a fence is a runnable call.
+pub fn parse_tool_json(s: &str) -> Option<ToolCall> {
+    // Try strict parse of the whole string first.
+    if let Some(call) = parse_tool_value(s) {
+        return Some(call);
     }
-    // Try to extract just the name for partial JSON
+    // The string may carry trailing prose (an unclosed block that the stream ran
+    // past, or a model that kept talking after the JSON). Fall back to the first
+    // balanced `{...}` object and parse that.
+    let obj = extract_json_object(s)?;
+    parse_tool_value(obj)
+}
+
+fn parse_tool_value(s: &str) -> Option<ToolCall> {
+    let v = serde_json::from_str::<serde_json::Value>(s.trim()).ok()?;
+    let name = v
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_string())?;
+    let args = v
+        .get("args")
+        .or_else(|| v.get("arguments"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    let id = v.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
+    Some(ToolCall { name, args, id })
+}
+
+/// Return the first balanced top-level `{...}` substring of `s`, tracking string
+/// literals and escapes so a brace inside a JSON string doesn't fool the counter.
+/// Used to recover a tool call from text that has an unclosed fence or trailing
+/// prose after the object.
+fn extract_json_object(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let start = s.find('{')?;
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for i in start..bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
     None
 }
 
@@ -137,6 +188,11 @@ pub fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
             }
             remaining = &content[end + 3..];
         } else {
+            // Unclosed block — the stream was cut mid-fence. Recover the call from
+            // whatever trailing content we have rather than dropping it silently.
+            if let Some(call) = parse_tool_json(content) {
+                calls.push(call);
+            }
             break;
         }
     }
@@ -231,6 +287,56 @@ Second call:
         let calls = extract_tool_calls(text);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].args["path"], "b.txt");
+    }
+
+    #[test]
+    fn extract_recovers_unclosed_final_block() {
+        // Stream cut mid-fence: no closing ```. The call must still be recovered.
+        let text = "sure, listing:\n```tool\n{\"name\":\"list\",\"args\":{\"path\":\".\",\"depth\":2}}";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "list");
+        assert_eq!(calls[0].args["depth"], 2);
+    }
+
+    #[test]
+    fn extract_recovers_unclosed_block_with_trailing_prose() {
+        // Model kept talking after the JSON without ever closing the fence.
+        let text = "```tool\n{\"name\":\"read\",\"args\":{\"path\":\"a.rs\"}}\nnow I will read it";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].args["path"], "a.rs");
+    }
+
+    #[test]
+    fn closed_calls_before_an_unclosed_one_all_parse() {
+        let text = "```tool\n{\"name\":\"read\",\"args\":{\"path\":\"a\"}}\n```\n```tool\n{\"name\":\"list\",\"args\":{\"path\":\".\"}}";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[1].name, "list");
+    }
+
+    #[test]
+    fn brace_in_json_string_does_not_fool_extractor() {
+        // A `}` inside a string literal must not close the object early.
+        let text = "```tool\n{\"name\":\"write\",\"args\":{\"content\":\"fn main() {}\"}}";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].args["content"], "fn main() {}");
+    }
+
+    #[test]
+    fn extract_json_object_finds_balanced_span() {
+        assert_eq!(extract_json_object("x {\"a\":1} y"), Some("{\"a\":1}"));
+        assert_eq!(
+            extract_json_object("{\"a\":{\"b\":2}} tail"),
+            Some("{\"a\":{\"b\":2}}")
+        );
+        assert_eq!(extract_json_object("no object"), None);
+        // Unbalanced (missing close) yields None rather than panicking.
+        assert_eq!(extract_json_object("{\"a\":1"), None);
     }
 
     #[test]

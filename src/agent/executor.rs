@@ -53,7 +53,7 @@ pub fn execute(call: ToolCall, cwd: &PathBuf) -> ToolResult {
     }
 }
 
-fn resolve_path(raw: &str, cwd: &PathBuf) -> PathBuf {
+fn resolve_path(raw: &str, cwd: &Path) -> PathBuf {
     let p = PathBuf::from(raw);
     if p.is_absolute() {
         p
@@ -196,12 +196,7 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
                 .get("command")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'command' argument")?;
-            let output = Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .current_dir(cwd)
-                .output()
-                .map_err(|e| format!("Cannot run command: {}", e))?;
+            let output = run_shell_command(cmd, cwd)?;
 
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -1244,6 +1239,77 @@ fn fmt_size(bytes: u64) -> String {
     }
 }
 
+/// Hard ceiling on how long a single `shell` call may run before it is killed,
+/// so a hang (a command waiting on stdin, a dev server, an infinite loop) can't
+/// wedge the agent loop forever. Generous enough for real builds/tests.
+const SHELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Run a shell command with stdin closed and a wall-clock timeout. On timeout the
+/// process (and its group, best-effort) is killed and an error is returned instead
+/// of blocking indefinitely.
+fn run_shell_command(cmd: &str, cwd: &Path) -> Result<std::process::Output, String> {
+    run_shell_with_timeout(cmd, cwd, SHELL_TIMEOUT)
+}
+
+fn run_shell_with_timeout(
+    cmd: &str,
+    cwd: &Path,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    // `Stdio::null()` on stdin turns a blocking read (e.g. bare `cat`, a REPL)
+    // into an immediate EOF rather than an infinite wait. `process_group(0)` puts
+    // the shell in its own group so the timeout path can kill the whole tree
+    // (`kill -9 -<pid>`), not just the shell.
+    #[allow(unused_mut)]
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command
+        .spawn()
+        .map_err(|e| format!("Cannot run command: {}", e))?;
+
+    // Capture the pid before moving the child into the waiter thread, so the
+    // watchdog can still kill it on timeout.
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result.map_err(|e| format!("Command failed: {}", e)),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Kill the whole process group first (covers children the shell spawned),
+            // then the shell itself; ignore failures (it may have just exited).
+            let _ = Command::new("kill")
+                .arg("-9")
+                .arg(format!("-{}", pid))
+                .output();
+            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+            Err(format!(
+                "Command timed out after {}s and was killed",
+                timeout.as_secs()
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("Command runner thread died".to_string())
+        }
+    }
+}
+
 fn truncate(s: String, max: usize) -> String {
     if s.len() <= max {
         s
@@ -1713,6 +1779,34 @@ mod tests {
         let result = execute(call, &dir);
         assert!(result.is_ok());
         assert!(result.text().contains("hello_from_shell"));
+    }
+
+    #[test]
+    fn shell_stdin_is_closed_so_stdin_readers_dont_hang() {
+        // `cat` with no args reads stdin; with stdin redirected to /dev/null it must
+        // hit EOF immediately and exit rather than blocking the test forever.
+        let dir = tmp_dir();
+        let out = run_shell_command("cat", &dir).expect("cat should finish on EOF");
+        assert!(out.status.success());
+    }
+
+    #[test]
+    fn shell_captures_stdout_and_exit() {
+        let dir = tmp_dir();
+        let out = run_shell_command("printf done; exit 3", &dir).unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "done");
+    }
+
+    #[test]
+    fn shell_kills_command_that_exceeds_timeout() {
+        let dir = tmp_dir();
+        let start = std::time::Instant::now();
+        let err = run_shell_with_timeout("sleep 30", &dir, std::time::Duration::from_millis(300))
+            .unwrap_err();
+        // Must return promptly (well under the 30s sleep) with a timeout message.
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert!(err.contains("timed out"), "got: {err}");
     }
 
     #[test]

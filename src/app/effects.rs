@@ -12,8 +12,10 @@ use crate::agent::{
 use crate::api::models::MessageContent;
 use crate::api::{ChatMessage, ChatRequest};
 use crate::app::action::Action;
-use crate::app::overlay::{DecisionRequest, Overlay, PermissionRequest, PlanRequest};
-use crate::app::state::{expand_mentions, App, TodoItem, TodoStatus, MAX_AGENT_ITERATIONS};
+use crate::app::overlay::{
+    DecisionRequest, Overlay, PermissionRequest, PlanRequest, PERMISSION_OPTIONS,
+};
+use crate::app::state::{expand_mentions, App, MAX_AGENT_ITERATIONS};
 use crate::domain::blocks::{parse_blocks, parse_tool_result};
 use crate::render::document::{build, build_message, DocMessage, LoadingKind, RenderedLine};
 use crate::render::theme::Theme;
@@ -290,6 +292,9 @@ impl App {
         }
         self.input_history_idx = None;
         self.input_draft.clear();
+        // The composed text is now a real message; clear the session's stashed
+        // draft so a stale copy isn't persisted or restored later.
+        self.sessions.active_mut().draft.clear();
 
         let mention_ctx = expand_mentions(&text);
         let text = if mention_ctx.is_empty() {
@@ -307,6 +312,74 @@ impl App {
         self.begin_stream_for(sid)
     }
 
+    /// Regenerate the last assistant turn: drop everything after the last user
+    /// message and resend. Blocked while a stream is in flight.
+    pub fn retry_last(&mut self) -> Option<Action> {
+        if self.is_busy() {
+            self.set_status("Can't retry — assistant is working (Ctrl-C to cancel)");
+            return None;
+        }
+        let sid = self.sessions.active_id();
+        if !self.sessions.active_mut().trim_after_last_user() {
+            self.set_status("Nothing to retry — no previous message");
+            return None;
+        }
+        self.agent_iterations = 0;
+        self.mention.reset();
+        self.chat.stick_bottom = true;
+        self.touch();
+        self.begin_stream_for(sid)
+    }
+
+    /// Pull the last user message back into the composer (removing that turn and
+    /// its reply) so it can be tweaked and resent. Blocked while streaming.
+    pub fn edit_last(&mut self) {
+        if self.is_busy() {
+            self.set_status("Can't edit — assistant is working (Ctrl-C to cancel)");
+            return;
+        }
+        match self.sessions.active_mut().take_last_user_turn() {
+            Some(text) => {
+                self.input.set_text(&text);
+                self.vim = crate::input::vim::VimMode::Insert;
+                self.mention.reset();
+                self.chat.stick_bottom = true;
+                self.touch();
+                self.set_status("Editing last message — Enter to resend");
+            }
+            None => self.set_status("Nothing to edit — no previous message"),
+        }
+    }
+
+    /// Queue the last assistant reply for the system clipboard (OSC 52).
+    pub fn copy_last_reply(&mut self) {
+        match self.sessions.active().last_assistant_text() {
+            Some(t) if !t.trim().is_empty() => {
+                let n = t.chars().count();
+                self.pending_clipboard = Some(t);
+                self.set_status(format!("Copied reply to clipboard ({} chars)", n));
+            }
+            _ => self.set_status("No assistant reply to copy"),
+        }
+    }
+
+    /// Queue the last fenced code block from the last reply for the clipboard.
+    pub fn copy_last_code(&mut self) {
+        let code = self
+            .sessions
+            .active()
+            .last_assistant_text()
+            .and_then(|t| crate::domain::blocks::last_code_block(&t));
+        match code {
+            Some(c) => {
+                let lines = c.lines().count().max(1);
+                self.pending_clipboard = Some(c);
+                self.set_status(format!("Copied code block to clipboard ({} lines)", lines));
+            }
+            None => self.set_status("No code block in the last reply to copy"),
+        }
+    }
+
     fn auto_name_session(&mut self) {
         let is_default = {
             let s = self.sessions.active();
@@ -321,16 +394,30 @@ impl App {
         }
     }
 
-    fn begin_stream_for(&mut self, sid: usize) -> Option<Action> {
+    /// Stash the live composer text into the active session so it persists and is
+    /// restored on return. Call before switching away or saving on quit.
+    pub fn stash_draft(&mut self) {
+        let text = self.input.text();
+        self.sessions.active_mut().draft = text;
+    }
+
+    /// Load the (now-)active session's stashed draft into the composer. Call right
+    /// after switching sessions.
+    pub fn load_active_draft(&mut self) {
+        let draft = self.sessions.active().draft.clone();
+        self.input.set_text(&draft);
+        self.input_history_idx = None;
+        self.input_draft.clear();
+    }
+
+    pub fn begin_stream_for(&mut self, sid: usize) -> Option<Action> {
         // Fresh turn: bump the epoch (so any speculative result still in flight from
         // the previous turn is dropped, not served stale) and drop its state.
         self.spec_epoch = self.spec_epoch.wrapping_add(1);
         self.spec_dispatched.clear();
         self.spec_results.clear();
         let is_mock = self.is_mock();
-        let Some(session) = self.sessions.by_id_mut(sid) else {
-            return None;
-        };
+        let session = self.sessions.by_id_mut(sid)?;
         session.begin_assistant_stream();
         session.pending_mock = is_mock;
         // The animated status-bar spinner ("working") is the generating indicator
@@ -381,10 +468,14 @@ impl App {
         }
 
         // Prepend active skills as system messages (personas / house styles).
+        // Proactive sliding window: keep the sent history to ~75% of the model's
+        // context (≈4 chars/token) so there's headroom for the reply plus the
+        // system/skill prompts prepended below. Oldest turns fall off silently.
+        let char_budget = (self.config.ui.context_window as usize).saturating_mul(3);
         let mut messages = self
             .sessions
             .by_id(sid)
-            .map(|s| s.api_messages(true))
+            .map(|s| s.api_messages_windowed(true, Some(char_budget)))
             .unwrap_or_default();
         for skill in self.skills.iter().rev().filter(|s| s.active) {
             messages.insert(0, ChatMessage::system(skill.body.clone()));
@@ -511,8 +602,7 @@ impl App {
             self.agent_session = None;
             return self.start_next_queued_round();
         }
-        self.agent_iterations += 1;
-        if self.agent_iterations > MAX_AGENT_ITERATIONS {
+        if agent_loop_guard_reached(self.agent_iterations) {
             self.agent_iterations = 0;
             self.agent_session = None;
             self.set_status(format!(
@@ -521,6 +611,7 @@ impl App {
             ));
             return self.start_next_queued_round();
         }
+        self.agent_iterations += 1;
         self.agent_session = Some(sid);
         self.pending_tools = calls.into();
         self.process_next_tool()
@@ -611,7 +702,7 @@ impl App {
                         }
                         calls.push(self.pending_tools.pop_front().unwrap());
                     }
-                    crate::app::notify::desktop(
+                    self.notify_desktop(
                         "AiTUI — access needed",
                         format!(
                             "Allow {} pending tool call{}?",
@@ -619,9 +710,9 @@ impl App {
                             if calls.len() == 1 { "" } else { "s" }
                         ),
                     );
-                    self.overlay = Overlay::Permission(PermissionRequest { calls, selected: 0 });
+                    self.overlay = Overlay::Permission(PermissionRequest::new(calls));
                     self.set_status(
-                        "Access — ↑↓ choose · ⏎ confirm · a allow all · d deny all · Esc cancel",
+                        "Access — ↑↓ option · PgUp/PgDn scroll · a allow · d deny · e edit · ⏎ run · Esc cancel",
                     );
                     return None;
                 }
@@ -695,6 +786,46 @@ impl App {
         }
     }
 
+    /// Apply the buffer edited in `$EDITOR` back onto the pending permission batch.
+    /// Fields are updated in place; any call whose block the user deleted is denied
+    /// (a skipped result is recorded so the model still gets an answer for it). If
+    /// every call was deleted the round continues as if all were denied.
+    pub fn apply_permission_edits(&mut self, text: &str) -> Option<Action> {
+        let dropped = match &mut self.overlay {
+            Overlay::Permission(req) => req.apply_edits(text),
+            _ => return None,
+        };
+        if dropped.is_empty() {
+            self.set_status("Commands updated — a allow · d deny · e edit again · ⏎ run");
+            self.touch();
+            return None;
+        }
+        // Pull the dropped calls out of the batch (highest index first so the
+        // remaining indices stay valid) and record a skip result for each.
+        let mut denied = Vec::new();
+        if let Overlay::Permission(req) = &mut self.overlay {
+            for &idx in dropped.iter().rev() {
+                if idx < req.calls.len() {
+                    denied.push(req.calls.remove(idx));
+                }
+            }
+            req.selected = req.selected.min(PERMISSION_OPTIONS - 1);
+            req.scroll = 0;
+        }
+        for call in denied {
+            let res = ToolResult::failure(call, "Skipped by user (removed in editor)".into(), 0);
+            self.record_tool_result(res);
+        }
+        let empty = matches!(&self.overlay, Overlay::Permission(r) if r.calls.is_empty());
+        if empty {
+            self.overlay = Overlay::None;
+            return self.process_next_tool();
+        }
+        self.set_status("Commands updated — a allow · d deny · e edit again · ⏎ run");
+        self.touch();
+        None
+    }
+
     fn open_decision(&mut self, call: ToolCall) -> Option<Action> {
         let question = call
             .args
@@ -729,7 +860,7 @@ impl App {
         if multi {
             chosen.insert(0);
         }
-        crate::app::notify::desktop("AiTUI — decision needed", question.clone());
+        self.notify_desktop("AiTUI — decision needed", question.clone());
         self.overlay = Overlay::Decision(DecisionRequest {
             call,
             question,
@@ -792,7 +923,7 @@ impl App {
             ));
             return self.process_next_tool();
         }
-        crate::app::notify::desktop("AiTUI — plan approval needed", path.display().to_string());
+        self.notify_desktop("AiTUI — plan approval needed", path.display().to_string());
         self.overlay = Overlay::Plan(PlanRequest {
             call,
             path: path.clone(),
@@ -838,6 +969,12 @@ impl App {
             .and_then(|s| s.cwd.clone())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    fn notify_desktop(&self, title: impl Into<String>, body: impl Into<String>) {
+        if !self.focused {
+            crate::app::notify::desktop(title, body);
+        }
     }
 
     /// While an agent reply is streaming, pre-run any *complete*, side-effect-free
@@ -943,7 +1080,7 @@ impl App {
         let Some(arr) = call.args.get("items").and_then(|v| v.as_array()) else {
             return ToolResult::failure(call.clone(), "todo: missing 'items' array".into(), 0);
         };
-        self.todos = arr
+        let todos: Vec<crate::app::state::TodoItem> = arr
             .iter()
             .filter_map(|it| {
                 let text = it
@@ -961,13 +1098,18 @@ impl App {
                 let status = it
                     .get("status")
                     .and_then(|v| v.as_str())
-                    .map(TodoStatus::parse)
-                    .unwrap_or(TodoStatus::Pending);
-                Some(TodoItem { text, status })
+                    .map(crate::app::state::TodoStatus::parse)
+                    .unwrap_or(crate::app::state::TodoStatus::Pending);
+                Some(crate::app::state::TodoItem { text, status })
             })
             .collect();
+        let n = todos.len();
+        let sid = self.agent_sid();
+        if let Some(s) = self.sessions.by_id_mut(sid) {
+            s.todos = todos;
+        }
+        self.sessions.save();
         self.touch();
-        let n = self.todos.len();
         ToolResult::success(
             call.clone(),
             format!(
@@ -1116,6 +1258,10 @@ fn write_paste_file(text: &str) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+fn agent_loop_guard_reached(iterations: usize) -> bool {
+    iterations == MAX_AGENT_ITERATIONS
+}
+
 /// Whether a tool call is safe to pre-run speculatively: local, read-only, no
 /// side effects. Deliberately excludes network reads (web fetch/search) and
 /// anything that mutates state or runs commands.
@@ -1191,4 +1337,16 @@ fn welcome_doc(theme: &Theme) -> Vec<RenderedLine> {
         rows.remove(0);
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loop_guard_trips_at_max_before_incrementing() {
+        assert!(!agent_loop_guard_reached(0));
+        assert!(!agent_loop_guard_reached(MAX_AGENT_ITERATIONS - 1));
+        assert!(agent_loop_guard_reached(MAX_AGENT_ITERATIONS));
+    }
 }

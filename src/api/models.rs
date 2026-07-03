@@ -150,6 +150,11 @@ pub struct ChatRequest {
     pub tools: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
+    /// Let the model emit several independent tool calls in ONE turn so the app
+    /// runs them as a batch (one round-trip instead of one per call). Omitted for
+    /// non-agent turns / endpoints that don't support it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -170,6 +175,7 @@ impl ChatRequest {
             reasoning_effort: None,
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
         }
     }
 
@@ -182,7 +188,8 @@ impl ChatRequest {
     /// Attach native function-calling tool schemas with `tool_choice:"required"`.
     pub fn with_tools(mut self, schemas: serde_json::Value) -> Self {
         self.tools = Some(schemas);
-        self.tool_choice = Some(serde_json::Value::String("required".to_string()));
+        self.tool_choice = Some(serde_json::Value::String("auto".to_string()));
+        self.parallel_tool_calls = Some(true);
         self
     }
 }

@@ -833,7 +833,8 @@ fn render_write_preview(
     paint_bg(&mut out[start..], width, CODE_BG);
 }
 
-/// Render a context diff with line numbers and red/green backgrounds.
+/// Render a context diff with line numbers, soft add/remove markers, and syntax
+/// highlighting for changed code when the edited path has a known language.
 fn render_diff(
     old: &str,
     new: &str,

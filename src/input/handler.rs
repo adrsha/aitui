@@ -12,10 +12,12 @@ pub fn handle_event(app: &App, event: Event) -> Vec<Action> {
         // With keyboard enhancement on, terminals also report key releases —
         // act on presses (and auto-repeats) only, so keys don't fire twice.
         Event::Key(k) if k.kind != KeyEventKind::Release => handle_key(app, k),
-        Event::Mouse(m) => handle_mouse(m),
+        Event::Mouse(m) => handle_mouse(app, m),
         Event::Resize(_, _) => vec![Action::Resize],
         // A bracketed paste arrives as one blob — smart-paste decides file vs chip.
         Event::Paste(s) => vec![Action::PasteText(s)],
+        Event::FocusGained => vec![Action::FocusGained],
+        Event::FocusLost => vec![Action::FocusLost],
         _ => vec![],
     }
 }
@@ -96,6 +98,20 @@ fn handle_key(app: &App, key: KeyEvent) -> Vec<Action> {
         // A notice is a plain "OK" dialog: any key dismisses it.
         Overlay::Notice { .. } => return vec![Action::DismissNotice],
         Overlay::None => {}
+    }
+
+    // ── Tab / Shift-Tab cycle sessions ──────────────────────────────────
+    // No overlay is open here (the match above returns for all of them). Skip
+    // while the @mention popup is up, where Tab accepts the highlighted match.
+    if !(app.mention.active && !app.mention.matches.is_empty()) {
+        if key.code == KeyCode::BackTab
+            || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+        {
+            return vec![Action::PrevSession];
+        }
+        if key.code == KeyCode::Tab {
+            return vec![Action::NextSession];
+        }
     }
 
     // ── Transcript scrolling (works in any input mode) ──────────────────
@@ -238,14 +254,18 @@ fn handle_api_setup(key: &KeyEvent) -> Vec<Action> {
 fn handle_permission(key: &KeyEvent) -> Vec<Action> {
     match key.code {
         KeyCode::Esc => vec![Action::AgentCancel],
+        // PageUp/PageDown scroll the (possibly long) command list.
+        KeyCode::PageUp => vec![Action::AgentPermScrollUp],
+        KeyCode::PageDown => vec![Action::AgentPermScrollDown],
         KeyCode::Up | KeyCode::Char('k') if !ctrl_pressed(key) => vec![Action::PickerUp],
         KeyCode::Down | KeyCode::Char('j') if !ctrl_pressed(key) => vec![Action::PickerDown],
         // Enter applies whichever menu option is highlighted.
         KeyCode::Enter => vec![Action::AgentResolvePermission],
         // Quick shortcuts for the common once-off cases, so you don't have to
-        // arrow to them: 'a' allow this call, 'd' deny this call.
+        // arrow to them: 'a' allow this call, 'd' deny this call, 'e' edit in $EDITOR.
         KeyCode::Char('a') if !ctrl_pressed(key) => vec![Action::AgentQuickAllow],
         KeyCode::Char('d') if !ctrl_pressed(key) => vec![Action::AgentQuickDeny],
+        KeyCode::Char('e') if !ctrl_pressed(key) => vec![Action::AgentPermissionEdit],
         _ => vec![],
     }
 }
@@ -404,6 +424,10 @@ fn handle_insert(app: &App, key: &KeyEvent) -> Vec<Action> {
     match key.code {
         KeyCode::Backspace => vec![Action::Backspace],
         KeyCode::Delete => vec![Action::DeleteAt],
+        // Single-line composer: Up/Down recall sent-message history (shell style).
+        // Multi-line: they move the cursor between lines.
+        KeyCode::Up if app.input.lines.len() <= 1 => vec![Action::InputHistoryPrev],
+        KeyCode::Down if app.input.lines.len() <= 1 => vec![Action::InputHistoryNext],
         KeyCode::Up => vec![Action::Move(Dir::Up)],
         KeyCode::Down => vec![Action::Move(Dir::Down)],
         KeyCode::Left => vec![Action::Move(Dir::Left)],
@@ -455,7 +479,7 @@ fn chord_escapes(chord: Option<(char, char)>, last_insert: Option<char>, key: Ke
     match (chord, key) {
         (Some((c1, c2)), KeyCode::Char(c)) => {
             c.eq_ignore_ascii_case(&c2)
-                && last_insert.map_or(false, |p| p.eq_ignore_ascii_case(&c1))
+                && last_insert.is_some_and(|p| p.eq_ignore_ascii_case(&c1))
         }
         _ => false,
     }
@@ -463,8 +487,12 @@ fn chord_escapes(chord: Option<(char, char)>, last_insert: Option<char>, key: Ke
 
 // ── Mouse handler ─────────────────────────────────────────────────────────────
 
-fn handle_mouse(mouse: MouseEvent) -> Vec<Action> {
+fn handle_mouse(app: &App, mouse: MouseEvent) -> Vec<Action> {
+    // While the permission prompt is open the wheel scrolls its command list.
+    let perm_open = matches!(app.overlay, Overlay::Permission(_));
     match mouse.kind {
+        MouseEventKind::ScrollUp if perm_open => vec![Action::AgentPermScrollUp],
+        MouseEventKind::ScrollDown if perm_open => vec![Action::AgentPermScrollDown],
         MouseEventKind::ScrollUp => vec![Action::ChatScroll(3)],
         MouseEventKind::ScrollDown => vec![Action::ChatScroll(-3)],
         MouseEventKind::Down(MouseButton::Left) => {

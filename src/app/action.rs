@@ -60,6 +60,15 @@ pub enum Action {
 
     // Submission / streaming
     Submit,
+    /// Regenerate the last assistant reply: drop it and resend the last user turn.
+    RetryLast,
+    /// Pull the last user message back into the composer for editing (removing that
+    /// turn and its reply).
+    EditLast,
+    /// Copy the last assistant reply to the system clipboard.
+    CopyLastReply,
+    /// Copy the last fenced code block from the last assistant reply to the clipboard.
+    CopyLastCode,
     /// Cancel the active session's in-flight stream.
     CancelStream,
     /// Attach a new stream for the given session id.
@@ -174,6 +183,14 @@ pub enum Action {
     /// Quick keys: allow / deny this one call without opening the full menu.
     AgentQuickAllow,
     AgentQuickDeny,
+    /// Scroll the command list in the permission prompt (independent of the
+    /// allow/deny option selection).
+    AgentPermScrollUp,
+    AgentPermScrollDown,
+    /// Open the pending permission batch in `$EDITOR` to edit the commands.
+    AgentPermissionEdit,
+    /// The edited permission buffer came back from `$EDITOR`; apply it.
+    AgentPermissionEdited(String),
     AgentDecisionToggle,
     AgentResolveDecision,
     AgentPlanEdit,
@@ -190,6 +207,8 @@ pub enum Action {
     SetSystemPrompt(Option<String>),
 
     // UI / misc
+    FocusGained,
+    FocusLost,
     ToggleHelp,
     Resize,
     Quit,

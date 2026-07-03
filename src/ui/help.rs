@@ -162,6 +162,28 @@ pub fn render(f: &mut Frame, app: &App, theme: &Theme) {
             val("Select file(s) · open all selected"),
         ]),
         Line::from(vec![]),
+        head("Message actions (commands)"),
+        Line::from(vec![
+            lit(":retry :r"),
+            val("Regenerate the last reply"),
+        ]),
+        Line::from(vec![
+            lit(":edit-last :el"),
+            val("Edit your last message and resend"),
+        ]),
+        Line::from(vec![
+            lit(":copy :y"),
+            val("Copy the last reply to the clipboard"),
+        ]),
+        Line::from(vec![
+            lit(":copy-code :yc"),
+            val("Copy the last code block to the clipboard"),
+        ]),
+        Line::from(vec![
+            lit("yy · visual y"),
+            val("Yank — also copies to the system clipboard (OSC 52)"),
+        ]),
+        Line::from(vec![]),
         Line::from(vec![lit("@file"), val("Mention a file into the message")]),
         Line::from(vec![
             lit(":skills"),

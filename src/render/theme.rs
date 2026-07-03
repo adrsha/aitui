@@ -25,7 +25,6 @@ pub struct Theme {
     pub gutter_tool: Color,
     pub gutter_system: Color,
     // Roles / inline
-    pub tool: Color,
     pub thinking: Color,
     pub link: Color,
     // Syntax highlighting (tree-sitter code previews)
@@ -57,7 +56,6 @@ impl Default for Theme {
             gutter_assistant: Color::Red,
             gutter_tool: Color::Green,
             gutter_system: Color::Yellow,
-            tool: Color::DarkGray,
             thinking: Color::Green,
             link: Color::Reset,
             // Code syntax — ANSI hues so it still follows the terminal palette.

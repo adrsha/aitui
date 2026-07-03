@@ -21,6 +21,11 @@ fn msg_text(m: &ChatMessage) -> String {
     }
 }
 
+/// Upper bound on a single streamed message (content or reasoning), in bytes.
+/// Guards against a runaway endpoint that never terminates the stream. Far larger
+/// than any legitimate response.
+const MAX_STREAM_BYTES: usize = 20 * 1024 * 1024;
+
 /// A single named conversation session.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -40,11 +45,17 @@ pub struct Session {
     pub pending_first_at: Option<std::time::Instant>,
     /// Whether the current streamed assistant response comes from the mock backend.
     pub pending_mock: bool,
+    /// Agent-declared task breakdown for this session, shown in the sticky panel
+    /// above the input while the session is active.
+    pub todos: Vec<crate::app::state::TodoItem>,
     /// Agent mode: when true the session uses tool-calling prompts.
     pub agent_mode: bool,
     /// The working directory this session belongs to. Resuming a session `cd`s
     /// back here so file tools and `@`-mentions resolve against the same project.
     pub cwd: Option<PathBuf>,
+    /// Unsent composer text, stashed when leaving the session and restored on
+    /// return. Persisted to disk so a draft survives a restart.
+    pub draft: String,
 }
 
 impl Session {
@@ -59,8 +70,10 @@ impl Session {
             pending_started_at: None,
             pending_first_at: None,
             pending_mock: false,
+            todos: Vec::new(),
             agent_mode: false,
             cwd: std::env::current_dir().ok(),
+            draft: String::new(),
         }
     }
 
@@ -77,7 +90,11 @@ impl Session {
         if let Some(text) = self.pending_assistant_text.as_mut() {
             self.pending_first_at
                 .get_or_insert_with(std::time::Instant::now);
-            text.push_str(token);
+            // Cap accumulation so a broken/malicious endpoint that streams forever
+            // (never sending [DONE]) can't grow this unbounded and exhaust memory.
+            if text.len() < MAX_STREAM_BYTES {
+                text.push_str(token);
+            }
         }
     }
 
@@ -86,9 +103,10 @@ impl Session {
         if self.pending_assistant_text.is_some() {
             self.pending_first_at
                 .get_or_insert_with(std::time::Instant::now);
-            self.pending_reasoning
-                .get_or_insert_with(String::new)
-                .push_str(token);
+            let buf = self.pending_reasoning.get_or_insert_with(String::new);
+            if buf.len() < MAX_STREAM_BYTES {
+                buf.push_str(token);
+            }
         }
     }
 
@@ -146,6 +164,42 @@ impl Session {
         self.messages.push(msg);
     }
 
+    /// Index of the most recent `user` message, if any.
+    fn last_user_index(&self) -> Option<usize> {
+        self.messages.iter().rposition(|m| m.role == "user")
+    }
+
+    /// Plain text of the most recent `assistant` message.
+    pub fn last_assistant_text(&self) -> Option<String> {
+        self.messages
+            .iter()
+            .rposition(|m| m.role == "assistant")
+            .map(|i| msg_text(&self.messages[i]))
+    }
+
+    /// Drop everything the assistant produced after the last user turn (the
+    /// assistant reply plus any tool messages), keeping the user message itself.
+    /// Returns false when there's no user message to retry. Used by `:retry`.
+    pub fn trim_after_last_user(&mut self) -> bool {
+        match self.last_user_index() {
+            Some(i) => {
+                self.messages.truncate(i + 1);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove the last user turn entirely (the user message and everything after
+    /// it) and return that user message's text, so it can be re-edited in the
+    /// composer. Used by `:edit-last`.
+    pub fn take_last_user_turn(&mut self) -> Option<String> {
+        let i = self.last_user_index()?;
+        let text = msg_text(&self.messages[i]);
+        self.messages.truncate(i);
+        Some(text)
+    }
+
     /// All messages suitable for sending to the API.
     ///
     /// - In agent mode the tool-calling system prompt is prepended so the model
@@ -156,7 +210,19 @@ impl Session {
     ///   become native `role:"tool"` messages with matching `tool_call_id`.
     /// - Otherwise (fenced fallback) "tool" messages are re-mapped to "user" so
     ///   plain OpenAI-compatible endpoints accept them as context.
+    #[cfg(test)]
     pub fn api_messages(&self, native: bool) -> Vec<ChatMessage> {
+        self.api_messages_windowed(native, None)
+    }
+
+    /// Like [`api_messages`], but drops the oldest turns so the tail fits within
+    /// `char_budget` characters (a proactive sliding window that keeps the request
+    /// under the model's context limit). `None` sends the whole history.
+    pub fn api_messages_windowed(
+        &self,
+        native: bool,
+        char_budget: Option<usize>,
+    ) -> Vec<ChatMessage> {
         let mut out = Vec::with_capacity(self.messages.len() + 2);
         if self.agent_mode {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -167,7 +233,7 @@ impl Session {
         }
 
         let msgs = &self.messages;
-        let mut i = 0;
+        let mut i = char_budget.map(|b| self.window_start(b)).unwrap_or(0);
         while i < msgs.len() {
             let m = &msgs[i];
             // Mock assistant turns are only for the visible offline transcript; never
@@ -253,6 +319,59 @@ impl Session {
         out
     }
 
+    /// Earliest index into `self.messages` whose tail fits within `char_budget`
+    /// characters, snapped forward to a `user`-message boundary so a kept window
+    /// never begins on an orphaned tool result or a mid-turn assistant reply.
+    /// Always keeps at least the final user turn (even if that lone turn is over
+    /// budget — the reactive `compact_history` path handles a turn too big to
+    /// ever fit).
+    fn window_start(&self, char_budget: usize) -> usize {
+        let msgs = &self.messages;
+        if msgs.is_empty() {
+            return 0;
+        }
+        // Walk backwards summing char cost; stop before the message that would
+        // push the tail over budget. The first (newest) message is always kept.
+        let mut total = 0usize;
+        let mut start = msgs.len();
+        for i in (0..msgs.len()).rev() {
+            let cost = msg_text(&msgs[i]).len();
+            if start != msgs.len() && total + cost > char_budget {
+                break;
+            }
+            total += cost;
+            start = i;
+        }
+        // Snap forward to the first user message at/after `start` so tool groups
+        // and assistant turns aren't left dangling without their user prompt.
+        match msgs[start..].iter().position(|m| m.role == "user") {
+            Some(off) => start + off,
+            None => self.last_user_index().unwrap_or(start),
+        }
+    }
+
+    /// Safety-net compaction when the endpoint reports the context is full even
+    /// after the proactive window: permanently drop the oldest ~half of the
+    /// conversation (whole turns, cutting on a user-message boundary, never the
+    /// final user turn). Returns false when only the current turn remains — a
+    /// single turn too large to ever fit, which the caller must surface as a hard
+    /// error rather than retry forever.
+    pub fn compact_history(&mut self) -> bool {
+        let users: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == "user")
+            .map(|(i, _)| i)
+            .collect();
+        if users.len() < 2 {
+            return false;
+        }
+        let cut = users[users.len() / 2];
+        self.messages.drain(..cut);
+        true
+    }
+
     pub fn is_streaming(&self) -> bool {
         self.pending_assistant_text.is_some()
     }
@@ -266,7 +385,7 @@ impl Session {
             };
             // Strip leading ``` blocks (file attachments), trim whitespace
             let cleaned = if text.starts_with("```\n") {
-                text.lines().skip(1).next().unwrap_or(text)
+                text.lines().nth(1).unwrap_or(text)
             } else {
                 text.lines().next().unwrap_or(text)
             };
@@ -289,7 +408,11 @@ struct SavedSession {
     messages: Vec<ChatMessage>,
     system_prompt: Option<String>,
     #[serde(default)]
+    todos: Vec<crate::app::state::TodoItem>,
+    #[serde(default)]
     cwd: Option<PathBuf>,
+    #[serde(default)]
+    draft: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -306,7 +429,9 @@ impl From<&Session> for SavedSession {
             name: s.name.clone(),
             messages: s.messages.clone(),
             system_prompt: s.system_prompt.clone(),
+            todos: s.todos.clone(),
             cwd: s.cwd.clone(),
+            draft: s.draft.clone(),
         }
     }
 }
@@ -323,8 +448,10 @@ impl From<SavedSession> for Session {
             pending_started_at: None,
             pending_first_at: None,
             pending_mock: false,
+            todos: s.todos,
             agent_mode: false,
             cwd: s.cwd,
+            draft: s.draft,
         }
     }
 }
@@ -357,7 +484,12 @@ impl SessionManager {
         };
         let saved: SavedState = match serde_json::from_str(&raw) {
             Ok(s) => s,
-            Err(_) => return Self::new(),
+            Err(_) => {
+                // Don't silently discard a corrupt save: preserve it as `.bak` so the
+                // user (or a future recovery) can inspect it, then start fresh.
+                let _ = fs::rename(&path, path.with_extension("json.bak"));
+                return Self::new();
+            }
         };
         if saved.sessions.is_empty() {
             return Self::new();
@@ -390,7 +522,7 @@ impl SessionManager {
         };
         let write = move || {
             if let Ok(json) = serde_json::to_string_pretty(&state) {
-                let _ = fs::write(&path, json);
+                let _ = atomic_write(&path, json.as_bytes());
             }
         };
         match tokio::runtime::Handle::try_current() {
@@ -521,6 +653,39 @@ fn sessions_path() -> PathBuf {
     base.join("aitui").join("sessions.json")
 }
 
+/// Write `bytes` to `path` atomically: write to a temp file in the same directory,
+/// then rename over the target. Rename is atomic on a POSIX filesystem, so a reader
+/// (or a crash) never sees a half-written file — the old contents survive intact
+/// until the new file is fully in place. Prevents session loss on a kill mid-save.
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Per-call counter so two overlapping saves (session writes run on background
+    // blocking tasks) never pick the same temp path and clobber each other.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.tmp.{}.{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("sessions"),
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?; // flush to disk before the rename so the data is durable
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp); // don't leave temp litter on failure
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,11 +693,105 @@ mod tests {
     // ── Session ────────────────────────────────────────────────────────────────
 
     #[test]
+    fn atomic_write_creates_and_overwrites_without_leaving_temp() {
+        let dir = std::env::temp_dir().join(format!("aitui_atomic_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("data.json");
+        atomic_write(&path, b"first").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
+        // Overwriting replaces the contents wholesale.
+        atomic_write(&path, b"second-longer").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second-longer");
+        // No leftover temp files in the directory.
+        let temps = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(temps, 0, "atomic_write left a temp file behind");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn new_session_has_default_name() {
         let s = Session::new(1);
         assert_eq!(s.name, "Session 1");
         assert!(!s.agent_mode);
         assert!(s.messages.is_empty());
+    }
+
+    #[test]
+    fn window_drops_oldest_turns_over_budget() {
+        let mut s = Session::new(1);
+        // Three user/assistant turns, ~20 chars of text each.
+        for n in 0..3 {
+            s.push_message(ChatMessage::user(format!("question number {}", n)));
+            s.push_message(ChatMessage::assistant(format!("answer number  {}", n)));
+        }
+        // Budget large enough for only the last turn's ~34 chars.
+        let msgs = s.api_messages_windowed(false, Some(40));
+        // Only the final turn survives, and the window starts on a user message.
+        assert_eq!(msgs.first().map(|m| m.role.as_str()), Some("user"));
+        assert!(msgs.len() < 6, "expected oldest turns dropped, got {:?}", msgs.len());
+        assert_eq!(msg_text(msgs.last().unwrap()), "answer number  2");
+    }
+
+    #[test]
+    fn window_keeps_last_user_turn_even_when_over_budget() {
+        let mut s = Session::new(1);
+        s.push_message(ChatMessage::user("a very long final question that exceeds the budget"));
+        // Budget smaller than the single turn — must still be sent, not dropped.
+        let msgs = s.api_messages_windowed(false, Some(1));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+    }
+
+    #[test]
+    fn compact_drops_oldest_half_but_keeps_current_turn() {
+        let mut s = Session::new(1);
+        for n in 0..4 {
+            s.push_message(ChatMessage::user(format!("q{}", n)));
+            s.push_message(ChatMessage::assistant(format!("a{}", n)));
+        }
+        let before = s.messages.len();
+        assert!(s.compact_history());
+        assert!(s.messages.len() < before);
+        // First surviving message is a user turn (clean boundary), last is intact.
+        assert_eq!(s.messages.first().unwrap().role, "user");
+        assert_eq!(msg_text(s.messages.last().unwrap()), "a3");
+    }
+
+    #[test]
+    fn compact_refuses_when_only_one_turn_left() {
+        let mut s = Session::new(1);
+        s.push_message(ChatMessage::user("only turn"));
+        // Nothing older to drop → false, so the caller surfaces a hard error.
+        assert!(!s.compact_history());
+        assert_eq!(s.messages.len(), 1);
+    }
+
+    #[test]
+    fn retry_and_edit_helpers_manipulate_the_last_turn() {
+        let mut s = Session::new(1);
+        s.push_message(ChatMessage::user("hello"));
+        s.push_message(ChatMessage::assistant("hi there"));
+        s.push_message(ChatMessage::tool("[tool-result:read] read(x) (ok)"));
+
+        assert_eq!(s.last_assistant_text().as_deref(), Some("hi there"));
+
+        // `:retry` keeps the user message but drops the reply + tool result.
+        assert!(s.trim_after_last_user());
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.messages[0].role, "user");
+
+        // `:edit-last` removes the user turn entirely and hands back its text.
+        assert_eq!(s.take_last_user_turn().as_deref(), Some("hello"));
+        assert!(s.messages.is_empty());
+
+        // Nothing left → both report "nothing to do".
+        assert!(!s.trim_after_last_user());
+        assert!(s.take_last_user_turn().is_none());
+        assert!(s.last_assistant_text().is_none());
     }
 
     #[test]

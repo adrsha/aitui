@@ -14,7 +14,8 @@ use crate::render::theme::Theme;
 const MAX_VISIBLE: usize = 8;
 
 /// Total panel height (rows + border) for the current todo list, or 0 when there
-/// are none — the layout uses this to size (or hide) the panel.
+/// are none — the layout uses this to size (or hide) the panel. When the list
+/// overflows, one extra row is reserved for the `↑/↓ N more` scroll indicator.
 pub fn height(todo_count: usize) -> u16 {
     if todo_count == 0 {
         return 0;
@@ -23,17 +24,44 @@ pub fn height(todo_count: usize) -> u16 {
     rows as u16 + 2 // top + bottom border
 }
 
+/// Choose which slice of a `count`-long todo list to show in a `max`-row window so
+/// that `focus` (the active task) stays visible, scrolling as the list progresses.
+/// Returns the inclusive-exclusive `[start, end)` range of task indices.
+///
+/// Kept pure (no `App`) so the scroll math is unit-testable and can't panic.
+fn visible_window(count: usize, focus: usize, max: usize) -> (usize, usize) {
+    if max == 0 {
+        return (0, 0);
+    }
+    if count <= max {
+        return (0, count);
+    }
+    // Center the focus in the window, then clamp to the list bounds.
+    let half = max / 2;
+    let start = focus.saturating_sub(half).min(count - max);
+    (start, start + max)
+}
+
+/// Index of the task the window should keep in view: the first in-progress task,
+/// else the last done task (progress frontier), else the top.
+fn focus_index(todos: &[crate::app::state::TodoItem]) -> usize {
+    if let Some(i) = todos.iter().position(|t| t.status == TodoStatus::InProgress) {
+        return i;
+    }
+    todos
+        .iter()
+        .rposition(|t| t.status == TodoStatus::Done)
+        .unwrap_or(0)
+}
+
 pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
-    if app.todos.is_empty() || area.height < 3 {
+    let todos = &app.sessions.active().todos;
+    if todos.is_empty() || area.height < 3 {
         return;
     }
 
-    let done = app
-        .todos
-        .iter()
-        .filter(|t| t.status == TodoStatus::Done)
-        .count();
-    let title = format!(" Tasks {}/{} ", done, app.todos.len());
+    let done = todos.iter().filter(|t| t.status == TodoStatus::Done).count();
+    let title = format!(" Tasks {}/{} ", done, todos.len());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -48,8 +76,21 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     f.render_widget(block, area);
 
     let width = inner.width as usize;
+    let count = todos.len();
+    let budget = inner.height as usize;
+    let overflow = count > budget;
+    // Reserve one row for the scroll indicator when the list overflows.
+    let task_rows = if overflow {
+        budget.saturating_sub(1).max(1)
+    } else {
+        budget
+    };
+    let (start, end) = visible_window(count, focus_index(todos), task_rows);
+    let hidden_above = start;
+    let hidden_below = count - end;
+
     let mut lines: Vec<Line> = Vec::new();
-    for todo in app.todos.iter().take(MAX_VISIBLE) {
+    for todo in &todos[start..end] {
         let (glyph_style, text_style) = match todo.status {
             TodoStatus::Done => (
                 Style::default().fg(theme.success),
@@ -78,9 +119,16 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             Span::styled(text, text_style),
         ]));
     }
-    if app.todos.len() > MAX_VISIBLE {
+    if overflow {
+        let mut parts: Vec<String> = Vec::new();
+        if hidden_above > 0 {
+            parts.push(format!("↑ {}", hidden_above));
+        }
+        if hidden_below > 0 {
+            parts.push(format!("↓ {}", hidden_below));
+        }
         lines.push(Line::from(Span::styled(
-            format!("  … {} more", app.todos.len() - MAX_VISIBLE),
+            format!("  {} more", parts.join("  ")),
             Style::default().fg(theme.faint),
         )));
     }
@@ -121,5 +169,48 @@ mod tests {
         assert_eq!(truncate_cols("hello", 10), "hello");
         assert_eq!(truncate_cols("hello", 3), "he…");
         assert_eq!(truncate_cols("hello", 0), "");
+    }
+
+    #[test]
+    fn window_shows_all_when_it_fits() {
+        assert_eq!(visible_window(3, 0, 5), (0, 3));
+        assert_eq!(visible_window(5, 2, 5), (0, 5));
+    }
+
+    #[test]
+    fn window_follows_focus_and_clamps() {
+        // 20 items, 6-row window. Focus near the top pins to the start.
+        assert_eq!(visible_window(20, 1, 6), (0, 6));
+        // Focus in the middle centers the window.
+        assert_eq!(visible_window(20, 10, 6), (7, 13));
+        // Focus near the end clamps so the window stays full and in-bounds.
+        assert_eq!(visible_window(20, 19, 6), (14, 20));
+    }
+
+    #[test]
+    fn window_degenerate_inputs_dont_panic() {
+        assert_eq!(visible_window(0, 0, 5), (0, 0));
+        assert_eq!(visible_window(10, 3, 0), (0, 0));
+        assert_eq!(visible_window(10, 99, 4), (6, 10)); // focus past end still clamps
+    }
+
+    #[test]
+    fn focus_prefers_in_progress_then_last_done() {
+        use crate::app::state::{TodoItem, TodoStatus};
+        let mk = |s: TodoStatus| TodoItem {
+            text: "t".into(),
+            status: s,
+        };
+        let list = vec![
+            mk(TodoStatus::Done),
+            mk(TodoStatus::Done),
+            mk(TodoStatus::InProgress),
+            mk(TodoStatus::Pending),
+        ];
+        assert_eq!(focus_index(&list), 2); // the in-progress task
+        let done_only = vec![mk(TodoStatus::Done), mk(TodoStatus::Done)];
+        assert_eq!(focus_index(&done_only), 1); // last done = progress frontier
+        let all_pending = vec![mk(TodoStatus::Pending)];
+        assert_eq!(focus_index(&all_pending), 0);
     }
 }

@@ -298,6 +298,30 @@ pub fn slash_commands() -> &'static [SlashCommand] {
             run: "fork",
         },
         SlashCommand {
+            name: "retry",
+            icon: "↻",
+            desc: "Regenerate the last reply",
+            run: "retry",
+        },
+        SlashCommand {
+            name: "edit-last",
+            icon: "✎",
+            desc: "Edit your last message and resend",
+            run: "edit-last",
+        },
+        SlashCommand {
+            name: "copy",
+            icon: "⧉",
+            desc: "Copy the last reply to the clipboard",
+            run: "copy",
+        },
+        SlashCommand {
+            name: "copy-code",
+            icon: "⧉",
+            desc: "Copy the last code block to the clipboard",
+            run: "copy-code",
+        },
+        SlashCommand {
             name: "effort",
             icon: "🧠",
             desc: "Cycle reasoning effort (low/medium/high/off)",
@@ -454,14 +478,109 @@ pub struct Settings {
 pub struct PermissionRequest {
     pub calls: Vec<ToolCall>,
     pub selected: usize,
+    /// First display-line of the (possibly long) command list that's visible; the
+    /// renderer windows the list from here so a big batch stays scrollable.
+    pub scroll: usize,
 }
 
+/// Plain-ASCII fence lines wrapping every field value in the editable buffer.
+/// A value line has to be *exactly* `>>>` to collide, which effectively never
+/// happens in real command / code content.
+const FIELD_OPEN: &str = "<<<";
+const FIELD_CLOSE: &str = ">>>";
+
 impl PermissionRequest {
-    pub fn single(call: ToolCall) -> Self {
+    pub fn new(calls: Vec<ToolCall>) -> Self {
         Self {
-            calls: vec![call],
+            calls,
             selected: 0,
+            scroll: 0,
         }
+    }
+
+    /// Build a single-call request. Test-only (production batches via the queue).
+    #[cfg(test)]
+    pub fn single(call: ToolCall) -> Self {
+        Self::new(vec![call])
+    }
+
+    pub fn scroll_up(&mut self) {
+        self.scroll = self.scroll.saturating_sub(1);
+    }
+    pub fn scroll_down(&mut self) {
+        self.scroll = self.scroll.saturating_add(1);
+    }
+
+    /// Render the batch as an editable plain-text buffer for `$EDITOR`. Each call
+    /// is a `### N tool` block; each editable field is `key:` then its value fenced
+    /// between [`FIELD_OPEN`]/[`FIELD_CLOSE`] on their own lines, so multi-line
+    /// values (an edit's old→new, a file's content) survive intact. Deleting a
+    /// whole block skips (denies) that call.
+    pub fn edit_buffer(&self) -> String {
+        let mut out = String::new();
+        out.push_str(
+            "# AiTUI — review & edit these tool calls, then save & quit to run them.\n\
+             # Edit any field's value between the <<< and >>> fence lines. Delete a\n\
+             # whole \"### N …\" block to skip (deny) that call. Lines starting with # are ignored.\n\n",
+        );
+        for (i, call) in self.calls.iter().enumerate() {
+            let kind = call.kind().map(|k| k.name()).unwrap_or(&call.name);
+            out.push_str(&format!("### {} {}\n", i + 1, kind));
+            for key in call.editable_arg_keys() {
+                let val = call.get_arg(key).unwrap_or("");
+                out.push_str(&format!("{}:\n{}\n{}\n{}\n", key, FIELD_OPEN, val, FIELD_CLOSE));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Apply edits from a buffer produced by [`edit_buffer`]. Field values are
+    /// written back onto the matching call (matched by the block's `N`); calls
+    /// whose block was deleted are returned as their original indices so the caller
+    /// can deny them. Unknown keys / malformed blocks are ignored.
+    pub fn apply_edits(&mut self, text: &str) -> Vec<usize> {
+        let mut seen = vec![false; self.calls.len()];
+        let lines: Vec<&str> = text.lines().collect();
+        let mut i = 0;
+        let mut cur: Option<usize> = None;
+        while i < lines.len() {
+            let line = lines[i];
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("### ") {
+                // "### N tool" — take N, remember which call this block edits.
+                cur = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .filter(|&n| n >= 1 && n <= self.calls.len())
+                    .map(|n| n - 1);
+                if let Some(idx) = cur {
+                    seen[idx] = true;
+                }
+                i += 1;
+                continue;
+            }
+            // "key:" followed by a fenced value.
+            if let (Some(idx), Some(key)) = (cur, trimmed.strip_suffix(':')) {
+                let key = key.trim();
+                if self.calls[idx].editable_arg_keys().contains(&key)
+                    && lines.get(i + 1).map(|l| l.trim()) == Some(FIELD_OPEN)
+                {
+                    let mut j = i + 2;
+                    let mut value_lines: Vec<&str> = Vec::new();
+                    while j < lines.len() && lines[j].trim() != FIELD_CLOSE {
+                        value_lines.push(lines[j]);
+                        j += 1;
+                    }
+                    self.calls[idx].set_arg(key, value_lines.join("\n"));
+                    i = j + 1; // skip past the closing fence
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        (0..self.calls.len()).filter(|&k| !seen[k]).collect()
     }
 }
 
@@ -889,6 +1008,63 @@ mod tests {
             req.down();
         }
         assert_eq!(req.selected, PERMISSION_OPTIONS - 1);
+    }
+
+    #[test]
+    fn edit_buffer_roundtrips_multiline_edits() {
+        let mut req = PermissionRequest::new(vec![
+            ToolCall {
+                name: "shell".into(),
+                args: serde_json::json!({ "command": "cargo test" }),
+                id: None,
+            },
+            ToolCall {
+                name: "edit".into(),
+                args: serde_json::json!({
+                    "path": "src/main.rs",
+                    "old": "let x = 1;\nlet y = 2;",
+                    "new": "let x = 10;",
+                }),
+                id: None,
+            },
+        ]);
+        // Simulate the user editing the shell command and the edit's `new` body.
+        let edited = req
+            .edit_buffer()
+            .replace("cargo test", "cargo test --release")
+            .replace("let x = 10;", "let x = 10;\nlet z = 3;");
+        let dropped = req.apply_edits(&edited);
+        assert!(dropped.is_empty());
+        assert_eq!(req.calls[0].get_arg("command"), Some("cargo test --release"));
+        // Multi-line `old` survives untouched; `new` gains its second line.
+        assert_eq!(req.calls[1].get_arg("old"), Some("let x = 1;\nlet y = 2;"));
+        assert_eq!(req.calls[1].get_arg("new"), Some("let x = 10;\nlet z = 3;"));
+    }
+
+    #[test]
+    fn apply_edits_reports_deleted_blocks_as_dropped() {
+        let mut req = PermissionRequest::new(vec![
+            ToolCall {
+                name: "shell".into(),
+                args: serde_json::json!({ "command": "a" }),
+                id: None,
+            },
+            ToolCall {
+                name: "shell".into(),
+                args: serde_json::json!({ "command": "b" }),
+                id: None,
+            },
+        ]);
+        // Keep only the first block; the user removed the second entirely.
+        let kept: String = req
+            .edit_buffer()
+            .lines()
+            .take_while(|l| !l.starts_with("### 2"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let dropped = req.apply_edits(&kept);
+        assert_eq!(dropped, vec![1]);
+        assert_eq!(req.calls[0].get_arg("command"), Some("a"));
     }
 
     // ── Session picker ───────────────────────────────────────────────────────────

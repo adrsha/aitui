@@ -87,7 +87,8 @@ impl InputBuffer {
         Some((lo, hi))
     }
 
-    /// Whether the character cell at (row, col) is within the selection.
+    /// Whether the character cell at (row, col) is within the selection. Test-only.
+    #[cfg(test)]
     pub fn is_selected(&self, row: usize, col: usize) -> bool {
         match self.selection_bounds() {
             Some((a, b)) => (row, col) >= a && (row, col) <= b,

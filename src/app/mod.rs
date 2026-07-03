@@ -1,4 +1,5 @@
 pub mod action;
+pub mod clipboard;
 pub mod effects;
 pub mod input_buffer;
 pub mod notify;

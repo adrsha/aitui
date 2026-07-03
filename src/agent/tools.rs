@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Represents a tool the agent can call. Lean, single-purpose catalogue (Unix
 /// philosophy): each variant does exactly one thing. Legacy names map onto these
@@ -184,7 +184,7 @@ impl ToolCall {
     }
 
     /// Directory a call primarily operates in, for directory-scoped permission rules.
-    pub fn permission_directory(&self, cwd: &PathBuf) -> Option<PathBuf> {
+    pub fn permission_directory(&self, cwd: &Path) -> Option<PathBuf> {
         let raw = match self.kind() {
             Some(ToolKind::Shell) => Some("."),
             Some(ToolKind::Move) | Some(ToolKind::Copy) => self
@@ -202,9 +202,31 @@ impl ToolCall {
         } else {
             p.parent()
                 .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| cwd.clone())
+                .unwrap_or_else(|| cwd.to_path_buf())
         };
         Some(std::fs::canonicalize(&dir).unwrap_or(dir))
+    }
+
+    /// Whether this call's `path` argument resolves *outside* the project tree
+    /// (`cwd`). Used to keep the blanket read auto-approval confined to the project:
+    /// a read of `~/.ssh/id_rsa` or `../../etc/passwd` escapes and still prompts.
+    ///
+    /// Resolution is lexical (`..`/`.` collapsed without touching the filesystem),
+    /// so it flags an escape even for a path that doesn't exist yet, and can't be
+    /// fooled into a slow/undefined canonicalize on a bogus path.
+    pub fn reads_outside_cwd(&self, cwd: &std::path::Path) -> bool {
+        let Some(raw) = self.args.get("path").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let raw_path = std::path::Path::new(raw);
+        let joined = if raw_path.is_absolute() {
+            raw_path.to_path_buf()
+        } else {
+            cwd.join(raw_path)
+        };
+        let target = normalize_lexical(&joined);
+        let base = normalize_lexical(cwd);
+        !target.starts_with(&base)
     }
 
     /// Human-readable summary of what this call will do, rendered function-call
@@ -274,6 +296,62 @@ impl ToolCall {
             None => format!("{}({})", self.name, self.args),
         }
     }
+
+    /// The argument keys a permission prompt lets the user review and edit, in
+    /// display order. Covers every field that defines what the call *does* — the
+    /// shell command, a file path, an edit's old→new snippets, a move's from→to —
+    /// so the whole action (including the diff) is editable before it runs. Empty
+    /// for tools that never reach the permission prompt (todo/ask/plan).
+    pub fn editable_arg_keys(&self) -> &'static [&'static str] {
+        match self.kind() {
+            Some(ToolKind::Shell) => &["command"],
+            Some(ToolKind::Read) | Some(ToolKind::List) | Some(ToolKind::Delete) => &["path"],
+            Some(ToolKind::Write) => &["path", "content"],
+            Some(ToolKind::Edit) => &["path", "old", "new"],
+            Some(ToolKind::Search) => &["pattern"],
+            Some(ToolKind::Move) | Some(ToolKind::Copy) => &["from", "to"],
+            Some(ToolKind::WebSearch) => &["query"],
+            Some(ToolKind::WebFetch) => &["url"],
+            Some(ToolKind::Download) => &["url", "path"],
+            _ => &[],
+        }
+    }
+
+    /// String value of an argument, if present.
+    pub fn get_arg(&self, key: &str) -> Option<&str> {
+        self.args.get(key).and_then(|v| v.as_str())
+    }
+
+    /// Set (or replace) a string argument, used to apply the user's inline edits.
+    pub fn set_arg(&mut self, key: &str, val: String) {
+        if let Some(obj) = self.args.as_object_mut() {
+            obj.insert(key.to_string(), serde_json::Value::String(val));
+        }
+    }
+}
+
+/// True for the read-only, auto-approvable tool family.
+fn is_read_family(kind: ToolKind) -> bool {
+    matches!(kind, ToolKind::Read | ToolKind::List | ToolKind::Search)
+}
+
+/// Collapse `.` and `..` components lexically (no filesystem access), so
+/// `/proj/../etc` becomes `/etc`. Symlinks are not resolved — this is a
+/// conservative containment check, and treating a symlink target as "inside" only
+/// happens if its lexical path is inside, which is the safe direction.
+fn normalize_lexical(p: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Result of executing a tool.
@@ -370,7 +448,13 @@ impl PermissionMemory {
         {
             return Some(PermissionDecision::Deny);
         }
-        if self.always_allow.contains(&kind)
+        // The blanket auto-approve for read-family tools (`always_allow`) is confined
+        // to the project tree: a read whose target escapes cwd is NOT covered by it,
+        // so it still prompts. Explicit scoped grants (a Directory/Timed rule the user
+        // chose) below still apply, and Deny above still wins.
+        let kind_auto = self.always_allow.contains(&kind)
+            && !(is_read_family(kind) && call.reads_outside_cwd(cwd));
+        if kind_auto
             || self.rules.iter().any(|r| {
                 r.decision == PermissionDecision::Allow && rule_matches(r, &kind, dir.as_ref())
             })
@@ -411,7 +495,7 @@ impl PermissionMemory {
     fn prune_expired(&mut self) {
         let now = now_secs();
         self.rules
-            .retain(|r| r.expires_at.map_or(true, |t| t > now));
+            .retain(|r| r.expires_at.is_none_or(|t| t > now));
     }
 }
 
@@ -431,7 +515,7 @@ fn now_secs() -> u64 {
 }
 
 /// Build the system prompt for agent mode.
-pub fn agent_system_prompt(cwd: &PathBuf) -> String {
+pub fn agent_system_prompt(cwd: &Path) -> String {
     format!(
         r#"You are an agentic coding assistant running INSIDE a terminal app that
 executes your tool calls directly on this machine. You have REAL, working access
@@ -448,7 +532,8 @@ Otherwise, emit a fenced ```tool block with the call as JSON — EXACTLY this sh
 {{"name": "list", "args": {{"path": "."}}}}
 ```
 The app runs it and feeds the result back as a new message; then you continue. You
-may call several tools across turns until the task is done. The user sees a clean
+may emit several calls in ONE turn (they run as a batch, one round-trip — see "Batch
+tool calls" below) and keep calling across turns until the task is done. The user sees a clean
 rendering of each call (a diff, a removed-file line, search hits, cited links) —
 never the raw arguments — so let the tools do the work and don't paste their guts
 into prose. Because that rendering is compact (and sometimes hidden), always follow
@@ -563,6 +648,23 @@ them together rather than stopping the user once per step. If several genuine
 decisions are the user's to make, ask them together, up front, not one at a time.
 Distinguish what a tool can answer (just call it) from what only the user can decide
 (ask). Don't begin editing until the shape of the work is clear.
+
+## Batch tool calls — one turn, many calls
+Every tool call pauses you: the app runs it and feeds the result back before you can
+continue. So MINIMIZE round-trips. In a single turn, emit ALL the calls whose inputs
+you already know — the app runs the whole batch and returns every result together in
+the next turn, instead of one stop-and-go per call. Predict what you'll need and
+request it at once.
+- Independent reads/searches → one batch. To understand a module, `read` all the
+  relevant files and `search` for the symbols in the SAME turn, not one, wait, next.
+- Only go sequential when a call's arguments genuinely depend on an earlier call's
+  result — e.g. `search` to find a file's path, THEN `read` that path; `read` a file,
+  THEN `edit` it with verbatim text you just saw. That dependency is the ONLY reason
+  to split a turn. When in doubt whether two calls are independent, assume they are
+  and batch them.
+- Don't batch destructive or hard-to-reverse calls speculatively (delete, move,
+  write over an existing file, shell that mutates) — those still follow the care
+  rules above. Batching is for cheap, reversible information-gathering and edits.
 
 ## Task tracking — the todo panel
 - todo(items) — Set the task breakdown shown in a sticky panel above the user's
@@ -802,6 +904,44 @@ mod tests {
         let mut mem = PermissionMemory::default();
         let c = call("read_file", serde_json::json!({"path": "a.txt"}));
         assert_eq!(mem.check(&c, &PathBuf::from(".")), None);
+    }
+
+    #[test]
+    fn reads_outside_cwd_detects_escapes() {
+        let cwd = PathBuf::from("/home/u/proj");
+        let inside = call("read_file", serde_json::json!({"path": "src/main.rs"}));
+        assert!(!inside.reads_outside_cwd(&cwd));
+        // `..` traversal that climbs out of the project.
+        let climb = call("read_file", serde_json::json!({"path": "../../etc/passwd"}));
+        assert!(climb.reads_outside_cwd(&cwd));
+        // Absolute path outside the tree.
+        let abs = call("read_file", serde_json::json!({"path": "/etc/shadow"}));
+        assert!(abs.reads_outside_cwd(&cwd));
+        // Absolute path inside the tree is fine.
+        let abs_in = call("read_file", serde_json::json!({"path": "/home/u/proj/a.rs"}));
+        assert!(!abs_in.reads_outside_cwd(&cwd));
+        // `..` that stays inside after collapsing is fine.
+        let bounce = call("read_file", serde_json::json!({"path": "src/../lib.rs"}));
+        assert!(!bounce.reads_outside_cwd(&cwd));
+    }
+
+    #[test]
+    fn auto_approved_reads_are_confined_to_cwd() {
+        let cwd = PathBuf::from("/home/u/proj");
+        let mut mem = PermissionMemory::default();
+        mem.remember_allow(ToolKind::Read); // the auto-approve default
+
+        // In-project read flows without a prompt.
+        let inside = call("read_file", serde_json::json!({"path": "src/main.rs"}));
+        assert_eq!(mem.check(&inside, &cwd), Some(PermissionDecision::Allow));
+
+        // A read escaping the project still prompts despite the blanket allow.
+        let outside = call("read_file", serde_json::json!({"path": "/etc/shadow"}));
+        assert_eq!(mem.check(&outside, &cwd), None);
+
+        // An explicit session-wide (Timed) grant DOES cover the out-of-tree read.
+        mem.remember_rule(PermissionDecision::Allow, PermissionScope::Timed, false);
+        assert_eq!(mem.check(&outside, &cwd), Some(PermissionDecision::Allow));
     }
 
     #[test]

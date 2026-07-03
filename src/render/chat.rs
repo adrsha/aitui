@@ -116,9 +116,7 @@ impl ChatState {
                     .min(max_scroll);
                 self.stick_bottom = self.scroll >= max_scroll;
             }
-        } else if self.stick_bottom {
-            self.scroll = max_scroll;
-        } else if self.scroll > max_scroll {
+        } else if self.stick_bottom || self.scroll > max_scroll {
             self.scroll = max_scroll;
         }
     }
@@ -146,6 +144,12 @@ impl ChatState {
 
     fn max_scroll(&self, h: usize) -> usize {
         self.doc.len().saturating_sub(h)
+    }
+
+    /// How many transcript rows sit below the viewport (hidden past the bottom).
+    /// Zero when the tail is visible — drives the "jump to bottom" pill.
+    pub fn rows_below(&self, h: usize) -> usize {
+        self.max_scroll(h).saturating_sub(self.scroll)
     }
 
     /// Wheel / line scroll. Positive `delta` scrolls up (toward older content).
@@ -232,6 +236,16 @@ mod tests {
         assert_eq!(s.scroll, 0);
         s.bottom(10);
         assert_eq!(s.scroll, s.doc().len().saturating_sub(10));
+    }
+
+    #[test]
+    fn rows_below_reflects_hidden_tail() {
+        let mut s = sample_state(40);
+        let max = s.doc().len().saturating_sub(10);
+        s.top(10); // scrolled to the very top
+        assert_eq!(s.rows_below(10), max);
+        s.bottom(10); // tail visible → nothing hidden below
+        assert_eq!(s.rows_below(10), 0);
     }
 
     #[test]
