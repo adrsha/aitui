@@ -1304,9 +1304,7 @@ fn run_shell_with_timeout(
                 timeout.as_secs()
             ))
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err("Command runner thread died".to_string())
-        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err("Command runner thread died".to_string()),
     }
 }
 

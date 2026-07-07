@@ -36,7 +36,7 @@ pub struct RenderedLine {
 }
 
 impl RenderedLine {
-    fn new(line: Line<'static>, plain: String, msg: usize) -> Self {
+    pub(crate) fn new(line: Line<'static>, plain: String, msg: usize) -> Self {
         Self {
             line,
             plain,
@@ -73,26 +73,6 @@ pub struct DocMessage {
     pub started_at: Option<std::time::Instant>,
 }
 
-/// Braille spinner frames, driven by wall-clock time so streaming animation
-/// works without explicit frame tracking.
-const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
-
-fn spinner_for(time_ms: u128) -> &'static str {
-    SPINNER[((time_ms / 100) as usize) % SPINNER.len()]
-}
-
-const STREAM_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
-const NET_FRAMES: [&str; 4] = ["∙  ", "∙∙ ", "∙∙∙", " ∙∙"];
-const TOOL_FRAMES: [&str; 4] = ["⚙◜", "⚙◝", "⚙◞", "⚙◟"];
-
-fn loading_frame(kind: LoadingKind, time_ms: u128) -> &'static str {
-    match kind {
-        LoadingKind::Network => NET_FRAMES[((time_ms / 180) as usize) % NET_FRAMES.len()],
-        LoadingKind::Streaming => STREAM_FRAMES[((time_ms / 120) as usize) % STREAM_FRAMES.len()],
-        LoadingKind::Tool => TOOL_FRAMES[((time_ms / 120) as usize) % TOOL_FRAMES.len()],
-    }
-}
-
 fn fmt_duration_ms(ms: u64) -> String {
     if ms < 1_000 {
         format!("{}ms", ms.max(1))
@@ -108,7 +88,7 @@ fn fmt_duration_ms(ms: u64) -> String {
 
 /// Build the full document. `toggled` holds (msg, block) keys the user has
 /// explicitly flipped from their default collapse state.
-/// `streaming` controls whether a loader animation is shown on thinking blocks.
+/// `streaming` controls whether partial tool calls are rendered as placeholders.
 pub fn build(
     messages: &[DocMessage],
     width: usize,
@@ -170,7 +150,7 @@ pub fn build_message(
             Block::Markdown(_) if hide_prose => {}
             Block::Markdown(text) => render_markdown(text, mi, inner, theme, &mut out),
             // While streaming, a partial ```tool block (JSON not yet complete) is
-            // shown as an animated "preparing tool call" chip rather than raw JSON.
+            // shown as a quiet "preparing tool call" chip rather than raw JSON.
             Block::Code { lang, code } if streaming && lang == "tool" => {
                 render_preparing_tool(code, mi, inner, theme, &mut out)
             }
@@ -240,19 +220,17 @@ fn render_role_header(
             .bg(theme.faint)
             .fg(theme.text)
             .add_modifier(Modifier::BOLD);
-        let badge_text = if let Some(kind) = loading {
+        let badge_text = if loading.is_some() {
             // Live: the total keeps climbing every frame. Before the first byte the
             // total IS the time-to-first-result ("waiting"); after it, show the
             // frozen first-result time alongside the still-growing total.
             let elapsed = started_at
                 .map(|t| t.elapsed().as_millis() as u64)
                 .unwrap_or(0);
-            let anim = loading_frame(kind, elapsed as u128);
             match first_ms {
-                None => Some(format!(" {} waiting {} ", anim, fmt_duration_ms(elapsed))),
+                None => Some(format!(" waiting {} ", fmt_duration_ms(elapsed))),
                 Some(f) => Some(format!(
-                    " {} {}  ·first {} ",
-                    anim,
+                    " {}  ·first {} ",
                     fmt_duration_ms(elapsed),
                     fmt_duration_ms(f)
                 )),
@@ -585,22 +563,13 @@ fn render_thinking(
     width: usize,
     theme: &Theme,
     toggled: &HashSet<(usize, usize)>,
-    streaming: bool,
+    _streaming: bool,
     out: &mut Vec<RenderedLine>,
 ) {
     let expanded = toggled.contains(&(mi, bi));
     let n = text.lines().count().max(1);
-    let spinner = if streaming {
-        let ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        format!(" {} ", spinner_for(ms))
-    } else {
-        String::new()
-    };
     let arrow = if expanded { "▾" } else { "▸" };
-    let header = format!(" {}{} thinking ({} lines) ", arrow, spinner, n);
+    let header = format!(" {} thinking ({} lines) ", arrow, n);
     let chip_style = Style::default()
         .bg(Color::Green)
         .fg(Color::Gray)
@@ -632,9 +601,9 @@ fn render_thinking(
     }
 }
 
-/// An animated placeholder shown while the assistant is still emitting a tool
-/// call (the JSON isn't closed yet). Hides the raw partial JSON and shows a
-/// spinner + the tool name as it resolves, on a dark chip.
+/// A quiet placeholder shown while the assistant is still emitting a tool call
+/// (the JSON isn't closed yet). Hides the raw partial JSON and shows the tool
+/// name as it resolves, leaving animation to the activity bar.
 fn render_preparing_tool(
     partial: &str,
     mi: usize,
@@ -643,15 +612,10 @@ fn render_preparing_tool(
     out: &mut Vec<RenderedLine>,
 ) {
     let start = out.len();
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let spinner = spinner_for(ms);
     let name = extract_partial_name(partial);
     let label = match &name {
-        Some(n) if !n.is_empty() => format!("  {} Preparing  {} …", spinner, n),
-        _ => format!("  {} Preparing tool call…", spinner),
+        Some(n) if !n.is_empty() => format!("  Preparing {} …", n),
+        _ => "  Preparing tool call…".to_string(),
     };
     out.push(RenderedLine::new(
         Line::from(Span::styled(
@@ -869,39 +833,78 @@ fn render_diff(
     let gutter_w = num_width + 3;
     let avail = width.saturating_sub(gutter_w + 1).max(1);
     let ctx_style = Style::default().fg(theme.faint);
-    let removed_style = Style::default()
-        .fg(theme.danger)
-        .bg(Color::Indexed(88));
-    let added_style = Style::default()
-        .fg(theme.success)
-        .bg(Color::Indexed(28));
+    let removed_style = Style::default().fg(theme.danger).bg(Color::Indexed(88));
+    let added_style = Style::default().fg(theme.success).bg(Color::Indexed(28));
+    let old_hl = highlight::highlight(old, path, theme);
+    let new_hl = highlight::highlight(new, path, theme);
 
     // Context before change
     let before_start = p.saturating_sub(ctx);
     for i in before_start..p {
-        push_diff_line(o[i], i + 1, num_width, " │", ctx_style, avail, mi, out);
+        push_diff_line(
+            o[i],
+            old_hl.as_ref().and_then(|lines| lines.get(i).map(Vec::as_slice)),
+            i + 1,
+            num_width,
+            " │",
+            ctx_style,
+            avail,
+            mi,
+            out,
+        );
     }
 
     // Removed lines
     for i in p..removed_end {
-        push_diff_line(o[i], i + 1, num_width, " -", removed_style, avail, mi, out);
+        push_diff_line(
+            o[i],
+            old_hl.as_ref().and_then(|lines| lines.get(i).map(Vec::as_slice)),
+            i + 1,
+            num_width,
+            " -",
+            removed_style,
+            avail,
+            mi,
+            out,
+        );
     }
 
     // Added lines
     for i in p..added_end {
-        push_diff_line(n[i], i + 1, num_width, " +", added_style, avail, mi, out);
+        push_diff_line(
+            n[i],
+            new_hl.as_ref().and_then(|lines| lines.get(i).map(Vec::as_slice)),
+            i + 1,
+            num_width,
+            " +",
+            added_style,
+            avail,
+            mi,
+            out,
+        );
     }
 
     // Context after change
     let after_end = (removed_end + ctx).min(o.len());
     for i in removed_end..after_end {
-        push_diff_line(o[i], i + 1, num_width, " │", ctx_style, avail, mi, out);
+        push_diff_line(
+            o[i],
+            old_hl.as_ref().and_then(|lines| lines.get(i).map(Vec::as_slice)),
+            i + 1,
+            num_width,
+            " │",
+            ctx_style,
+            avail,
+            mi,
+            out,
+        );
     }
 }
 
-/// Push one diff line with line number gutter and hard-wrapping.
+/// Push one diff line with line number gutter, optional syntax segments, and hard-wrapping.
 fn push_diff_line(
     src: &str,
+    segments: Option<&[Segment]>,
     line_num: usize,
     num_width: usize,
     marker: &str,
@@ -920,6 +923,39 @@ fn push_diff_line(
         ));
         return;
     }
+
+    if let Some(segments) = segments {
+        let mut styled_segments: Vec<Segment> = segments
+            .iter()
+            .map(|(text, seg_style)| {
+                let mut st = *seg_style;
+                st.bg = style.bg;
+                (text.clone(), st)
+            })
+            .collect();
+        if styled_segments.is_empty() {
+            styled_segments.push((src.to_string(), style));
+        }
+        for (ci, (spans, chunk_plain)) in wrap_segments(&styled_segments, avail)
+            .into_iter()
+            .enumerate()
+        {
+            let gutter = if ci == 0 {
+                format!("{:>width$}{} ", line_num, marker, width = num_width)
+            } else {
+                format!("{:>width$}  ", "", width = num_width + 1)
+            };
+            let mut row_spans = vec![Span::styled(gutter.clone(), style)];
+            row_spans.extend(spans);
+            out.push(RenderedLine::new(
+                Line::from(row_spans),
+                format!("{}{}", gutter, chunk_plain),
+                mi,
+            ));
+        }
+        return;
+    }
+
     for (ci, chunk) in hard_chunks(src, avail).into_iter().enumerate() {
         let gutter = if ci == 0 {
             format!("{:>width$}{} ", line_num, marker, width = num_width)
@@ -1165,7 +1201,12 @@ pub fn style_inline(text: &str, base: Style, theme: &Theme) -> Vec<Span<'static>
             if let Some(end) = find_double_star(&chars, i + 2) {
                 flush(&mut buf, &mut spans);
                 let inner: String = chars[i + 2..end].iter().collect();
-                spans.push(Span::styled(inner, base.add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(
+                    inner,
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
+                ));
                 i = end + 2;
                 continue;
             }
@@ -1438,7 +1479,7 @@ mod tests {
 
     #[test]
     fn streaming_partial_tool_shows_preparing_chip() {
-        // Mid-stream, an unclosed ```tool block renders as the animated placeholder.
+        // Mid-stream, an unclosed ```tool block renders as the quiet placeholder.
         let block = Block::Code {
             lang: "tool".into(),
             code: "{\"name\":\"read_file\",\"args\":{\"pa".into(),

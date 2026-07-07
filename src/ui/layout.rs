@@ -2,14 +2,16 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 pub struct AppLayout {
     pub chat: Rect,
+    pub activity: Rect,
     pub todo: Rect,
     pub input: Rect,
     pub statusbar: Rect,
 }
 
-/// Single-column layout: transcript fills the space, then an optional sticky todo
-/// panel, then the input box, then a one-line status bar. The todo panel and input
-/// sit *below* the scrollable transcript, so neither scrolls with it.
+/// Single-column layout: transcript fills the space, then a one-line activity
+/// denoter, optional sticky todo panel, the input box, and the normal status bar.
+/// The activity/todo/input cluster sits below the scrollable transcript, while
+/// the status bar remains at the bottom.
 ///
 /// `input_height` is the number of text rows the input currently needs (already
 /// clamped by the caller); the panel adds 2 for its border. `todo_height` is the
@@ -19,6 +21,7 @@ pub fn compute(area: Rect, input_height: u16, todo_height: u16) -> AppLayout {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
+            Constraint::Length(1),
             Constraint::Length(todo_height),
             Constraint::Length(input_height + 2),
             Constraint::Length(1),
@@ -27,8 +30,9 @@ pub fn compute(area: Rect, input_height: u16, todo_height: u16) -> AppLayout {
 
     AppLayout {
         chat: chunks[0],
-        todo: chunks[1],
-        input: chunks[2],
-        statusbar: chunks[3],
+        activity: chunks[1],
+        todo: chunks[2],
+        input: chunks[3],
+        statusbar: chunks[4],
     }
 }

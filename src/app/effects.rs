@@ -17,8 +17,10 @@ use crate::app::overlay::{
 };
 use crate::app::state::{expand_mentions, App, MAX_AGENT_ITERATIONS};
 use crate::domain::blocks::{parse_blocks, parse_tool_result};
-use crate::render::document::{build, build_message, DocMessage, LoadingKind, RenderedLine};
+use crate::render::document::{build_message, DocMessage, LoadingKind, RenderedLine};
 use crate::render::theme::Theme;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 
 /// Plain display text for a stored message.
 fn message_text(m: &ChatMessage) -> String {
@@ -171,7 +173,7 @@ impl App {
         }
 
         if out.is_empty() {
-            return welcome_doc(&theme);
+            return welcome_doc(&theme, width);
         }
         out
     }
@@ -1309,32 +1311,115 @@ fn message_sig(
 }
 
 /// The empty-state splash, shown when there are no messages.
-fn welcome_doc(theme: &Theme) -> Vec<RenderedLine> {
-    let intro = vec![
-        DocMessage {
-            role: "assistant".into(),
-            blocks: vec![crate::domain::blocks::Block::Markdown(
-                "# AiTUI\nYour terminal coding agent.\n\n- **@path** — mention a file into context\n- **/** — open the command palette\n- **i … :w** — type a message, then send\n- **Ctrl-A** — toggle agent mode (read/edit/run with approval)\n- **?** — full keybinding help"
-                    .into(),
-            )],
-            duration_ms: None,
-            first_ms: None,
-            loading: None,
-            started_at: None,
-        },
+fn welcome_doc(theme: &Theme, width: usize) -> Vec<RenderedLine> {
+    let logo = [
+        "        ████████████████        ",
+        "     ███▓▓▓▓▓▓▓▓▓▓▓▓▓▓███     ",
+        "   ██▓▓      ▓▓▓▓      ▓▓██   ",
+        "  ██▓▓   ██   ▓▓   ██   ▓▓██  ",
+        " ██▓▓   ████  ▓▓  ████   ▓▓██ ",
+        " ██▓▓        ▓▓▓▓        ▓▓██ ",
+        " ██▓▓  ▓▓▓▓  ▓▓▓▓  ▓▓▓▓  ▓▓██ ",
+        "  ██▓▓  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓  ▓▓██  ",
+        "   ██▓▓     ▓▓▓▓▓▓     ▓▓██   ",
+        "     ███▓▓▓▓▓▓▓▓▓▓▓▓███     ",
+        "        ████████████████        ",
     ];
-    // Build with an empty toggle set; reuse the normal builder for consistent styling.
-    let mut rows = build(
-        &intro,
-        70,
-        theme,
-        &std::collections::HashSet::new(),
-        false,
-        false,
-    );
-    // Drop the role header for a cleaner splash.
-    if !rows.is_empty() {
-        rows.remove(0);
+    let cyan = Color::Rgb(11, 227, 253);
+    let purple = Color::Rgb(29, 6, 72);
+    let logo_w = logo.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let pad = width.saturating_sub(logo_w) / 2;
+    let mut rows = Vec::new();
+
+    for raw in logo {
+        let mut spans = Vec::new();
+        spans.push(Span::raw(" ".repeat(pad)));
+        let mut run = String::new();
+        let mut run_style = None;
+        for ch in raw.chars() {
+            let style = match ch {
+                '█' => Some(Style::default().fg(purple).add_modifier(Modifier::BOLD)),
+                '▓' => Some(Style::default().fg(cyan).add_modifier(Modifier::BOLD)),
+                _ => None,
+            };
+            if style != run_style {
+                if !run.is_empty() {
+                    match run_style {
+                        Some(st) => spans.push(Span::styled(std::mem::take(&mut run), st)),
+                        None => spans.push(Span::raw(std::mem::take(&mut run))),
+                    }
+                }
+                run_style = style;
+            }
+            run.push(ch);
+        }
+        if !run.is_empty() {
+            match run_style {
+                Some(st) => spans.push(Span::styled(run.clone(), st)),
+                None => spans.push(Span::raw(run.clone())),
+            }
+        }
+        rows.push(RenderedLine::new(
+            Line::from(spans),
+            format!("{}{}", " ".repeat(pad), raw),
+            0,
+        ));
+    }
+
+    rows.push(RenderedLine::new(Line::raw(""), String::new(), 0));
+    let title = "AiTUI";
+    let subtitle = "terminal-native coding agent";
+    for (text, style) in [
+        (
+            title,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        (subtitle, Style::default().fg(theme.muted)),
+    ] {
+        let pad = width.saturating_sub(text.chars().count()) / 2;
+        rows.push(RenderedLine::new(
+            Line::from(vec![
+                Span::raw(" ".repeat(pad)),
+                Span::styled(text.to_string(), style),
+            ]),
+            format!("{}{}", " ".repeat(pad), text),
+            0,
+        ));
+    }
+    rows.push(RenderedLine::new(Line::raw(""), String::new(), 0));
+
+    let tips = [
+        ("@path", "pull a file into context"),
+        ("/", "open commands"),
+        ("i … :w", "compose, then send"),
+        ("Ctrl-A", "toggle agent mode"),
+        ("?", "show every keybinding"),
+    ];
+    let tip_w = tips
+        .iter()
+        .map(|(k, v)| k.chars().count() + v.chars().count() + 5)
+        .max()
+        .unwrap_or(0);
+    let pad = width.saturating_sub(tip_w) / 2;
+    for (key, desc) in tips {
+        let plain = format!("{}  {:<7} — {}", " ".repeat(pad), key, desc);
+        rows.push(RenderedLine::new(
+            Line::from(vec![
+                Span::raw(" ".repeat(pad)),
+                Span::styled(
+                    format!("  {:<7}", key),
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" — ", Style::default().fg(theme.faint)),
+                Span::styled(desc.to_string(), Style::default().fg(theme.text)),
+            ]),
+            plain,
+            0,
+        ));
     }
     rows
 }

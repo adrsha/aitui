@@ -398,24 +398,50 @@ fn render_permission(f: &mut Frame, req: &crate::app::overlay::PermissionRequest
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
         ))),
-        Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
     );
 
     f.render_widget(
         Paragraph::new(all_lines[start..end].to_vec()),
-        Rect { x: inner.x, y: inner.y + 2, width: inner.width, height: list_h },
+        Rect {
+            x: inner.x,
+            y: inner.y + 2,
+            width: inner.width,
+            height: list_h,
+        },
     );
     // Scroll affordances at the list's edges.
     if start > 0 {
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled("▲ more (PgUp)", Style::default().fg(theme.faint)))),
-            Rect { x: inner.x + inner.width.saturating_sub(14), y: inner.y + 2, width: 14, height: 1 },
+            Paragraph::new(Line::from(Span::styled(
+                "▲ more (PgUp)",
+                Style::default().fg(theme.faint),
+            ))),
+            Rect {
+                x: inner.x + inner.width.saturating_sub(14),
+                y: inner.y + 2,
+                width: 14,
+                height: 1,
+            },
         );
     }
     if end < total {
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled("▼ more (PgDn)", Style::default().fg(theme.faint)))),
-            Rect { x: inner.x + inner.width.saturating_sub(14), y: inner.y + 1 + list_h, width: 14, height: 1 },
+            Paragraph::new(Line::from(Span::styled(
+                "▼ more (PgDn)",
+                Style::default().fg(theme.faint),
+            ))),
+            Rect {
+                x: inner.x + inner.width.saturating_sub(14),
+                y: inner.y + 1 + list_h,
+                width: 14,
+                height: 1,
+            },
         );
     }
 
@@ -456,7 +482,12 @@ fn render_permission(f: &mut Frame, req: &crate::app::overlay::PermissionRequest
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(format!("  {}", opt), style))),
-            Rect { x: inner.x, y, width: inner.width, height: 1 },
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
         );
     }
 
@@ -489,7 +520,10 @@ fn command_lines(
         let kind = call.kind();
         let icon = kind.map(|k| k.icon()).unwrap_or("⚙");
         let risk = kind.map(|k| k.risk().label()).unwrap_or("UNKNOWN");
-        let name = kind.map(|k| k.name()).unwrap_or(call.name.as_str()).to_string();
+        let name = kind
+            .map(|k| k.name())
+            .unwrap_or(call.name.as_str())
+            .to_string();
         let scope = call
             .permission_directory(cwd)
             .map(|d| d.display().to_string())
@@ -505,7 +539,9 @@ fn command_lines(
             ),
         ]));
         for key in call.editable_arg_keys() {
-            let Some(val) = call.get_arg(key) else { continue };
+            let Some(val) = call.get_arg(key) else {
+                continue;
+            };
             out.push(Line::from(Span::styled(
                 format!("    {}:", key),
                 Style::default().fg(theme.faint),
@@ -572,7 +608,10 @@ fn value_lines(
             .split('\n')
             .map(|src| {
                 let clipped: String = if src.chars().count() > avail {
-                    src.chars().take(avail.saturating_sub(1)).collect::<String>() + "…"
+                    src.chars()
+                        .take(avail.saturating_sub(1))
+                        .collect::<String>()
+                        + "…"
                 } else {
                     src.to_string()
                 };

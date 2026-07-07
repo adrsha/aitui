@@ -5,8 +5,7 @@ use base64::Engine;
 
 /// Check whether the terminal supports the Kitty graphics protocol.
 pub fn supports_kitty() -> bool {
-    std::env::var("KITTY_WINDOW_ID").is_ok()
-        || std::env::var("WEZTERM_PANE").is_ok()
+    std::env::var("KITTY_WINDOW_ID").is_ok() || std::env::var("WEZTERM_PANE").is_ok()
 }
 
 /// The 8-byte PNG signature.
@@ -46,8 +45,8 @@ mod tests {
 
     #[test]
     fn display_reports_missing_file() {
-        let err = display_image(std::path::Path::new("/no/such/aitui.png"), 0, 0, 4, 2)
-            .unwrap_err();
+        let err =
+            display_image(std::path::Path::new("/no/such/aitui.png"), 0, 0, 4, 2).unwrap_err();
         assert!(err.contains("Cannot read"), "got: {err}");
     }
 }

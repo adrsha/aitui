@@ -139,8 +139,7 @@ impl ApiClient {
         let (tx, rx) = mpsc::channel(8);
         let out_path2 = out_str.clone();
         tokio::spawn(async move {
-            let result =
-                image_inner(client, url, headers, request, out_path2, tx.clone()).await;
+            let result = image_inner(client, url, headers, request, out_path2, tx.clone()).await;
             if let Err(e) = result {
                 let _ = tx.send(StreamEvent::Error(e.to_string())).await;
             }

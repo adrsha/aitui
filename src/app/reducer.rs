@@ -292,7 +292,6 @@ impl App {
                     let preselect = self.edited_files.iter().map(PathBuf::from).collect();
                     self.overlay =
                         Overlay::Browser(FileBrowser::open(cwd, BrowsePurpose::Edit, preselect));
-
                 }
             }
             Action::OpenFilesInEditor(paths) => {

@@ -528,7 +528,10 @@ impl PermissionRequest {
             out.push_str(&format!("### {} {}\n", i + 1, kind));
             for key in call.editable_arg_keys() {
                 let val = call.get_arg(key).unwrap_or("");
-                out.push_str(&format!("{}:\n{}\n{}\n{}\n", key, FIELD_OPEN, val, FIELD_CLOSE));
+                out.push_str(&format!(
+                    "{}:\n{}\n{}\n{}\n",
+                    key, FIELD_OPEN, val, FIELD_CLOSE
+                ));
             }
             out.push('\n');
         }
@@ -1035,7 +1038,10 @@ mod tests {
             .replace("let x = 10;", "let x = 10;\nlet z = 3;");
         let dropped = req.apply_edits(&edited);
         assert!(dropped.is_empty());
-        assert_eq!(req.calls[0].get_arg("command"), Some("cargo test --release"));
+        assert_eq!(
+            req.calls[0].get_arg("command"),
+            Some("cargo test --release")
+        );
         // Multi-line `old` survives untouched; `new` gains its second line.
         assert_eq!(req.calls[1].get_arg("old"), Some("let x = 1;\nlet y = 2;"));
         assert_eq!(req.calls[1].get_arg("new"), Some("let x = 10;\nlet z = 3;"));

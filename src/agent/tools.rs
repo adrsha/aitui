@@ -494,8 +494,7 @@ impl PermissionMemory {
 
     fn prune_expired(&mut self) {
         let now = now_secs();
-        self.rules
-            .retain(|r| r.expires_at.is_none_or(|t| t > now));
+        self.rules.retain(|r| r.expires_at.is_none_or(|t| t > now));
     }
 }
 
@@ -918,7 +917,10 @@ mod tests {
         let abs = call("read_file", serde_json::json!({"path": "/etc/shadow"}));
         assert!(abs.reads_outside_cwd(&cwd));
         // Absolute path inside the tree is fine.
-        let abs_in = call("read_file", serde_json::json!({"path": "/home/u/proj/a.rs"}));
+        let abs_in = call(
+            "read_file",
+            serde_json::json!({"path": "/home/u/proj/a.rs"}),
+        );
         assert!(!abs_in.reads_outside_cwd(&cwd));
         // `..` that stays inside after collapsing is fine.
         let bounce = call("read_file", serde_json::json!({"path": "src/../lib.rs"}));

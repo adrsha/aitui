@@ -45,7 +45,10 @@ fn visible_window(count: usize, focus: usize, max: usize) -> (usize, usize) {
 /// Index of the task the window should keep in view: the first in-progress task,
 /// else the last done task (progress frontier), else the top.
 fn focus_index(todos: &[crate::app::state::TodoItem]) -> usize {
-    if let Some(i) = todos.iter().position(|t| t.status == TodoStatus::InProgress) {
+    if let Some(i) = todos
+        .iter()
+        .position(|t| t.status == TodoStatus::InProgress)
+    {
         return i;
     }
     todos
@@ -60,7 +63,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         return;
     }
 
-    let done = todos.iter().filter(|t| t.status == TodoStatus::Done).count();
+    let done = todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Done)
+        .count();
     let title = format!(" Tasks {}/{} ", done, todos.len());
     let block = Block::default()
         .borders(Borders::ALL)

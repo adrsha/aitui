@@ -163,10 +163,7 @@ pub fn render(f: &mut Frame, app: &App, theme: &Theme) {
         ]),
         Line::from(vec![]),
         head("Message actions (commands)"),
-        Line::from(vec![
-            lit(":retry :r"),
-            val("Regenerate the last reply"),
-        ]),
+        Line::from(vec![lit(":retry :r"), val("Regenerate the last reply")]),
         Line::from(vec![
             lit(":edit-last :el"),
             val("Edit your last message and resend"),

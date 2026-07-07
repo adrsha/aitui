@@ -292,7 +292,8 @@ Second call:
     #[test]
     fn extract_recovers_unclosed_final_block() {
         // Stream cut mid-fence: no closing ```. The call must still be recovered.
-        let text = "sure, listing:\n```tool\n{\"name\":\"list\",\"args\":{\"path\":\".\",\"depth\":2}}";
+        let text =
+            "sure, listing:\n```tool\n{\"name\":\"list\",\"args\":{\"path\":\".\",\"depth\":2}}";
         let calls = extract_tool_calls(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "list");

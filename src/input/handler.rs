@@ -478,8 +478,7 @@ fn handle_operator(key: &KeyEvent, _op: char) -> Vec<Action> {
 fn chord_escapes(chord: Option<(char, char)>, last_insert: Option<char>, key: KeyCode) -> bool {
     match (chord, key) {
         (Some((c1, c2)), KeyCode::Char(c)) => {
-            c.eq_ignore_ascii_case(&c2)
-                && last_insert.is_some_and(|p| p.eq_ignore_ascii_case(&c1))
+            c.eq_ignore_ascii_case(&c2) && last_insert.is_some_and(|p| p.eq_ignore_ascii_case(&c1))
         }
         _ => false,
     }

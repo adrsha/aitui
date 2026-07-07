@@ -732,14 +732,20 @@ mod tests {
         let msgs = s.api_messages_windowed(false, Some(40));
         // Only the final turn survives, and the window starts on a user message.
         assert_eq!(msgs.first().map(|m| m.role.as_str()), Some("user"));
-        assert!(msgs.len() < 6, "expected oldest turns dropped, got {:?}", msgs.len());
+        assert!(
+            msgs.len() < 6,
+            "expected oldest turns dropped, got {:?}",
+            msgs.len()
+        );
         assert_eq!(msg_text(msgs.last().unwrap()), "answer number  2");
     }
 
     #[test]
     fn window_keeps_last_user_turn_even_when_over_budget() {
         let mut s = Session::new(1);
-        s.push_message(ChatMessage::user("a very long final question that exceeds the budget"));
+        s.push_message(ChatMessage::user(
+            "a very long final question that exceeds the budget",
+        ));
         // Budget smaller than the single turn — must still be sent, not dropped.
         let msgs = s.api_messages_windowed(false, Some(1));
         assert_eq!(msgs.len(), 1);

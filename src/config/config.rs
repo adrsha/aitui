@@ -453,7 +453,9 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let tmp = dir.join(format!(
         ".{}.tmp.{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("config"),
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config"),
         std::process::id()
     ));
     {

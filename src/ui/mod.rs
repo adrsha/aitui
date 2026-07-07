@@ -41,6 +41,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     scrollbar::render(f, app, scroll_area, &theme);
     render_tokens(f, app, chat_area, &theme);
     render_jump_pill(f, app, chat_area, &theme);
+    statusbar::render_activity(f, app, lay.activity, &theme);
     todo::render(f, app, lay.todo, &theme);
     input::render(f, app, lay.input, &theme);
     statusbar::render(f, app, lay.statusbar, &theme);
@@ -109,9 +110,9 @@ mod tests {
     }
 }
 
-/// Split the transcript rect into (text area, 1-column scrollbar on the right).
+/// Split the transcript rect into (text area, 2-column scrollbar on the right).
 fn split_scrollbar(chat: Rect) -> (Rect, Rect) {
-    if chat.width < 2 {
+    if chat.width < 4 {
         return (
             chat,
             Rect {
@@ -122,16 +123,17 @@ fn split_scrollbar(chat: Rect) -> (Rect, Rect) {
             },
         );
     }
+    let bar_w = 2;
     let text = Rect {
         x: chat.x,
         y: chat.y,
-        width: chat.width - 1,
+        width: chat.width - bar_w,
         height: chat.height,
     };
     let bar = Rect {
-        x: chat.x + chat.width - 1,
+        x: chat.x + chat.width - bar_w,
         y: chat.y,
-        width: 1,
+        width: bar_w,
         height: chat.height,
     };
     (text, bar)
@@ -145,7 +147,11 @@ fn render_jump_pill(f: &mut Frame, app: &App, chat: Rect, theme: &Theme) {
     if hidden == 0 || chat.height == 0 {
         return;
     }
-    let label = format!(" ↓ {} below · {} ", hidden, app.keymap.scroll_bottom.label());
+    let label = format!(
+        " ↓ {} below · {} ",
+        hidden,
+        app.keymap.scroll_bottom.label()
+    );
     let w = (label.chars().count() as u16).min(chat.width);
     if w == 0 {
         return;
