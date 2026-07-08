@@ -266,6 +266,9 @@ fn handle_permission(key: &KeyEvent) -> Vec<Action> {
         KeyCode::Char('a') if !ctrl_pressed(key) => vec![Action::AgentQuickAllow],
         KeyCode::Char('d') if !ctrl_pressed(key) => vec![Action::AgentQuickDeny],
         KeyCode::Char('e') if !ctrl_pressed(key) => vec![Action::AgentPermissionEdit],
+        // 'p' opens $EDITOR to set the session access policy; on save this batch is
+        // re-judged against it (so you can teach it once and stop being asked).
+        KeyCode::Char('p') if !ctrl_pressed(key) => vec![Action::AgentEditPolicy],
         _ => vec![],
     }
 }
@@ -319,32 +322,35 @@ fn handle_normal(app: &App, key: &KeyEvent) -> Vec<Action> {
     match key.code {
         KeyCode::Esc => vec![],
         KeyCode::Char('V') => vec![Action::EnterVisualLine],
-        KeyCode::Char('I') => vec![Action::EnterInsert, Action::LineStart],
-        KeyCode::Char('a') => vec![Action::EnterInsert, Action::Move(Dir::Right)],
-        KeyCode::Char('A') => vec![Action::EnterInsert, Action::LineEnd],
-        KeyCode::Char('o') => vec![Action::EnterInsert, Action::Newline],
-        KeyCode::Char('O') => vec![
-            Action::LineStart,
-            Action::EnterInsert,
-            Action::Newline,
-            Action::Move(Dir::Up),
+        KeyCode::Char('I') => vec![Action::LineStart, Action::EnterInsert],
+        KeyCode::Char('a') => vec![Action::Move(Dir::Right), Action::EnterInsert],
+        KeyCode::Char('A') => vec![
             Action::LineEnd,
+            Action::Move(Dir::Right),
+            Action::EnterInsert,
         ],
+        KeyCode::Char('o') => vec![Action::OpenLineBelow],
+        KeyCode::Char('O') => vec![Action::OpenLineAbove],
         KeyCode::Char('h') | KeyCode::Left => vec![Action::Move(Dir::Left)],
         KeyCode::Char('j') | KeyCode::Down => vec![Action::Move(Dir::Down)],
         KeyCode::Char('k') | KeyCode::Up => vec![Action::Move(Dir::Up)],
         KeyCode::Char('l') | KeyCode::Right => vec![Action::Move(Dir::Right)],
         KeyCode::Char('w') => vec![Action::Move(Dir::WordForward)],
         KeyCode::Char('b') => vec![Action::Move(Dir::WordBackward)],
+        KeyCode::Char('e') => vec![Action::Move(Dir::WordEnd)],
         KeyCode::Char('0') => vec![Action::LineStart],
-        KeyCode::Char('^') => vec![Action::LineStart],
+        KeyCode::Char('^') => vec![Action::FirstNonBlank],
         KeyCode::Char('$') => vec![Action::LineEnd],
         KeyCode::Char('x') => vec![Action::DeleteAt],
         KeyCode::Char('d') => vec![Action::EnterOperator('d')],
-        KeyCode::Char('y') => vec![Action::YankLine],
+        KeyCode::Char('c') => vec![Action::EnterOperator('c')],
+        KeyCode::Char('y') => vec![Action::EnterOperator('y')],
+        KeyCode::Char('Y') => vec![Action::YankLine],
         KeyCode::Char('p') => vec![Action::Paste],
-        KeyCode::Char('D') => vec![Action::DeleteAt, Action::LineEnd],
-        KeyCode::Char('u') => vec![Action::Backspace],
+        KeyCode::Char('D') => vec![Action::DeleteToLineEnd],
+        KeyCode::Char('C') => vec![Action::ChangeToLineEnd],
+        KeyCode::Char('u') => vec![Action::UndoInput],
+        KeyCode::Char('r') if ctrl_pressed(key) => vec![Action::RedoInput],
         KeyCode::Backspace => vec![Action::Backspace],
         _ => vec![],
     }
@@ -391,6 +397,9 @@ fn handle_insert(app: &App, key: &KeyEvent) -> Vec<Action> {
     // terminal speaks the kitty keyboard protocol (breaks under tmux / plain
     // xterm), so Ctrl-J — the canonical LF chord — is always available to insert a
     // newline without submitting, whatever the terminal.
+    if ctrl && key.code == KeyCode::Char('r') {
+        return vec![Action::RedoInput];
+    }
     if ctrl && key.code == KeyCode::Char('j') {
         return vec![Action::Newline];
     }
@@ -456,7 +465,9 @@ fn handle_visual(key: &KeyEvent) -> Vec<Action> {
         KeyCode::Char('l') | KeyCode::Right => vec![Action::Move(Dir::Right)],
         KeyCode::Char('w') => vec![Action::Move(Dir::WordForward)],
         KeyCode::Char('b') => vec![Action::Move(Dir::WordBackward)],
+        KeyCode::Char('e') => vec![Action::Move(Dir::WordEnd)],
         KeyCode::Char('0') => vec![Action::LineStart],
+        KeyCode::Char('^') => vec![Action::FirstNonBlank],
         KeyCode::Char('$') => vec![Action::LineEnd],
         KeyCode::Char('y') => vec![Action::VisualYank],
         KeyCode::Char('d') | KeyCode::Char('x') => vec![Action::VisualDelete],
@@ -465,10 +476,35 @@ fn handle_visual(key: &KeyEvent) -> Vec<Action> {
     }
 }
 
-fn handle_operator(key: &KeyEvent, _op: char) -> Vec<Action> {
-    match key.code {
-        KeyCode::Char('d') => vec![Action::DeleteLine],
-        KeyCode::Char('y') => vec![Action::YankLine],
+fn handle_operator(key: &KeyEvent, op: char) -> Vec<Action> {
+    let motion = match key.code {
+        KeyCode::Char('h') | KeyCode::Left => Some(Dir::Left),
+        KeyCode::Char('l') | KeyCode::Right => Some(Dir::Right),
+        KeyCode::Char('j') | KeyCode::Down => Some(Dir::Down),
+        KeyCode::Char('k') | KeyCode::Up => Some(Dir::Up),
+        KeyCode::Char('w') if op == 'c' => Some(Dir::WordEnd),
+        KeyCode::Char('w') => Some(Dir::WordForward),
+        KeyCode::Char('b') => Some(Dir::WordBackward),
+        KeyCode::Char('e') => Some(Dir::WordEnd),
+        _ => None,
+    };
+    if let Some(dir) = motion {
+        return match op {
+            'd' => vec![Action::DeleteTo(dir)],
+            'c' => vec![Action::ChangeTo(dir)],
+            'y' => vec![Action::YankTo(dir)],
+            _ => vec![Action::EnterNormal],
+        };
+    }
+
+    match (op, key.code) {
+        ('d', KeyCode::Char('d')) => vec![Action::DeleteLine, Action::EnterNormal],
+        ('c', KeyCode::Char('c')) => vec![Action::ChangeLine],
+        ('y', KeyCode::Char('y')) => vec![Action::YankLine, Action::EnterNormal],
+        ('d', KeyCode::Char('$')) => vec![Action::DeleteToLineEnd, Action::EnterNormal],
+        ('c', KeyCode::Char('$')) => vec![Action::ChangeToLineEnd],
+        ('y', KeyCode::Char('$')) => vec![Action::YankToLineEnd, Action::EnterNormal],
+        (_, KeyCode::Esc) => vec![Action::EnterNormal],
         _ => vec![Action::EnterNormal],
     }
 }
@@ -504,6 +540,46 @@ fn handle_mouse(app: &App, mouse: MouseEvent) -> Vec<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crossterm::event::KeyEventKind;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        }
+    }
+
+    fn test_app() -> App {
+        let mut app = App::new(Config::default()).unwrap();
+        app.vim = VimMode::Insert;
+        app
+    }
+
+    #[test]
+    fn default_jk_chord_backspaces_j_and_enters_normal() {
+        let mut app = test_app();
+        app.last_insert = Some('j');
+
+        let actions = handle_insert(&app, &key(KeyCode::Char('k')));
+
+        assert!(matches!(actions.as_slice(), [Action::Backspace, Action::EnterNormal]));
+    }
+
+    #[test]
+    fn custom_two_char_chord_backspaces_first_char_and_enters_normal() {
+        let mut config = Config::default();
+        config.keybinds.normal = "fd".into();
+        let mut app = App::new(config).unwrap();
+        app.vim = VimMode::Insert;
+        app.last_insert = Some('f');
+
+        let actions = handle_insert(&app, &key(KeyCode::Char('d')));
+
+        assert!(matches!(actions.as_slice(), [Action::Backspace, Action::EnterNormal]));
+    }
 
     #[test]
     fn chord_fires_on_second_char_after_first() {

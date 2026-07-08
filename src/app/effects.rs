@@ -7,16 +7,19 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use crate::agent::{
-    self, Permission, PermissionDecision, PermissionScope, ToolCall, ToolKind, ToolResult,
+    self, AccessVerdict, Permission, PermissionDecision, PermissionScope, ToolCall, ToolKind,
+    ToolResult,
 };
 use crate::api::models::MessageContent;
-use crate::api::{ChatMessage, ChatRequest};
+use crate::api::{ApiClient, ChatMessage, ChatRequest};
+use crate::app::state::JudgeBatch;
 use crate::app::action::Action;
 use crate::app::overlay::{
     DecisionRequest, Overlay, PermissionRequest, PlanRequest, PERMISSION_OPTIONS,
 };
 use crate::app::state::{expand_mentions, App, MAX_AGENT_ITERATIONS};
 use crate::domain::blocks::{parse_blocks, parse_tool_result};
+use crate::domain::session::MAX_COLD_STREAM_RETRIES;
 use crate::render::document::{build_message, DocMessage, LoadingKind, RenderedLine};
 use crate::render::theme::Theme;
 use ratatui::style::{Color, Modifier, Style};
@@ -124,7 +127,10 @@ impl App {
                 let mi = session.messages.len();
                 let doc_msg = DocMessage {
                     role: "tool".into(),
-                    blocks: vec![crate::domain::blocks::Block::Markdown(summary)],
+                    blocks: vec![crate::domain::blocks::Block::Markdown(format!(
+                        "⚙ About to run `{}` — executing the requested tool now.",
+                        summary
+                    ))],
                     duration_ms: None,
                     first_ms: None,
                     loading: Some(LoadingKind::Tool),
@@ -413,11 +419,30 @@ impl App {
     }
 
     pub fn begin_stream_for(&mut self, sid: usize) -> Option<Action> {
+        // TODO(audit): move request assembly into a pure builder so streaming,
+        // image routing, skills, tools, and context-window policy can be tested separately.
         // Fresh turn: bump the epoch (so any speculative result still in flight from
         // the previous turn is dropped, not served stale) and drop its state.
         self.spec_epoch = self.spec_epoch.wrapping_add(1);
         self.spec_dispatched.clear();
         self.spec_results.clear();
+        self.start_stream_for(sid, None)
+    }
+
+    pub fn retry_cold_stream(&mut self, sid: usize, cold_retries: u8) -> Option<Action> {
+        if let Some(s) = self.sessions.by_id_mut(sid) {
+            s.cancel_empty_assistant_stream();
+        }
+        self.streams.retain(|h| h.session_id != sid);
+        self.set_status(format!(
+            "No response yet — retrying request ({}/{})…",
+            cold_retries, MAX_COLD_STREAM_RETRIES
+        ));
+        self.touch();
+        self.start_stream_for(sid, Some(cold_retries))
+    }
+
+    fn start_stream_for(&mut self, sid: usize, cold_retries: Option<u8>) -> Option<Action> {
         let is_mock = self.is_mock();
         let session = self.sessions.by_id_mut(sid)?;
         session.begin_assistant_stream();
@@ -449,7 +474,10 @@ impl App {
                 Some(client) => match client.generate_image(&model, &prompt) {
                     Ok((rx, img_path)) => {
                         self.pending_image = Some(img_path.into());
-                        Some(Action::AttachStream(sid, rx))
+                        match cold_retries {
+                            Some(n) => Some(Action::AttachRetriedStream(sid, rx, n)),
+                            None => Some(Action::AttachStream(sid, rx)),
+                        }
                     }
                     Err(e) => {
                         if let Some(s) = self.sessions.by_id_mut(sid) {
@@ -469,7 +497,6 @@ impl App {
             };
         }
 
-        // Prepend active skills as system messages (personas / house styles).
         // Proactive sliding window: keep the sent history to ~75% of the model's
         // context (≈4 chars/token) so there's headroom for the reply plus the
         // system/skill prompts prepended below. Oldest turns fall off silently.
@@ -479,13 +506,31 @@ impl App {
             .by_id(sid)
             .map(|s| s.api_messages_windowed(true, Some(char_budget)))
             .unwrap_or_default();
-        for skill in self.skills.iter().rev().filter(|s| s.active) {
-            messages.insert(0, ChatMessage::system(skill.body.clone()));
+        self.skills = crate::skills::reload_preserving_active(&self.skills);
+        // Loop-mode directive: tell the model it's working autonomously and how to end.
+        if let Some(l) = self.sessions.by_id(sid).and_then(|s| s.loop_state.as_ref()) {
+            let directive = format!(
+                "AUTONOMOUS LOOP MODE is active. You are working toward a goal across \
+                 multiple turns without waiting for the user between them.\n\
+                 GOAL: {}\n\
+                 STOP CRITERIA: {}\n\
+                 Each turn, make concrete, verifiable progress using tools (read/edit/\
+                 write/shell/etc). Do not just describe what you would do — do it. When \
+                 (and ONLY when) the STOP CRITERIA are fully and verifiably met, call the \
+                 `finish` tool with a short summary to end the loop. If you become truly \
+                 blocked and cannot proceed, call `finish` explaining why. You are on \
+                 iteration {} of at most {}.",
+                l.goal, l.stop, l.iteration + 1, l.max
+            );
+            prepend_or_merge_system(&mut messages, directive);
+        }
+        if let Some(skill_prompt) = active_skills_prompt(&self.skills) {
+            prepend_or_merge_system(&mut messages, skill_prompt);
         }
         // The global system prompt from config.toml sits at the very front.
         let sys = self.config.api.system_prompt.trim();
         if !sys.is_empty() {
-            messages.insert(0, ChatMessage::system(sys.to_string()));
+            prepend_or_merge_system(&mut messages, sys.to_string());
         }
         let mut request = ChatRequest::new(self.current_model(), messages)
             .with_reasoning_effort(self.reasoning_effort.clone());
@@ -502,15 +547,19 @@ impl App {
 
         // Offline mock backend: scripted, tool-driving reply, no network.
         if self.is_mock() {
-            return Some(Action::AttachStream(
-                sid,
-                crate::api::mock::stream(&request),
-            ));
+            let rx = crate::api::mock::stream(&request);
+            return match cold_retries {
+                Some(n) => Some(Action::AttachRetriedStream(sid, rx, n)),
+                None => Some(Action::AttachStream(sid, rx)),
+            };
         }
 
         match self.api.as_ref() {
             Some(client) => match client.stream(request) {
-                Ok(rx) => Some(Action::AttachStream(sid, rx)),
+                Ok(rx) => match cold_retries {
+                    Some(n) => Some(Action::AttachRetriedStream(sid, rx, n)),
+                    None => Some(Action::AttachStream(sid, rx)),
+                },
                 Err(e) => {
                     if let Some(s) = self.sessions.by_id_mut(sid) {
                         s.finalize_assistant_stream();
@@ -537,6 +586,11 @@ impl App {
     pub fn maybe_start_agent_round(&mut self, sid: usize) -> Option<Action> {
         let has_tools = !self.tool_calls_in(sid).is_empty();
         if !has_tools {
+            // The turn ended with a plain reply. If this session is running an
+            // autonomous loop, keep it going (or stop it at the cap).
+            if let Some(follow) = self.maybe_continue_loop(sid) {
+                return Some(follow);
+            }
             // Nothing to run for this session; let a queued session take over.
             return self.start_next_queued_round();
         }
@@ -658,6 +712,11 @@ impl App {
 
     pub fn process_next_tool(&mut self) -> Option<Action> {
         let cwd = self.agent_cwd();
+        // Calls already cleared this round (judged-allow or batch-allow) run first,
+        // straight to execution with no fresh permission check or re-judge.
+        if let Some(call) = self.approved.pop_front() {
+            return self.execute_tool(call);
+        }
         while let Some(call) = self.pending_tools.pop_front() {
             let Some(kind) = call.kind() else {
                 let res =
@@ -675,6 +734,11 @@ impl App {
             }
             if kind == ToolKind::Plan {
                 return self.open_plan(call);
+            }
+            if kind == ToolKind::Finish {
+                let res = self.apply_finish(&call);
+                self.record_tool_result(res);
+                continue;
             }
             match self.permissions.check(&call, &cwd) {
                 Some(PermissionDecision::Deny) => {
@@ -704,19 +768,16 @@ impl App {
                         }
                         calls.push(self.pending_tools.pop_front().unwrap());
                     }
-                    self.notify_desktop(
-                        "AiTUI — access needed",
-                        format!(
-                            "Allow {} pending tool call{}?",
-                            calls.len(),
-                            if calls.len() == 1 { "" } else { "s" }
-                        ),
-                    );
-                    self.overlay = Overlay::Permission(PermissionRequest::new(calls));
-                    self.set_status(
-                        "Access — ↑↓ option · PgUp/PgDn scroll · a allow · d deny · e edit · ⏎ run · Esc cancel",
-                    );
-                    return None;
+                    // With a session access policy set, let the judge model triage
+                    // the batch before bothering the human — unless we can't reach a
+                    // model (mock/offline) or every call is on the safety floor.
+                    if self.permissions.policy.is_some()
+                        && self.can_judge()
+                        && self.batch_has_judgeable(&calls, &cwd)
+                    {
+                        return self.begin_judge(calls);
+                    }
+                    return self.prompt_permission(calls);
                 }
             }
         }
@@ -786,6 +847,186 @@ impl App {
             }
             self.process_next_tool()
         }
+    }
+
+    /// Show the permission prompt for a batch the judge couldn't clear (or when no
+    /// policy is set). Shared by the plain path, the judge's "ask" verdicts, and a
+    /// re-judge that still needs the human.
+    fn prompt_permission(&mut self, calls: Vec<ToolCall>) -> Option<Action> {
+        self.notify_desktop(
+            "AiTUI — access needed",
+            format!(
+                "Allow {} pending tool call{}?",
+                calls.len(),
+                if calls.len() == 1 { "" } else { "s" }
+            ),
+        );
+        self.overlay = Overlay::Permission(PermissionRequest::new(calls));
+        self.set_status(
+            "Access — ↑↓ option · a allow · d deny · e edit · p policy · ⏎ run · Esc cancel",
+        );
+        None
+    }
+
+    /// Whether a live model is reachable to run the access judge (never in mock /
+    /// offline mode — there's nothing to ask).
+    fn can_judge(&self) -> bool {
+        !self.is_mock() && !self.config.api.endpoint.trim().is_empty()
+    }
+
+    /// Whether any call in the batch is eligible for the judge — i.e. not on the
+    /// safety floor. If every call is floored, judging is pointless: prompt directly.
+    fn batch_has_judgeable(&self, calls: &[ToolCall], cwd: &PathBuf) -> bool {
+        calls.iter().any(|c| !agent::needs_hard_prompt(c, cwd))
+    }
+
+    /// Spawn the async access-policy judge for `calls`. The fast judge model
+    /// classifies each call allow/deny/ask against the session policy; verdicts
+    /// return over `judge_rx` as an `AccessJudged` action. The batch is stashed in
+    /// `self.judging` meanwhile.
+    fn begin_judge(&mut self, calls: Vec<ToolCall>) -> Option<Action> {
+        let sid = self.agent_sid();
+        let cwd = self.agent_cwd();
+        let policy = self.permissions.policy.clone().unwrap_or_default();
+        let descs: Vec<(usize, String)> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, agent::describe_call(c, &cwd)))
+            .collect();
+        let (system, user) = agent::access::build_judge_prompt(&policy, &descs);
+        let n = calls.len();
+        let model = if self.config.api.access_judge_model.trim().is_empty() {
+            self.current_model().to_string()
+        } else {
+            self.config.api.access_judge_model.clone()
+        };
+        let endpoint = self.config.api.endpoint.clone();
+        let key = self.config.api.api_key.clone();
+
+        let (tx, rx) = mpsc::channel(1);
+        self.judge_rx = Some(rx);
+        self.judging = Some(JudgeBatch {
+            session_id: sid,
+            calls,
+        });
+        self.set_status(format!(
+            "⚖ Judging {} call{} against access policy…",
+            n,
+            if n == 1 { "" } else { "s" }
+        ));
+        self.touch();
+
+        tokio::spawn(async move {
+            // Any failure (no client, HTTP error, parse miss) degrades to all-Ask,
+            // i.e. fall back to the human — the safe direction.
+            let verdicts = match ApiClient::new(&endpoint, &key) {
+                Ok(client) => {
+                    let mut req = ChatRequest::new(
+                        &model,
+                        vec![ChatMessage::system(system), ChatMessage::user(user)],
+                    );
+                    req.stream = false;
+                    req.stream_options = None;
+                    req.max_tokens = Some(256);
+                    match client.complete(req).await {
+                        Ok(reply) => agent::access::parse_verdicts(&reply, n),
+                        Err(_) => vec![AccessVerdict::Ask; n],
+                    }
+                }
+                Err(_) => vec![AccessVerdict::Ask; n],
+            };
+            let _ = tx.send((sid, verdicts)).await;
+        });
+        None
+    }
+
+    /// Apply the judge's per-call verdicts to the in-flight batch. Allowed calls are
+    /// queued to run without re-prompting; denied calls get a policy-skip result;
+    /// anything left as "ask" (including safety-floor calls, forced here regardless
+    /// of the model's answer) falls back to the normal permission prompt.
+    ///
+    /// The batch always came from one `parallel_tool_calls` turn — the model marked
+    /// these calls independent — so running the auto-allowed ones alongside a human
+    /// prompt for the rest does not break an ordering dependency.
+    pub fn apply_access_verdicts(
+        &mut self,
+        sid: usize,
+        verdicts: Vec<AccessVerdict>,
+    ) -> Option<Action> {
+        self.judge_rx = None;
+        let Some(batch) = self.judging.take() else {
+            return None;
+        };
+        // Stale result (session switched / round cancelled) — drop it.
+        if batch.session_id != sid {
+            return None;
+        }
+        let cwd = self.agent_cwd();
+        let mut ask: Vec<ToolCall> = Vec::new();
+        let mut allowed = 0usize;
+        let mut denied = 0usize;
+        for (i, call) in batch.calls.into_iter().enumerate() {
+            let mut verdict = verdicts.get(i).copied().unwrap_or(AccessVerdict::Ask);
+            // Safety floor overrides the judge: destructive / irreversible ops
+            // always go to the human.
+            if agent::needs_hard_prompt(&call, &cwd) {
+                verdict = AccessVerdict::Ask;
+            }
+            match verdict {
+                AccessVerdict::Allow => {
+                    self.approved.push_back(call);
+                    allowed += 1;
+                }
+                AccessVerdict::Deny => {
+                    self.record_tool_result(ToolResult::failure(
+                        call,
+                        "Skipped: denied by access policy".into(),
+                        0,
+                    ));
+                    denied += 1;
+                }
+                AccessVerdict::Ask => ask.push(call),
+            }
+        }
+        if !ask.is_empty() {
+            // Human still needed for some. The auto-allowed ones wait in `approved`
+            // and run once the prompt resolves.
+            return self.prompt_permission(ask);
+        }
+        if allowed + denied > 0 {
+            self.set_status(format!(
+                "Access policy: {} allowed · {} denied",
+                allowed, denied
+            ));
+        }
+        self.process_next_tool()
+    }
+
+    /// Set (or clear, when blank) the session access policy. If a permission prompt
+    /// is already open, re-triage that batch under the new policy right away.
+    pub fn set_access_policy(&mut self, text: &str) -> Option<Action> {
+        self.permissions.set_policy(text);
+        match self.permissions.policy.clone() {
+            Some(p) => {
+                let short: String = p.chars().take(60).collect();
+                self.set_status(format!("Access policy set: {}", short));
+            }
+            None => {
+                self.set_status("Access policy cleared — tool calls prompt normally");
+                return None;
+            }
+        }
+        // A prompt is open and we just gained a policy — re-judge those calls.
+        if let Overlay::Permission(req) = &self.overlay {
+            let calls = req.calls.clone();
+            self.overlay = Overlay::None;
+            let cwd = self.agent_cwd();
+            if self.can_judge() && self.batch_has_judgeable(&calls, &cwd) {
+                return self.begin_judge(calls);
+            }
+            return self.prompt_permission(calls);
+        }
+        None
     }
 
     /// Apply the buffer edited in `$EDITOR` back onto the pending permission batch.
@@ -984,6 +1225,8 @@ impl App {
     /// is already sitting in `spec_results` the moment the turn finishes and the
     /// tool round starts. Never touches tools that mutate or run commands.
     pub fn speculate_read_tools(&mut self, sid: usize) {
+        // TODO(audit): add backpressure/cancellation accounting for speculative tasks;
+        // stale results are dropped, but the work still consumes threads and I/O.
         let (partial, cwd) = {
             let Some(s) = self.sessions.by_id(sid) else {
                 return;
@@ -1110,6 +1353,8 @@ impl App {
         if let Some(s) = self.sessions.by_id_mut(sid) {
             s.todos = todos;
         }
+        // TODO(audit): debounce/coalesce session persistence; frequent tool/todo
+        // updates currently rewrite the whole session file synchronously.
         self.sessions.save();
         self.touch();
         ToolResult::success(
@@ -1140,6 +1385,8 @@ impl App {
     /// Loading (the chip shows a spinner), and spawn the fetch. The main loop drains
     /// `models_rx` into `ModelsLoaded`/`ModelsFailed`.
     pub fn refresh_models(&mut self) {
+        // TODO(audit): tag model-list requests so a slower older refresh cannot
+        // overwrite a newer endpoint/model state when responses arrive out of order.
         use crate::app::state::ModelLoad;
         let endpoint = self.config.api.endpoint.clone();
         let key = self.config.api.api_key.clone();
@@ -1215,6 +1462,158 @@ impl App {
         self.agent_session = None;
         self.begin_stream_for(sid)
     }
+
+    /// The model called `finish` — end this session's autonomous loop. Clears the
+    /// loop so the next completed turn won't continue it, and reports the summary.
+    fn apply_finish(&mut self, call: &ToolCall) -> ToolResult {
+        let summary = call
+            .args
+            .get("summary")
+            .or_else(|| call.args.get("reason"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("done")
+            .to_string();
+        let sid = self.agent_sid();
+        let was_looping = self
+            .sessions
+            .by_id_mut(sid)
+            .map(|s| s.loop_state.take().is_some())
+            .unwrap_or(false);
+        if was_looping {
+            self.sessions.save();
+            self.notify_desktop("AiTUI — loop finished", summary.clone());
+            self.set_status(format!("🏁 Loop finished — {}", summary));
+            ToolResult::success(call.clone(), format!("Loop ended: {}", summary), 0)
+        } else {
+            // `finish` outside a loop is a no-op the model shouldn't have called.
+            ToolResult::success(
+                call.clone(),
+                "finish ignored — not in loop mode".into(),
+                0,
+            )
+        }
+    }
+
+    /// Start an autonomous loop on the active session: store the goal/criteria, turn
+    /// on agent mode, seed the goal as the first user turn, and begin streaming. The
+    /// agent then keeps working on its own (see `maybe_continue_loop`).
+    pub fn start_loop(&mut self, goal: String, stop: String, max: usize) -> Option<Action> {
+        let goal = goal.trim().to_string();
+        if goal.is_empty() {
+            self.set_status("Loop needs a goal — :loop <what to do>");
+            return None;
+        }
+        let stop = if stop.trim().is_empty() {
+            "The goal is fully and verifiably complete.".to_string()
+        } else {
+            stop.trim().to_string()
+        };
+        let max = max.max(1);
+        let sid = self.sessions.active_id();
+        if let Some(s) = self.sessions.by_id_mut(sid) {
+            s.agent_mode = true;
+            s.loop_state = Some(crate::domain::session::LoopState {
+                goal: goal.clone(),
+                stop: stop.clone(),
+                iteration: 0,
+                max,
+            });
+            s.push_message(ChatMessage::user(format!(
+                "Begin working on this task autonomously.\n\nGOAL: {}\n\nSTOP CRITERIA: {}",
+                goal, stop
+            )));
+        }
+        self.sessions.save();
+        self.set_status(format!("⟳ Loop started (max {} iterations) — Ctrl-C or :loop stop to halt", max));
+        self.touch();
+        self.begin_stream_for(sid)
+    }
+
+    /// Called when a turn finished with no tool calls (the model produced a plain
+    /// reply). If the session is looping and not yet done, bump the counter and
+    /// either stop (hit the cap) or nudge the model into another iteration.
+    fn maybe_continue_loop(&mut self, sid: usize) -> Option<Action> {
+        let (goal, stop, iteration, max) = match self.sessions.by_id(sid).and_then(|s| s.loop_state.as_ref()) {
+            Some(l) => (l.goal.clone(), l.stop.clone(), l.iteration, l.max),
+            None => return None,
+        };
+        let next = iteration + 1;
+        if next >= max {
+            if let Some(s) = self.sessions.by_id_mut(sid) {
+                s.loop_state = None;
+            }
+            self.sessions.save();
+            self.notify_desktop("AiTUI — loop stopped", format!("Reached the {}-iteration cap", max));
+            self.set_status(format!("⟳ Loop stopped after {} iterations (cap). :loop to resume.", max));
+            self.touch();
+            return None;
+        }
+        if let Some(s) = self.sessions.by_id_mut(sid) {
+            if let Some(l) = s.loop_state.as_mut() {
+                l.iteration = next;
+            }
+            s.push_message(ChatMessage::user(format!(
+                "Continue toward the goal (iteration {}/{}). GOAL: {}\nSTOP CRITERIA: {}\n\
+                 If the stop criteria are now fully met, call the `finish` tool with a short \
+                 summary. Otherwise make concrete progress this turn using tools.",
+                next, max, goal, stop
+            )));
+        }
+        self.sessions.save();
+        self.set_status(format!("⟳ Loop iteration {}/{}", next, max));
+        self.touch();
+        self.begin_stream_for(sid)
+    }
+
+    /// Stop an active loop on the active session (from `:loop stop` / Ctrl-C).
+    pub fn stop_loop(&mut self) {
+        let sid = self.sessions.active_id();
+        let stopped = self
+            .sessions
+            .by_id_mut(sid)
+            .map(|s| s.loop_state.take().is_some())
+            .unwrap_or(false);
+        if stopped {
+            self.sessions.save();
+            self.set_status("⟳ Loop stopped.");
+            self.touch();
+        }
+    }
+}
+
+fn active_skills_prompt(skills: &[crate::skills::Skill]) -> Option<String> {
+    let active: Vec<&crate::skills::Skill> = skills.iter().filter(|s| s.active).collect();
+    if active.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "Active skills are mandatory response-shaping instructions. Apply every active skill to every answer in this turn, including after tool calls. If a skill changes tone, format, constraints, or workflow, the final response and intermediate user-visible updates must reflect it.\n",
+    );
+    for skill in active {
+        out.push_str(&format!(
+            "\n## Skill: {}\n{}\n",
+            skill.name,
+            skill.body.trim()
+        ));
+    }
+    Some(out)
+}
+
+fn prepend_or_merge_system(messages: &mut Vec<ChatMessage>, text: String) {
+    if text.trim().is_empty() {
+        return;
+    }
+    match messages.first_mut() {
+        Some(first) if first.role == "system" => {
+            if let MessageContent::Text(existing) = &mut first.content {
+                let old = std::mem::take(existing);
+                *existing = format!("{}\n\n{}", text.trim(), old.trim());
+                return;
+            }
+        }
+        _ => {}
+    }
+    messages.insert(0, ChatMessage::system(text.trim().to_string()));
 }
 
 fn build_user_message(text: &str, attachment: Option<&PathBuf>, app: &mut App) -> ChatMessage {
@@ -1414,7 +1813,7 @@ fn welcome_doc(theme: &Theme, width: usize) -> Vec<RenderedLine> {
                         .fg(theme.warning)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" — ", Style::default().fg(theme.faint)),
+                Span::styled(" — ", Style::default().fg(theme.accent)),
                 Span::styled(desc.to_string(), Style::default().fg(theme.text)),
             ]),
             plain,
@@ -1427,6 +1826,45 @@ fn welcome_doc(theme: &Theme, width: usize) -> Vec<RenderedLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_skills_prompt_reinforces_and_includes_only_active_skills() {
+        let skills = vec![
+            crate::skills::Skill {
+                name: "terse".into(),
+                desc: "".into(),
+                body: "Answer briefly.".into(),
+                active: true,
+            },
+            crate::skills::Skill {
+                name: "off".into(),
+                desc: "".into(),
+                body: "Never include me.".into(),
+                active: false,
+            },
+        ];
+        let prompt = active_skills_prompt(&skills).expect("active prompt");
+        assert!(prompt.contains("mandatory response-shaping instructions"));
+        assert!(prompt.contains("## Skill: terse"));
+        assert!(prompt.contains("Answer briefly."));
+        assert!(!prompt.contains("Never include me."));
+    }
+
+    #[test]
+    fn prepend_or_merge_system_merges_with_existing_first_system_message() {
+        let mut messages = vec![
+            ChatMessage::system("agent prompt"),
+            ChatMessage::user("hello"),
+        ];
+        prepend_or_merge_system(&mut messages, "skill prompt".into());
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        let MessageContent::Text(text) = &messages[0].content else {
+            panic!("expected text system message");
+        };
+        assert!(text.starts_with("skill prompt"));
+        assert!(text.contains("agent prompt"));
+    }
 
     #[test]
     fn loop_guard_trips_at_max_before_incrementing() {

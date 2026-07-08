@@ -14,6 +14,9 @@ pub enum StreamEvent {
     Reasoning(String),
     /// Final token accounting, when the endpoint reports it.
     Usage(super::models::Usage),
+    /// A native structured tool call started streaming; the runnable call is still
+    /// emitted as a synthesized tool fence once complete.
+    ToolCallStarted(String),
     /// The stream finished cleanly.
     Done,
     /// A network or protocol error occurred.
@@ -145,6 +148,41 @@ impl ApiClient {
             }
         });
         Ok((rx, out_str))
+    }
+
+    /// One-shot, non-streaming chat completion — used by the access-policy judge,
+    /// which needs a single short reply rather than a token stream. Returns the
+    /// assistant message text (empty string if the endpoint returns no content).
+    pub async fn complete(&self, request: ChatRequest) -> anyhow::Result<String> {
+        let url = format!("{}/v1/chat/completions", self.endpoint);
+        let headers = self.auth_headers()?;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Completion request failed: {}", e))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!("Completion API error {}: {}", status, body));
+        }
+
+        let parsed: super::models::ChatResponse = response
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse completion response: {}", e))?;
+
+        Ok(parsed
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .unwrap_or_default())
     }
 
     /// Fetch available models from the /v1/models endpoint.
@@ -367,6 +405,17 @@ async fn stream_inner(
                         // Accumulate native tool-call fragments by index.
                         if let Some(tcs) = choice.delta.tool_calls {
                             emitted = true;
+                            for tc in &tcs {
+                                if let Some(name) = tc
+                                    .function
+                                    .as_ref()
+                                    .and_then(|f| f.name.as_ref())
+                                    .filter(|n| !n.trim().is_empty())
+                                {
+                                    let _ =
+                                        tx.send(StreamEvent::ToolCallStarted(name.clone())).await;
+                                }
+                            }
                             accumulate_tool_calls(&mut tool_acc, tcs);
                         }
                         // Finish reason signals stream end even without [DONE].

@@ -54,6 +54,8 @@ pub fn execute(call: ToolCall, cwd: &PathBuf) -> ToolResult {
 }
 
 fn resolve_path(raw: &str, cwd: &Path) -> PathBuf {
+    // TODO(audit): harden path containment/symlink handling so mutating tools cannot
+    // escape the intended workspace after approval via `..` or symlink pivots.
     let p = PathBuf::from(raw);
     if p.is_absolute() {
         p
@@ -94,40 +96,14 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
             let content = fs::read_to_string(&path)
                 .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
             // Optional line window: offset = 1-based first line, limit = line count.
-            let offset = call
-                .args
-                .get("offset")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize);
-            let limit = call
-                .args
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize);
-            if offset.is_none() && limit.is_none() {
-                // Whole file, but cap so a huge file can't blow the context window.
-                return Ok(truncate(content, 60_000));
-            }
-            let total = content.lines().count();
-            let start = offset.unwrap_or(1).max(1);
-            let take = limit.unwrap_or(usize::MAX);
-            let slice: String = content
-                .lines()
-                .skip(start - 1)
-                .take(take)
-                .collect::<Vec<_>>()
-                .join("\n");
-            let end = (start - 1 + take.min(total.saturating_sub(start - 1))).min(total);
-            Ok(format!(
-                "[lines {}-{} of {}]\n{}",
-                start,
-                end,
-                total,
-                truncate(slice, 60_000)
-            ))
+            let offset = usize_arg(call, "offset");
+            let limit = usize_arg(call, "limit");
+            Ok(read_output(&content, path_str, offset, limit))
         }
 
         Some(ToolKind::Write) => {
+            // FIXME(audit): require an explicit overwrite acknowledgement for existing
+            // files, or route updates through `edit`, before broadening write approvals.
             let path_str = call
                 .args
                 .get("path")
@@ -237,15 +213,24 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
             let path = resolve_path(path_str, cwd);
             // Optional glob to restrict files (e.g. "*.rs"); passed to ripgrep when present.
             let glob = call.args.get("glob").and_then(|v| v.as_str());
+            let offset = usize_arg(call, "offset").unwrap_or(1).max(1);
+            let limit = usize_arg(call, "limit")
+                .unwrap_or(200)
+                .clamp(1, SEARCH_PAGE_LIMIT);
+            let collect = offset
+                .saturating_sub(1)
+                .saturating_add(limit)
+                .min(SEARCH_COLLECT_LIMIT);
 
             // Prefer ripgrep: regex, .gitignore-aware, skips binaries, fast. Fall back
             // to the built-in literal-substring walker when `rg` isn't installed.
-            let matches = match ripgrep(pattern, &path, glob) {
+            let (matches, capped) = match ripgrep(pattern, &path, glob, collect) {
                 Some(m) => m,
                 None => {
                     let mut m: Vec<String> = Vec::new();
-                    search_recursive(&path, pattern, &path, &mut m, 0);
-                    m
+                    search_recursive(&path, pattern, &path, &mut m, 0, collect);
+                    let capped = m.len() >= collect;
+                    (m, capped)
                 }
             };
 
@@ -256,20 +241,44 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
                     path.display()
                 ))
             } else {
-                let shown = matches.len().min(200);
-                let header = format!(
-                    "{} match(es) for '{}' (showing {}):",
-                    matches.len(),
-                    pattern,
-                    shown
-                );
+                let total = matches.len();
+                let page: Vec<String> = matches.into_iter().skip(offset - 1).take(limit).collect();
+                let shown = page.len();
+                let end = offset + shown.saturating_sub(1);
+                let total_label = if capped {
+                    format!("{}+", total)
+                } else {
+                    total.to_string()
+                };
+                let header = if shown == 0 {
+                    format!(
+                        "{} match(es) for '{}' (showing 0 from offset {}):",
+                        total_label, pattern, offset
+                    )
+                } else {
+                    format!(
+                        "{} match(es) for '{}' (showing {}-{}):",
+                        total_label, pattern, offset, end
+                    )
+                };
                 let mut out = vec![header];
-                out.extend(matches.into_iter().take(200));
-                Ok(truncate(out.join("\n"), 8192))
+                out.extend(page);
+                if capped {
+                    out.push(format!(
+                        "  … more matches possible; rerun with offset {}",
+                        offset
+                            .saturating_sub(1)
+                            .saturating_add(limit)
+                            .saturating_add(1)
+                    ));
+                }
+                Ok(truncate(out.join("\n"), 16_000))
             }
         }
 
         Some(ToolKind::Edit) => {
+            // TODO(audit): make edit writes atomic and preserve file metadata where
+            // practical; the current read/replace/write path can leave partial files.
             let path_str = call
                 .args
                 .get("path")
@@ -277,31 +286,37 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
                 .ok_or("Missing 'path' argument")?;
             let old_s = call
                 .args
-                .get("old_string")
-                .or_else(|| call.args.get("old"))
+                .get("old")
+                .or_else(|| call.args.get("old_string"))
                 .and_then(|v| v.as_str())
-                .ok_or("Missing 'old_string' argument")?;
+                .ok_or("edit: missing required 'old' argument")?;
             let new_s = call
                 .args
-                .get("new_string")
-                .or_else(|| call.args.get("new"))
+                .get("new")
+                .or_else(|| call.args.get("new_string"))
                 .and_then(|v| v.as_str())
-                .ok_or("Missing 'new_string' argument")?;
+                .ok_or("edit: missing required 'new' argument")?;
             let path = resolve_path(path_str, cwd);
             let content = fs::read_to_string(&path)
                 .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
-            if !content.contains(old_s) {
-                return Err(format!("old_string not found in {}", path.display()));
+            let count = content.matches(old_s).count();
+            match count {
+                0 => return Err(format!("old_string not found in {}", path.display())),
+                1 => {}
+                n => {
+                    return Err(format!(
+                        "old_string matched {} occurrences in {}; include a larger unique snippet",
+                        n,
+                        path.display()
+                    ))
+                }
             }
-            let replaced = content.replace(old_s, new_s);
+            let replaced = content.replacen(old_s, new_s, 1);
             fs::write(&path, &replaced)
                 .map_err(|e| format!("Cannot write {}: {}", path.display(), e))?;
-            let count = content.matches(old_s).count();
             Ok(format!(
-                "Edit {} ({} occurrence{})\n{}",
+                "Edit {} (1 occurrence)\n{}",
                 path.display(),
-                count,
-                if count == 1 { "" } else { "s" },
                 line_diff(&content, &replaced)
             ))
         }
@@ -420,6 +435,7 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
         Some(ToolKind::Todo) => Ok("(todo handled by UI)".into()),
         Some(ToolKind::Ask) => Ok("(ask handled by UI)".into()),
         Some(ToolKind::Plan) => Ok("(plan handled by UI)".into()),
+        Some(ToolKind::Finish) => Ok("(finish handled by UI)".into()),
 
         None => Err(format!("Unknown tool: {}", call.name)),
     }
@@ -601,6 +617,8 @@ fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
 /// self-hostable; DuckDuckGo/Bing remain fallback providers so the tool still
 /// works when public SearxNG instances rate-limit or block automated requests.
 fn web_search(query: &str) -> Result<String, String> {
+    // TODO(audit): replace brittle scraped fallbacks with provider-specific clients
+    // and structured diagnostics before relying on web_search for critical answers.
     let settings = search_settings();
     let provider = settings.provider.trim().to_lowercase();
     let mut diagnostics = Vec::new();
@@ -1059,6 +1077,8 @@ fn urlencode(s: &str) -> String {
 /// Very small HTML→text reduction: drop script/style, strip tags, collapse
 /// whitespace. Good enough to feed a page's readable text back to the model.
 fn strip_html(html: &str) -> String {
+    // TODO(audit): switch to a real HTML readability/parser pipeline; this reducer
+    // loses links/headings and can return boilerplate-heavy text for complex pages.
     let lower = html.to_lowercase();
     // If it doesn't look like HTML, return as-is.
     if !lower.contains("<html")
@@ -1110,6 +1130,66 @@ fn strip_html(html: &str) -> String {
 
 /// Max entries a single `list_dir` will emit before it stops descending.
 const LIST_CAP: usize = 400;
+/// Max bytes returned by a whole-file read before it switches to line paging.
+const READ_FULL_BYTE_LIMIT: usize = 60_000;
+/// Default number of lines returned for a large read page.
+const READ_PAGE_LINES: usize = 400;
+/// Hard cap on read page size, including explicit `limit` requests.
+const READ_PAGE_LIMIT: usize = 1000;
+/// Max search matches returned to a single page.
+const SEARCH_PAGE_LIMIT: usize = 1000;
+/// Max search matches collected internally while paging.
+const SEARCH_COLLECT_LIMIT: usize = 20_000;
+
+fn usize_arg(call: &ToolCall, key: &str) -> Option<usize> {
+    let v = call.args.get(key)?;
+    v.as_u64()
+        .map(|n| n as usize)
+        .or_else(|| v.as_str()?.parse().ok())
+}
+
+fn read_output(content: &str, path: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    if offset.is_none() && limit.is_none() && content.len() <= READ_FULL_BYTE_LIMIT {
+        return content.to_string();
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let start = offset.unwrap_or(1).max(1).min(total.saturating_add(1));
+    let requested = limit.unwrap_or(READ_PAGE_LINES).max(1);
+    let take = requested.min(READ_PAGE_LIMIT);
+    let shown: Vec<&str> = lines
+        .iter()
+        .skip(start.saturating_sub(1))
+        .take(take)
+        .copied()
+        .collect();
+    let shown_len = shown.len();
+    let end = if shown_len == 0 {
+        start.saturating_sub(1)
+    } else {
+        start + shown_len - 1
+    };
+    let mut out = format!("[lines {}-{} of {}]", start, end, total);
+    if requested > READ_PAGE_LIMIT {
+        out.push_str(&format!(
+            "\n[limit capped at {} lines per read]",
+            READ_PAGE_LIMIT
+        ));
+    }
+    if !shown.is_empty() {
+        out.push('\n');
+        out.push_str(&shown.join("\n"));
+    }
+    if end < total {
+        let next = end + 1;
+        out.push_str(&format!(
+            "\n[next: read(path=\"{}\", offset={}, limit={})]",
+            path, next, take
+        ));
+    }
+    out
+}
 
 /// Recursively list `dir` up to `max_depth` levels (1 = just this dir). Dirs first,
 /// then files, each sorted; hidden and heavy build dirs are skipped. Appends indented
@@ -1164,12 +1244,16 @@ fn list_recursive(
 /// Run ripgrep for `pattern` under `path`, returning `file:line: text` matches.
 /// Returns `None` if `rg` isn't on PATH (caller falls back to the built-in walker).
 /// `rg`'s own exit code 1 (no matches) maps to an empty vec, not a fallback.
-fn ripgrep(pattern: &str, path: &Path, glob: Option<&str>) -> Option<Vec<String>> {
+fn ripgrep(
+    pattern: &str,
+    path: &Path,
+    glob: Option<&str>,
+    collect: usize,
+) -> Option<(Vec<String>, bool)> {
     let mut cmd = Command::new("rg");
     cmd.arg("--line-number")
         .arg("--no-heading")
         .arg("--color=never")
-        .arg("--max-count=50")
         .arg("--max-columns=300");
     if let Some(g) = glob {
         cmd.arg("--glob").arg(g);
@@ -1179,13 +1263,16 @@ fn ripgrep(pattern: &str, path: &Path, glob: Option<&str>) -> Option<Vec<String>
     // rg missing → Command::output errors above → None. Here rg ran: 0 = matches,
     // 1 = no matches (both fine), 2 = actual error (still return what we parsed).
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Some(
-        stdout
-            .lines()
-            .take(200)
-            .map(|l| format!("  {}", l))
-            .collect(),
-    )
+    let mut capped = false;
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        if out.len() >= collect {
+            capped = true;
+            break;
+        }
+        out.push(format!("  {}", line));
+    }
+    Some((out, capped))
 }
 
 fn search_recursive(
@@ -1194,8 +1281,9 @@ fn search_recursive(
     base: &Path,
     matches: &mut Vec<String>,
     depth: usize,
+    collect: usize,
 ) {
-    if depth > 8 || matches.len() >= 200 {
+    if depth > 8 || matches.len() >= collect {
         return;
     }
     let entries = match fs::read_dir(dir) {
@@ -1210,10 +1298,13 @@ fn search_recursive(
             continue;
         }
         if path.is_dir() {
-            search_recursive(&path, pattern, base, matches, depth + 1);
+            search_recursive(&path, pattern, base, matches, depth + 1, collect);
         } else {
             if let Ok(content) = fs::read_to_string(&path) {
                 for (line_no, line) in content.lines().enumerate() {
+                    if matches.len() >= collect {
+                        return;
+                    }
                     if line.to_lowercase().contains(&pattern.to_lowercase()) {
                         let rel = path.strip_prefix(base).unwrap_or(&path);
                         matches.push(format!(
@@ -1248,6 +1339,8 @@ const SHELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// process (and its group, best-effort) is killed and an error is returned instead
 /// of blocking indefinitely.
 fn run_shell_command(cmd: &str, cwd: &Path) -> Result<std::process::Output, String> {
+    // TODO(audit): replace the ad-hoc `sh -c` runner with explicit command
+    // classification/sandboxing; timeout alone is not enough isolation.
     run_shell_with_timeout(cmd, cwd, SHELL_TIMEOUT)
 }
 
@@ -1488,6 +1581,56 @@ mod tests {
     }
 
     #[test]
+    fn large_read_returns_page_with_next_call() {
+        let dir = tmp_dir();
+        let path = dir.join("large.txt");
+        let content = (1..=1200)
+            .map(|i| format!("line {i} {}", "x".repeat(80)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, content).unwrap();
+        let call = make_call("read", serde_json::json!({"path": path.to_str().unwrap()}));
+        let result = execute(call, &dir);
+        assert!(result.is_ok());
+        let text = result.text();
+        assert!(text.starts_with("[lines 1-400 of 1200]"), "{text}");
+        assert!(text.contains("line 400"), "{text}");
+        assert!(!text.contains("line 401"), "{text}");
+        assert!(
+            text.contains("offset=401, limit=400"),
+            "next read call is shown: {text}"
+        );
+        assert!(
+            !text.contains("[truncated"),
+            "large reads should page, not truncate: {text}"
+        );
+    }
+
+    #[test]
+    fn read_file_pages_with_offset_and_limit() {
+        let dir = tmp_dir();
+        let path = dir.join("paged.txt");
+        let content = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, content).unwrap();
+        let call = make_call(
+            "read",
+            serde_json::json!({"path": path.to_str().unwrap(), "offset": "4", "limit": "3"}),
+        );
+        let result = execute(call, &dir);
+        assert!(result.is_ok());
+        assert_eq!(
+            result.text(),
+            format!(
+                "[lines 4-6 of 10]\nline 4\nline 5\nline 6\n[next: read(path=\"{}\", offset=7, limit=3)]",
+                path.to_str().unwrap()
+            )
+        );
+    }
+
+    #[test]
     fn read_file_missing_returns_error() {
         let dir = tmp_dir();
         let call = make_call(
@@ -1595,6 +1738,25 @@ mod tests {
         let result = execute(call, &dir);
         assert!(result.is_ok());
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello there foo");
+    }
+
+    #[test]
+    fn edit_file_rejects_duplicate_old_string() {
+        let dir = tmp_dir();
+        let path = dir.join("edit_dupe.txt");
+        fs::write(&path, "same\nkeep\nsame").unwrap();
+        let call = make_call(
+            "edit_file",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "same",
+                "new_string": "changed"
+            }),
+        );
+        let result = execute(call, &dir);
+        assert!(!result.is_ok());
+        assert!(result.text().contains("matched 2 occurrences"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "same\nkeep\nsame");
     }
 
     #[test]
@@ -1805,6 +1967,64 @@ mod tests {
         // Must return promptly (well under the 30s sleep) with a timeout message.
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
         assert!(err.contains("timed out"), "got: {err}");
+    }
+
+    #[test]
+    fn search_defaults_to_first_200_matches_and_reports_next_offset() {
+        let dir = tmp_dir();
+        let path = dir.join("many.txt");
+        let content = (1..=250)
+            .map(|n| format!("needle {}", n))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, content).unwrap();
+        let call = make_call(
+            "search",
+            serde_json::json!({"pattern": "needle", "path": path.to_str().unwrap()}),
+        );
+        let result = execute(call, &dir);
+        assert!(result.is_ok(), "search failed: {}", result.text());
+        let text = result.text();
+        assert!(
+            text.contains("200+ match(es) for 'needle' (showing 1-200)"),
+            "default page header: {}",
+            text
+        );
+        assert!(text.contains("rerun with offset 201"));
+        assert!(text.contains("needle 1"));
+        assert!(!text.contains("needle 201"));
+    }
+
+    #[test]
+    fn search_pages_with_string_offset_and_limit_args() {
+        let dir = tmp_dir();
+        let path = dir.join("many_string_args.txt");
+        let content = (1..=5)
+            .map(|n| format!("needle {}", n))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, content).unwrap();
+        let call = make_call(
+            "search",
+            serde_json::json!({
+                "pattern": "needle",
+                "path": path.to_str().unwrap(),
+                "offset": "3",
+                "limit": "2"
+            }),
+        );
+        let result = execute(call, &dir);
+        assert!(result.is_ok(), "search failed: {}", result.text());
+        let text = result.text();
+        assert!(
+            text.contains("4+ match(es) for 'needle' (showing 3-4)"),
+            "paged header: {}",
+            text
+        );
+        assert!(!text.contains("needle 2"));
+        assert!(text.contains("needle 3"));
+        assert!(text.contains("needle 4"));
+        assert!(!text.contains("needle 5"));
     }
 
     #[test]

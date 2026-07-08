@@ -47,6 +47,11 @@ pub struct ApiConfig {
     /// auto-disabled if the endpoint rejects the `tools` field. Default on.
     #[serde(default = "default_true")]
     pub native_tools: bool,
+    /// Model used to judge tool calls against the session access policy (see
+    /// `:access`). A small/fast model is ideal — it runs once per uncovered tool
+    /// batch. Empty falls back to the current chat model.
+    #[serde(default)]
+    pub access_judge_model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,7 +280,7 @@ fn kb_visual() -> String {
     "v".into()
 }
 fn kb_normal() -> String {
-    "esc".into()
+    "jk".into()
 }
 
 impl Default for KeybindConfig {
@@ -351,6 +356,7 @@ impl Default for Config {
                 system_prompt: String::new(),
                 reasoning_effort: String::new(),
                 native_tools: true,
+                access_judge_model: String::new(),
             },
             ui: UiConfig::default(),
             search: SearchConfig::default(),

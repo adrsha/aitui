@@ -12,18 +12,20 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
 use crate::app::state::{App, PanelLayout};
 use crate::render::theme::Theme;
 
-/// Input box auto-sizes to its content: one row per logical line, at least one row
-/// so it's always visible, and at most `config.ui.input_height` rows so a huge
-/// paste can't crowd out the transcript (that cap is what `:resize` adjusts).
+/// Input box auto-sizes to its wrapped visual content, at least one row so it's
+/// always visible, and at most `config.ui.input_height` rows so a huge paste can't
+/// crowd out the transcript (that cap is what `:resize` adjusts).
 pub fn render(f: &mut Frame, app: &mut App) {
     let max_rows = app.config.ui.input_height.max(1);
-    let input_rows = (app.input.lines.len() as u16).clamp(1, max_rows);
     let todo_count = app.sessions.active().todos.len();
     let todo_h = todo::height(todo_count);
+    let input_width = f.area().width.saturating_sub(4).saturating_sub(1).max(1) as usize;
+    let input_rows = input_visual_rows(&app.input.lines, input_width).clamp(1, max_rows);
     let lay = layout::compute(f.area(), input_rows, todo_h);
 
     // Reserve the rightmost column of the transcript for a scrollbar; the text
@@ -39,20 +41,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     chat::render(f, app, chat_area, &theme);
     scrollbar::render(f, app, scroll_area, &theme);
-    render_tokens(f, app, chat_area, &theme);
+    render_top_info(f, app, chat_area, &theme);
     render_jump_pill(f, app, chat_area, &theme);
     statusbar::render_activity(f, app, lay.activity, &theme);
     todo::render(f, app, lay.todo, &theme);
     input::render(f, app, lay.input, &theme);
     statusbar::render(f, app, lay.statusbar, &theme);
-
-    // Dim the whole UI behind a modal so the overlay stands out. The overlay's
-    // own `Clear` resets its cells back to full brightness, so only the backdrop
-    // dims. Uses the ANSI DIM attribute (no custom colour) per the terminal-only
-    // theme rule.
-    if app.show_help || app.overlay.is_active() {
-        dim_area(f, f.area());
-    }
 
     if app.show_help {
         help::render(f, app, &theme);
@@ -80,23 +74,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// Fade everything already drawn in `area` by adding the ANSI DIM attribute and
-/// dropping BOLD, so a modal on top reads as the focused layer.
-fn dim_area(f: &mut Frame, area: Rect) {
-    use ratatui::style::Modifier;
-    let buf = f.buffer_mut();
-    for y in area.top()..area.bottom() {
-        for x in area.left()..area.right() {
-            let cell = &mut buf[(x, y)];
-            cell.modifier.insert(Modifier::DIM);
-            cell.modifier.remove(Modifier::BOLD);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::context_gauge;
+    use super::{context_gauge, hard_chunk_count, input_visual_rows};
 
     #[test]
     fn gauge_fills_proportionally_and_clamps() {
@@ -108,6 +88,44 @@ mod tests {
         // Zero window is safe (no divide-by-zero).
         assert_eq!(context_gauge(10, 0, 4), "▱▱▱▱ 0%");
     }
+
+    #[test]
+    fn input_visual_rows_counts_wrapped_single_line() {
+        assert_eq!(hard_chunk_count("abcdef", 3), 2);
+        assert_eq!(input_visual_rows(&["abcdef".into()], 3), 2);
+        assert_eq!(input_visual_rows(&["".into()], 3), 1);
+    }
+
+    #[test]
+    fn input_visual_rows_sums_logical_lines() {
+        let lines = vec!["abcdef".to_string(), "xy".to_string()];
+        assert_eq!(input_visual_rows(&lines, 3), 3);
+    }
+}
+
+fn input_visual_rows(lines: &[String], width: usize) -> u16 {
+    lines
+        .iter()
+        .map(|line| hard_chunk_count(line, width.max(1)))
+        .sum::<usize>()
+        .max(1) as u16
+}
+
+fn hard_chunk_count(s: &str, width: usize) -> usize {
+    if s.is_empty() {
+        return 1;
+    }
+    let mut rows = 1usize;
+    let mut cur_w = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cur_w + cw > width && cur_w > 0 {
+            rows += 1;
+            cur_w = 0;
+        }
+        cur_w += cw;
+    }
+    rows
 }
 
 /// Split the transcript rect into (text area, 2-column scrollbar on the right).
@@ -142,25 +160,9 @@ fn split_scrollbar(chat: Rect) -> (Rect, Rect) {
 /// When the transcript is scrolled up off the tail, draw a small "jump to bottom"
 /// pill in the chat pane's bottom-right showing how many rows are hidden below.
 /// Pressing the scroll-to-bottom key (or sending) returns to the live tail.
-fn render_jump_pill(f: &mut Frame, app: &App, chat: Rect, theme: &Theme) {
-    let hidden = app.chat.rows_below(chat.height as usize);
-    if hidden == 0 || chat.height == 0 {
+fn render_jump_pill(f: &mut Frame, app: &App, _chat: Rect, theme: &Theme) {
+    let Some((area, label)) = app.jump_pill() else {
         return;
-    }
-    let label = format!(
-        " ↓ {} below · {} ",
-        hidden,
-        app.keymap.scroll_bottom.label()
-    );
-    let w = (label.chars().count() as u16).min(chat.width);
-    if w == 0 {
-        return;
-    }
-    let area = Rect {
-        x: chat.x + chat.width.saturating_sub(w),
-        y: chat.y + chat.height - 1,
-        width: w,
-        height: 1,
     };
     f.render_widget(Clear, area);
     f.render_widget(
@@ -192,19 +194,27 @@ fn context_gauge(used: u32, window: u32, cells: usize) -> String {
     format!("{} {}%", bar, pct)
 }
 
-/// Draw the token counter for the last response in the chat pane's top-right
-/// corner (overlaid, like a context gauge). No-op until the endpoint reports it.
-fn render_tokens(f: &mut Frame, app: &App, chat: Rect, theme: &Theme) {
-    let Some(u) = app.usage else { return };
+/// Draw compact session and token info in the chat pane's top-right corner.
+fn render_top_info(f: &mut Frame, app: &App, chat: Rect, theme: &Theme) {
     if chat.width < 12 || chat.height == 0 {
         return;
     }
-    let gauge = context_gauge(u.prompt_tokens, app.config.ui.context_window, 8);
-    let label = format!(
-        " ↑{} ↓{} · {} tok · {} ",
-        u.prompt_tokens, u.completion_tokens, u.total_tokens, gauge
+    let session = app.sessions.active();
+    let mut label = format!(
+        " {}/{} {} ",
+        app.sessions.active_idx() + 1,
+        app.sessions.all().len(),
+        session.name
     );
+    if let Some(u) = app.usage {
+        let gauge = context_gauge(u.prompt_tokens, app.config.ui.context_window, 8);
+        label.push_str(&format!(
+            "↑{} ↓{} · {} tok · {} ",
+            u.prompt_tokens, u.completion_tokens, u.total_tokens, gauge
+        ));
+    }
     let w = (label.chars().count() as u16).min(chat.width);
+    let clipped: String = label.chars().take(w as usize).collect();
     let area = Rect {
         x: chat.x + chat.width - w,
         y: chat.y,
@@ -213,10 +223,7 @@ fn render_tokens(f: &mut Frame, app: &App, chat: Rect, theme: &Theme) {
     };
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            label,
-            Style::default().fg(theme.faint),
-        ))),
+        Paragraph::new(Line::from(Span::styled(clipped, theme.subtle_pill()))),
         area,
     );
 }

@@ -110,6 +110,9 @@ fn run(
                             actions.push(Action::StreamReasoning(sid, r))
                         }
                         Ok(api::StreamEvent::Usage(u)) => actions.push(Action::StreamUsage(sid, u)),
+                        Ok(api::StreamEvent::ToolCallStarted(name)) => {
+                            actions.push(Action::StreamToolCallStarted(sid, name))
+                        }
                         Ok(api::StreamEvent::Done) => {
                             actions.push(Action::StreamDone(sid));
                             break;
@@ -144,12 +147,26 @@ fn run(
             }
         }
 
+        // ── 5a2. Drain access-policy judge verdicts ─────────────────────
+        if let Some(rx) = app.judge_rx.as_mut() {
+            if let Ok((sid, verdicts)) = rx.try_recv() {
+                dispatch(app, vec![Action::AccessJudged(sid, verdicts)]);
+                dirty = true;
+            }
+        }
+
         // ── 5b. Drain speculative (pre-run read-only) tool results ──────
         while let Ok((epoch, result)) = app.spec_rx.try_recv() {
             app.store_spec_result(epoch, result);
         }
 
-        // ── 5c. A stream was cut early (tool call detected) — start its round
+        // ── 5c. Restart streams that have produced no visible output ───────
+        if let Some((sid, retries)) = cold_stream_to_retry(app) {
+            dispatch(app, vec![Action::RetryStream(sid, retries + 1)]);
+            dirty = true;
+        }
+
+        // ── 5d. A stream was cut early (tool call detected) — start its round
         // now, on a clean pass, so any leftover tokens from the cut stream have
         // already been drained (and no-op'd) before the next stream begins.
         if let Some(sid) = app.cut_stream.take() {
@@ -173,6 +190,23 @@ fn dispatch(app: &mut app::App, actions: Vec<Action>) {
             queue.push_back(follow_up);
         }
     }
+}
+
+fn cold_stream_to_retry(app: &app::App) -> Option<(usize, u8)> {
+    app.streams.iter().find_map(|h| {
+        if h.cold_retries >= domain::session::MAX_COLD_STREAM_RETRIES {
+            return None;
+        }
+        let session = app.sessions.by_id(h.session_id)?;
+        let start = session.pending_started_at?;
+        if session.pending_first_at.is_none()
+            && start.elapsed() >= domain::session::COLD_STREAM_RETRY_AFTER
+        {
+            Some((h.session_id, h.cold_retries))
+        } else {
+            None
+        }
+    })
 }
 
 /// Suspend the TUI, run an external program (editor or shell), then restore the
@@ -246,6 +280,34 @@ fn run_external_inner(ext: app::state::PendingExternal) -> anyhow::Result<Option
             let contents = std::fs::read_to_string(&path).unwrap_or_default();
             let _ = std::fs::remove_file(&path);
             return Ok(Some(Action::AgentPermissionEdited(contents)));
+        }
+        PendingExternal::PolicyReadback(path) => {
+            let ed = editor();
+            Command::new(&ed)
+                .arg(&path)
+                .status()
+                .map_err(|e| anyhow::anyhow!("Failed to launch {ed}: {e}"))?;
+            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            let _ = std::fs::remove_file(&path);
+            // Drop `#` comment lines (the seeded instructions) and keep the rest.
+            let policy = raw
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+            return Ok(Some(Action::SetAccessPolicy(policy)));
+        }
+        PendingExternal::LoopReadback(path) => {
+            let ed = editor();
+            Command::new(&ed)
+                .arg(&path)
+                .status()
+                .map_err(|e| anyhow::anyhow!("Failed to launch {ed}: {e}"))?;
+            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            let _ = std::fs::remove_file(&path);
+            return Ok(Some(Action::StartLoopSpec(raw)));
         }
         PendingExternal::Shell => {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());

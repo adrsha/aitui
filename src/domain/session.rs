@@ -26,6 +26,33 @@ fn msg_text(m: &ChatMessage) -> String {
 /// than any legitimate response.
 const MAX_STREAM_BYTES: usize = 20 * 1024 * 1024;
 
+/// How long to wait for the first visible stream event before restarting the
+/// request. This covers accepted-but-silent backend hangs without killing slow
+/// healthy streams after they begin producing output.
+pub const COLD_STREAM_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Retry cold starts only a few times; after that the user sees the normal wait
+/// state and can cancel with Ctrl-C.
+pub const MAX_COLD_STREAM_RETRIES: u8 = 2;
+
+/// Autonomous-loop configuration for a session. When present, the agent keeps
+/// taking turns toward `goal` on its own — after each completed turn it either
+/// continues (injecting a nudge) or stops, and the model ends it by calling the
+/// `finish` tool once `stop` is met. `iteration` counts completed turns; `max`
+/// caps them as a hard safety stop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopState {
+    pub goal: String,
+    pub stop: String,
+    pub iteration: usize,
+    pub max: usize,
+}
+
+impl LoopState {
+    /// The default iteration cap when the user doesn't specify one.
+    pub const DEFAULT_MAX: usize = 25;
+}
+
 /// A single named conversation session.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -56,6 +83,10 @@ pub struct Session {
     /// Unsent composer text, stashed when leaving the session and restored on
     /// return. Persisted to disk so a draft survives a restart.
     pub draft: String,
+    /// Active autonomous loop, if any. `Some` means the agent keeps working toward
+    /// the goal on its own until `finish`/`max`/cancel. Persisted so a loop survives
+    /// a restart.
+    pub loop_state: Option<LoopState>,
 }
 
 impl Session {
@@ -74,6 +105,7 @@ impl Session {
             agent_mode: false,
             cwd: std::env::current_dir().ok(),
             draft: String::new(),
+            loop_state: None,
         }
     }
 
@@ -107,6 +139,37 @@ impl Session {
             if buf.len() < MAX_STREAM_BYTES {
                 buf.push_str(token);
             }
+        }
+    }
+
+    /// Mark progress for streamed metadata that is not part of the final visible
+    /// assistant body, such as native tool-call headers.
+    pub fn mark_stream_progress(&mut self) {
+        if self.pending_assistant_text.is_some() {
+            self.pending_first_at
+                .get_or_insert_with(std::time::Instant::now);
+        }
+    }
+
+    /// Drop a still-empty pending assistant shell before retrying the same turn.
+    /// If anything visible arrived, keep it so a retry cannot erase real output.
+    pub fn cancel_empty_assistant_stream(&mut self) {
+        let empty_text = self
+            .pending_assistant_text
+            .as_ref()
+            .map(|t| t.is_empty())
+            .unwrap_or(false);
+        let empty_reasoning = self
+            .pending_reasoning
+            .as_ref()
+            .map(|r| r.is_empty())
+            .unwrap_or(true);
+        if empty_text && empty_reasoning {
+            self.pending_assistant_text = None;
+            self.pending_reasoning = None;
+            self.pending_started_at = None;
+            self.pending_first_at = None;
+            self.pending_mock = false;
         }
     }
 
@@ -413,6 +476,8 @@ struct SavedSession {
     cwd: Option<PathBuf>,
     #[serde(default)]
     draft: String,
+    #[serde(default)]
+    loop_state: Option<LoopState>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -432,6 +497,7 @@ impl From<&Session> for SavedSession {
             todos: s.todos.clone(),
             cwd: s.cwd.clone(),
             draft: s.draft.clone(),
+            loop_state: s.loop_state.clone(),
         }
     }
 }
@@ -452,6 +518,7 @@ impl From<SavedSession> for Session {
             agent_mode: false,
             cwd: s.cwd,
             draft: s.draft,
+            loop_state: s.loop_state,
         }
     }
 }
@@ -571,9 +638,11 @@ impl SessionManager {
         copy.id = self.next_id;
         self.next_id += 1;
         copy.name = format!("{} (fork)", copy.name);
-        // A fork starts idle — never inherit the source's in-flight stream state.
+        // A fork starts idle — never inherit the source's in-flight stream state,
+        // nor its autonomous loop (a fork is a manual branch to explore by hand).
         copy.pending_assistant_text = None;
         copy.pending_reasoning = None;
+        copy.loop_state = None;
         self.sessions.push(copy);
         self.active_idx = self.sessions.len() - 1;
     }

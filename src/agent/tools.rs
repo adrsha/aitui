@@ -26,6 +26,9 @@ pub enum ToolKind {
     Todo,
     Ask,
     Plan,
+    /// Autonomous-loop control: the model calls this to signal the loop's stop
+    /// criteria are met (or that it's blocked), ending the loop.
+    Finish,
 }
 
 impl ToolKind {
@@ -46,6 +49,7 @@ impl ToolKind {
             ToolKind::Todo => "todo",
             ToolKind::Ask => "ask",
             ToolKind::Plan => "plan",
+            ToolKind::Finish => "finish",
         }
     }
 
@@ -66,6 +70,7 @@ impl ToolKind {
             ToolKind::Todo => "Set the task breakdown shown in the sticky todo panel",
             ToolKind::Ask => "Ask the user to choose from options",
             ToolKind::Plan => "Write a plan file for user review and approval",
+            ToolKind::Finish => "End the autonomous loop: stop criteria met (or blocked)",
         }
     }
 
@@ -86,6 +91,7 @@ impl ToolKind {
             ToolKind::Todo => "☑",
             ToolKind::Ask => "?",
             ToolKind::Plan => "📝",
+            ToolKind::Finish => "🏁",
         }
     }
 
@@ -105,12 +111,15 @@ impl ToolKind {
             ToolKind::Todo => ToolRisk::Low,
             ToolKind::Ask => ToolRisk::Low,
             ToolKind::Plan => ToolRisk::Low,
+            ToolKind::Finish => ToolRisk::Low,
             ToolKind::Delete => ToolRisk::High,
             ToolKind::Shell => ToolRisk::High,
         }
     }
 
     pub fn from_name(name: &str) -> Option<Self> {
+        // TODO(audit): retire legacy aliases once persisted sessions are migrated;
+        // aliases currently make schema/prompt/executor behavior harder to reason about.
         match name {
             "read" | "read_file" => Some(ToolKind::Read),
             "write" | "write_file" | "append_file" => Some(ToolKind::Write),
@@ -127,6 +136,7 @@ impl ToolKind {
             "todo" | "todos" | "todo_write" => Some(ToolKind::Todo),
             "ask" | "decide" => Some(ToolKind::Ask),
             "plan" => Some(ToolKind::Plan),
+            "finish" | "done" | "complete" | "stop_loop" => Some(ToolKind::Finish),
             _ => None,
         }
     }
@@ -293,6 +303,10 @@ impl ToolCall {
                 let lines = s("body").map(|c| c.lines().count()).unwrap_or(0);
                 format!("plan({} · {} lines)", path(), lines)
             }
+            Some(ToolKind::Finish) => {
+                let why = s("summary").or_else(|| s("reason")).unwrap_or("done");
+                format!("finish(\"{}\")", why)
+            }
             None => format!("{}({})", self.name, self.args),
         }
     }
@@ -333,6 +347,19 @@ impl ToolCall {
 /// True for the read-only, auto-approvable tool family.
 fn is_read_family(kind: ToolKind) -> bool {
     matches!(kind, ToolKind::Read | ToolKind::List | ToolKind::Search)
+}
+
+/// Whether `raw` (relative to `cwd` when not absolute) lexically resolves outside
+/// the project tree. Shared with the access-policy safety floor so a mutation that
+/// escapes `cwd` can be forced to prompt. Lexical, like `reads_outside_cwd`.
+pub(crate) fn path_escapes_cwd(raw: &str, cwd: &Path) -> bool {
+    let rp = Path::new(raw);
+    let joined = if rp.is_absolute() {
+        rp.to_path_buf()
+    } else {
+        cwd.join(rp)
+    };
+    !normalize_lexical(&joined).starts_with(normalize_lexical(cwd))
 }
 
 /// Collapse `.` and `..` components lexically (no filesystem access), so
@@ -430,6 +457,10 @@ pub struct PermissionMemory {
     /// Kept for settings/tests and treated as kind-scoped deny rules.
     pub always_deny: Vec<ToolKind>,
     pub rules: Vec<PermissionRule>,
+    /// A natural-language description of what access the user is willing to
+    /// auto-grant this session. When set, an uncovered call is judged against it by
+    /// a fast model (see `agent::access`) before ever prompting. `None` = judge off.
+    pub policy: Option<String>,
 }
 
 impl PermissionMemory {
@@ -462,6 +493,16 @@ impl PermissionMemory {
             return Some(PermissionDecision::Allow);
         }
         None
+    }
+
+    /// Set (or clear, when blank) the natural-language session access policy.
+    pub fn set_policy(&mut self, text: &str) {
+        let t = text.trim();
+        self.policy = if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        };
     }
 
     pub fn remember_allow(&mut self, kind: ToolKind) {
@@ -536,9 +577,9 @@ tool calls" below) and keep calling across turns until the task is done. The use
 rendering of each call (a diff, a removed-file line, search hits, cited links) —
 never the raw arguments — so let the tools do the work and don't paste their guts
 into prose. Because that rendering is compact (and sometimes hidden), always follow
-tool work with a short plain-text summary for the user: WHAT you did, WHY, and HOW
-(e.g. "Sorted ~/Downloads by extension — moved 12 files into Documents/Pictures/
-Music using `move`, skipping folders."). One tight paragraph, no raw output dumps.
+tool work with a short plain-text summary for the user only after every visible todo
+item is complete or honestly blocked. Do not summarize-and-stop while any todo is
+still pending or in_progress unless you are explicitly waiting on the user.
 - You ARE in this terminal with working tools. When the user asks you to inspect,
   organize, move, edit, or delete files, DO IT with the tools — never hand back a
   shell script or PowerShell for the user to run, and never ask them to "enable" or
@@ -551,16 +592,19 @@ Music using `move`, skipping folders."). One tight paragraph, no raw output dump
 
 ## Tools — signatures and how to use each
 Filesystem:
-- read(path[, offset, limit]) — Read a file. offset (1-based line) + limit (count)
-  read only a window of a big file. Read before you edit.
+- read(path[, offset, limit]) — Read a file. Omit offset/limit for the whole file;
+  large files return the first page plus an exact next read(...) call. offset is a
+  1-based line number and limit is a line count for paging.
 - write(path, content) — Create or OVERWRITE a whole file. Prefer edit for changes
   to an existing file; write is for new files or a full rewrite.
-- edit(path, old, new) — Replace `old` with `new`. `old` must be verbatim and
-  UNIQUE in the file — include enough surrounding context to pin it down. The user
-  sees the change as a diff.
+- edit(path, old, new) — REQUIRED: always pass `path`, `old`, and `new`. Never call
+  edit with an empty argument object, and never omit `path`; if you do not know
+  the file, search/list/read first. `old` must match verbatim and be UNIQUE in
+  the file — include enough surrounding context. The user sees the change as a diff.
 - list(path[, depth]) — List a directory. "." = cwd; depth>1 descends as a tree.
-- search(pattern[, path, glob]) — Regex search across files. Results come back as
-  `file:line: match`; when you cite a hit to the user, use that file:line form.
+- search(pattern[, path, glob, offset, limit]) — Regex search across files. Results come back as
+  `file:line: match`; optional glob narrows files. Use offset/limit to page through
+  broad searches instead of shell scripts for inspection.
 - move(from, to) / copy(from, to) — Move/rename or copy a path (copy is recursive).
 - delete(path) — Delete a file OR a directory tree. Irreversible: only for paths
   you created this session or the user explicitly asked to remove.
@@ -676,6 +720,14 @@ each to "done" the moment it's finished. Always send the whole list (it replaces
 old one). Skip the panel for trivial one-step tasks. The todo call itself is silent
 in the transcript — only the panel updates.
 
+Todo discipline is mandatory:
+- Treat the todo list as the source of truth for whether the turn is finished.
+- Before any final/user-facing summary, check the todo list. If any item is still
+  pending or in_progress, continue working or ask the user for the specific blocker.
+- Do not end your side of the response with a summary while work remains actionable.
+- Keep exactly one item in_progress while actively working; update immediately when
+  switching focus or completing an item.
+
 Use an ASCII diagram when a picture communicates better than prose — data flow, a
 tree, state transitions, box-and-arrow architecture. Put it in a fenced code block
 so it renders monospaced.
@@ -688,6 +740,8 @@ so it renders monospaced.
 /// Lean, single-purpose set (12 tools). Descriptions carry the output-structure
 /// expectations so the model formats results consistently (mirrored in the prompt).
 pub fn tool_schemas() -> serde_json::Value {
+    // TODO(audit): generate schemas from a typed argument model shared with
+    // `editable_arg_keys` and executor parsing to prevent argument drift.
     // One entry: name, description, and (property, is-required, prop-description) rows.
     fn f(name: &str, desc: &str, props: &[(&str, bool, &str)]) -> serde_json::Value {
         let mut properties = serde_json::Map::new();
@@ -712,7 +766,7 @@ pub fn tool_schemas() -> serde_json::Value {
     }
 
     serde_json::json!([
-        f("read", "Read a file's contents. Omit offset/limit for the whole file (capped); pass them to read only a line window of a large file.", &[
+        f("read", "Read a file's contents. Omit offset/limit for the whole file; large files return the first page plus an exact next read(...) call. Pass offset/limit to read a specific line window.", &[
             ("path", true, "File path, relative to cwd or absolute"),
             ("offset", false, "1-based first line to read (optional)"),
             ("limit", false, "Number of lines from offset (optional)"),
@@ -721,7 +775,7 @@ pub fn tool_schemas() -> serde_json::Value {
             ("path", true, "File path"),
             ("content", true, "Full file contents to write"),
         ]),
-        f("edit", "Replace an exact, unique snippet in a file. `old` must match verbatim and be unique — include enough surrounding context. Read the file first.", &[
+        f("edit", "Replace an exact, unique snippet in a file. REQUIRED: always pass path, old, and new; never call edit with an empty args object or without path. `old` must match verbatim and be unique — include enough surrounding context. Read the file first.", &[
             ("path", true, "File path"),
             ("old", true, "Exact existing text to replace (unique in the file)"),
             ("new", true, "Replacement text"),
@@ -730,10 +784,12 @@ pub fn tool_schemas() -> serde_json::Value {
             ("path", true, "Directory path (\".\" for cwd)"),
             ("depth", false, "Levels to descend; 1 (default) = just this dir"),
         ]),
-        f("search", "Search file contents for a regex (ripgrep, .gitignore-aware; literal-substring fallback). Returns file:line: match. Optional glob narrows files.", &[
+        f("search", "Search file contents for a regex (ripgrep, .gitignore-aware; literal-substring fallback). Returns file:line: match. Optional glob narrows files; offset/limit page through broad result sets.", &[
             ("pattern", true, "Regex (ripgrep) or literal substring (fallback)"),
             ("path", false, "Directory to search (default \".\")"),
             ("glob", false, "File glob, e.g. \"*.rs\" (ripgrep only)"),
+            ("offset", false, "1-based first result to show (optional)"),
+            ("limit", false, "Number of results to show from offset (optional, default 200, max 1000)"),
         ]),
         f("shell", "Run a shell command for BUILD/TEST/RUN only (e.g. cargo test). Never use it to read or edit files — use read/edit/write.", &[
             ("command", true, "Shell command to execute in cwd"),
@@ -820,6 +876,20 @@ pub fn tool_schemas() -> serde_json::Value {
                 }
             }
         }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "finish",
+                "description": "ONLY in autonomous loop mode: call this to END the loop when the stated STOP CRITERIA are fully and verifiably met (or when you are truly blocked and cannot proceed). Do not call it prematurely or in normal chat.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": { "type": "string", "description": "Brief summary of what was accomplished, or why you're stopping" }
+                    },
+                    "required": ["summary"]
+                }
+            }
+        }),
     ])
 }
 
@@ -892,10 +962,11 @@ mod tests {
             "todo",
             "ask",
             "plan",
+            "finish",
         ] {
             assert!(names.contains(&expected), "missing schema for {expected}");
         }
-        assert_eq!(names.len(), 15);
+        assert_eq!(names.len(), 16);
     }
 
     #[test]

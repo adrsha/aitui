@@ -342,8 +342,18 @@ mod tests {
 
     #[test]
     fn single_key_normal_has_no_chord() {
-        let km = Keymap::from_config(&KeybindConfig::default());
+        let mut cfg = KeybindConfig::default();
+        cfg.normal = "esc".into();
+        let km = Keymap::from_config(&cfg);
         assert!(km.normal_chord.is_none());
         assert!(km.normal.matches(&ev(KeyCode::Esc, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn default_normal_binding_is_jk_with_esc_fallback() {
+        let km = Keymap::from_config(&KeybindConfig::default());
+        assert_eq!(km.normal_chord, Some(('j', 'k')));
+        assert!(km.normal.matches(&ev(KeyCode::Esc, KeyModifiers::NONE)));
+        assert_eq!(km.normal_label(), "jk / Esc");
     }
 }

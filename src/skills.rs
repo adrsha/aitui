@@ -6,6 +6,7 @@
 //! request while the skill is active. To add one, drop a `.md` in that folder —
 //! it shows up in the skill picker (`:skill`) automatically.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -65,6 +66,22 @@ fn load_active_names() -> Vec<String> {
 /// set (sticky skills). Seeds a sample `caveman.md` on the first run so the
 /// feature is discoverable out of the box.
 pub fn load() -> Vec<Skill> {
+    load_with_active(&HashSet::new())
+}
+
+/// Reload skill files while preserving in-memory active toggles. Sticky active
+/// names still apply too, so a newly-created skill listed in active_skills.json
+/// starts active after reload.
+pub fn reload_preserving_active(existing: &[Skill]) -> Vec<Skill> {
+    let active: HashSet<String> = existing
+        .iter()
+        .filter(|s| s.active)
+        .map(|s| s.name.clone())
+        .collect();
+    load_with_active(&active)
+}
+
+fn load_with_active(extra_active: &HashSet<String>) -> Vec<Skill> {
     let active = load_active_names();
     let dir = skills_dir();
     if !dir.exists() {
@@ -91,7 +108,7 @@ pub fn load() -> Vec<Skill> {
                 .find(|l| !l.is_empty())
                 .unwrap_or("")
                 .to_string();
-            let is_active = active.iter().any(|a| a == &name);
+            let is_active = active.iter().any(|a| a == &name) || extra_active.contains(&name);
             skills.push(Skill {
                 name,
                 desc,
@@ -115,6 +132,36 @@ Pattern: `[thing] [action] [reason]. [next step].`\n";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reload_preserves_in_memory_active_skills() {
+        let base = std::env::temp_dir().join(format!(
+            "aitui_skills_reload_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let dir = base.join("aitui").join("skills");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("style.md"), "# Style\nBe direct.").unwrap();
+        let old = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
+
+        let mut skills = load();
+        assert_eq!(skills.len(), 1);
+        skills[0].active = true;
+        std::fs::write(dir.join("style.md"), "# Style\nBe very direct.").unwrap();
+        let reloaded = reload_preserving_active(&skills);
+
+        match old {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(reloaded.len(), 1);
+        assert!(reloaded[0].active);
+        assert!(reloaded[0].body.contains("very direct"));
+    }
 
     #[test]
     fn desc_is_first_nonempty_line_without_hashes() {

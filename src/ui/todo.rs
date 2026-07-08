@@ -135,7 +135,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         }
         lines.push(Line::from(Span::styled(
             format!("  {} more", parts.join("  ")),
-            Style::default().fg(theme.faint),
+            Style::default().fg(theme.accent),
         )));
     }
 

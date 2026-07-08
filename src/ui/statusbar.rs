@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use crate::agent::tools::{PermissionDecision, PermissionScope};
 use crate::app::state::App;
 use crate::render::theme::Theme;
 
@@ -301,7 +302,11 @@ fn busy_label(app: &App, ms: u128) -> Option<String> {
             "{} staging {} tool{} · {}",
             motion.frame(ms),
             app.pending_tools.len(),
-            if app.pending_tools.len() == 1 { "" } else { "s" },
+            if app.pending_tools.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
             flavour(
                 &[
                     "permission slip on the clipboard",
@@ -407,14 +412,77 @@ fn busy_label(app: &App, ms: u128) -> Option<String> {
     None
 }
 
+fn chip_fg(bg: Color) -> Color {
+    match bg {
+        Color::Black | Color::Blue | Color::DarkGray | Color::Red | Color::Magenta => Color::White,
+        _ => Color::Black,
+    }
+}
+
 fn chip(text: impl Into<String>, bg: Color) -> Span<'static> {
     Span::styled(
         format!(" {} ", text.into()),
         Style::default()
             .bg(bg)
-            .fg(Color::Black)
+            .fg(crate::render::theme::fg_guard(chip_fg(bg)))
             .add_modifier(Modifier::BOLD),
     )
+}
+
+fn cwd_label(app: &App) -> String {
+    let cwd = app
+        .sessions
+        .active()
+        .cwd
+        .as_ref()
+        .cloned()
+        .or_else(|| std::env::current_dir().ok());
+    let Some(cwd) = cwd else {
+        return "cwd —".to_string();
+    };
+    let display = cwd
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .map(|name| format!("…/{}", name))
+        .unwrap_or_else(|| cwd.display().to_string());
+    format!("cwd {}", display)
+}
+
+fn permission_summary(app: &App) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    // A ⚖ marks that a natural-language access policy is judging tool calls.
+    if app.permissions.policy.is_some() {
+        parts.push("⚖policy".to_string());
+    }
+    for kind in &app.permissions.always_allow {
+        parts.push(format!("✓{}", kind.name()));
+    }
+    for kind in &app.permissions.always_deny {
+        parts.push(format!("✕{}", kind.name()));
+    }
+    for rule in &app.permissions.rules {
+        let mark = match rule.decision {
+            PermissionDecision::Allow => "✓",
+            PermissionDecision::Deny => "✕",
+        };
+        let scope = match &rule.scope {
+            PermissionScope::Kind(kind) => kind.name().to_string(),
+            PermissionScope::Directory(dir) => dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|name| format!("…/{}", name))
+                .unwrap_or_else(|| dir.display().to_string()),
+            PermissionScope::Timed => "all".to_string(),
+        };
+        let timed = if rule.expires_at.is_some() { "⏱" } else { "" };
+        parts.push(format!("{}{}{}", mark, scope, timed));
+    }
+    if parts.is_empty() {
+        "access ask".to_string()
+    } else {
+        format!("access {}", parts.join(" "))
+    }
 }
 
 pub fn render_activity(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
@@ -434,13 +502,6 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let agent_mode = session.agent_mode;
     let ms = now_ms();
 
-    let sess_label = format!(
-        "{}/{} {}",
-        app.sessions.active_idx() + 1,
-        app.sessions.all().len(),
-        session.name,
-    );
-
     let model = app.current_model();
     let status = app.status.as_deref().unwrap_or("");
 
@@ -448,7 +509,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
 
     use crate::input::vim::VimMode;
     let (mode_label, mode_bg) = match app.vim {
-        VimMode::Normal => ("NORMAL", Color::Blue),
+        VimMode::Normal => ("NORMAL", Color::DarkGray),
         VimMode::Insert => ("INSERT", Color::Green),
         VimMode::Visual if app.input.visual_line => ("V-LINE", Color::Magenta),
         VimMode::Visual => ("VISUAL", Color::Magenta),
@@ -457,15 +518,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     left.push(chip(mode_label, mode_bg));
     left.push(Span::raw(" "));
 
-    left.push(Span::styled(
-        format!(" {} ", sess_label),
-        Style::default()
-            .bg(theme.faint)
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    ));
+    left.push(Span::styled(cwd_label(app), theme.subtle_pill()));
+    left.push(Span::raw(" "));
+    left.push(Span::styled(permission_summary(app), theme.subtle_pill()));
 
     let mut chips: Vec<(String, Color)> = Vec::new();
+    if let Some(l) = session.loop_state.as_ref() {
+        chips.push((format!("⟳ loop {}/{}", l.iteration, l.max), theme.accent));
+    }
     if agent_mode {
         chips.push(("agent".into(), theme.warning));
     }
@@ -514,7 +574,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         right,
         Style::default()
             .bg(right_bg)
-            .fg(Color::Black)
+            .fg(chip_fg(right_bg))
             .add_modifier(Modifier::BOLD),
     ));
 

@@ -217,7 +217,7 @@ fn render_role_header(
         // background with a bright foreground, so it stands out instead of blending
         // into the terminal bg the way dim `faint` foreground text did.
         let time_style = Style::default()
-            .bg(theme.faint)
+            .bg(theme.muted)
             .fg(theme.text)
             .add_modifier(Modifier::BOLD);
         let badge_text = if loading.is_some() {
@@ -411,7 +411,7 @@ fn render_code(
         Span::styled(
             format!("{} ", lang_disp),
             Style::default()
-                .fg(theme.faint)
+                .fg(theme.muted)
                 .add_modifier(Modifier::BOLD),
         ),
     ];
@@ -634,7 +634,7 @@ fn render_preparing_tool(
         let shown: String = peek.chars().take(avail).collect();
         let line = format!("      {}", shown);
         out.push(RenderedLine::new(
-            Line::from(Span::styled(line.clone(), Style::default().fg(theme.faint))),
+            Line::from(Span::styled(line.clone(), Style::default().fg(theme.muted))),
             line,
             mi,
         ));
@@ -744,7 +744,7 @@ fn render_tool_call(
             let n = content.lines().count();
             let hint = format!("      … {} line(s) written · click to view", n);
             out.push(RenderedLine::new(
-                Line::from(Span::styled(hint.clone(), Style::default().fg(theme.faint))),
+                Line::from(Span::styled(hint.clone(), Style::default().fg(theme.muted))),
                 hint,
                 mi,
             ));
@@ -789,7 +789,7 @@ fn render_write_preview(
     if total > WRITE_PREVIEW_LINES {
         let more = format!("▌ … {} more line(s)", total - WRITE_PREVIEW_LINES);
         out.push(RenderedLine::new(
-            Line::from(Span::styled(more.clone(), Style::default().fg(theme.faint))),
+            Line::from(Span::styled(more.clone(), Style::default().fg(theme.muted))),
             more,
             mi,
         ));
@@ -832,7 +832,7 @@ fn render_diff(
     let num_width = n.len().max(o.len()).to_string().len().max(3);
     let gutter_w = num_width + 3;
     let avail = width.saturating_sub(gutter_w + 1).max(1);
-    let ctx_style = Style::default().fg(theme.faint);
+    let ctx_style = Style::default().fg(theme.muted);
     let removed_style = Style::default().fg(theme.danger).bg(Color::Indexed(88));
     let added_style = Style::default().fg(theme.success).bg(Color::Indexed(28));
     let old_hl = highlight::highlight(old, path, theme);
@@ -1664,5 +1664,30 @@ mod tests {
         );
         assert!(rows.iter().any(|r| r.plain.contains("- foo")));
         assert!(rows.iter().any(|r| r.plain.contains("+ bar")));
+    }
+
+    #[test]
+    fn edit_diff_is_syntax_highlighted() {
+        let call = crate::agent::ToolCall {
+            name: "edit".into(),
+            args: serde_json::json!({
+                "path": "a.rs",
+                "old": "fn foo() { 1 }",
+                "new": "fn bar() { 2 }",
+            }),
+            id: None,
+        };
+        let rows = build(
+            &doc("assistant", vec![Block::ToolCall(call)]),
+            60,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(
+            has_keyword_colour(&rows),
+            "the `fn` keyword in the diff should be tree-sitter highlighted"
+        );
     }
 }

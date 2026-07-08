@@ -1,5 +1,5 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 use ratatui::Frame;
@@ -72,7 +72,7 @@ fn visual_selection_bounds(
 }
 
 pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
-    let panel = Style::default().bg(Color::Indexed(8));
+    let panel = Style::default();
     // Breathing room inside the input panel: 2 cols each side, 1 row top/bottom.
     // The layout allots `input_height + 2` rows, so the vertical padding consumes
     // that slack and the text area stays `input_height` tall.

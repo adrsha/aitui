@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::agent::{PermissionMemory, ToolCall, ToolResult};
+use crate::agent::{AccessVerdict, PermissionMemory, ToolCall, ToolResult};
 use crate::api::{ApiClient, StreamEvent};
 use crate::app::input_buffer::InputBuffer;
 use crate::app::overlay::{sync_auto_approvals, Mention, Overlay};
@@ -68,12 +68,22 @@ pub struct TodoItem {
     pub status: TodoStatus,
 }
 
+/// A tool-call batch awaiting a judgment from the access-policy judge model. Held
+/// while the async call is in flight; verdicts arrive via `AccessJudged`.
+pub struct JudgeBatch {
+    pub session_id: usize,
+    pub calls: Vec<ToolCall>,
+}
+
 /// A model stream tagged with the session it belongs to, so several sessions can
 /// generate concurrently and events route to the right one regardless of which is
 /// currently on screen.
 pub struct StreamHandle {
     pub session_id: usize,
     pub rx: mpsc::Receiver<StreamEvent>,
+    /// Number of times this exact turn has been restarted before any visible
+    /// token/reasoning/tool event arrived.
+    pub cold_retries: u8,
 }
 
 /// A request to leave the TUI, run an external program, then return. Handled by
@@ -88,11 +98,19 @@ pub enum PendingExternal {
     /// contents back (the file is written before this is set). Used to edit a
     /// pending permission batch; the contents return via `AgentPermissionEdited`.
     EditReadback(PathBuf),
+    /// Open an already-written temp file in `$EDITOR`, then read it back as the new
+    /// session access policy (contents return via `SetAccessPolicy`).
+    PolicyReadback(PathBuf),
+    /// Open a pre-written temp file in `$EDITOR`, then read it back as an autonomous
+    /// loop spec (goal / stop / max), returned via `StartLoopSpec`.
+    LoopReadback(PathBuf),
     /// Drop into an interactive `$SHELL`.
     Shell,
 }
 
 pub struct App {
+    // TODO(audit): split long-lived UI/session/agent/network state into smaller
+    // structs so reducer/effects invariants can be tested without constructing all of App.
     pub config: Config,
     pub keymap: Keymap,
     pub sessions: SessionManager,
@@ -112,6 +130,8 @@ pub struct App {
     pub input_history_idx: Option<usize>,
     /// The in-progress text saved when history browsing begins, restored on exit.
     pub input_draft: String,
+    pub input_undo: Vec<InputBuffer>,
+    pub input_redo: Vec<InputBuffer>,
 
     pub overlay: Overlay,
     pub mention: Mention,
@@ -168,6 +188,14 @@ pub struct App {
 
     pub permissions: PermissionMemory,
     pub pending_tools: VecDeque<ToolCall>,
+    /// Calls already cleared to run (by the access-policy judge or a batch allow)
+    /// this round — drained ahead of `pending_tools` and executed WITHOUT a fresh
+    /// permission check, so a judged-allow never re-prompts or re-judges.
+    pub approved: VecDeque<ToolCall>,
+    /// The batch currently being judged against the session access policy, if any.
+    pub judging: Option<JudgeBatch>,
+    /// Verdicts stream back here from the async judge task, tagged with the session.
+    pub judge_rx: Option<mpsc::Receiver<(usize, Vec<AccessVerdict>)>>,
     pub agent_iterations: usize,
     /// Which session the in-progress agent tool round belongs to (rounds are
     /// serialized; a background session that finishes needing tools waits its turn).
@@ -269,6 +297,8 @@ impl App {
             input_history: Vec::new(),
             input_history_idx: None,
             input_draft: String::new(),
+            input_undo: Vec::new(),
+            input_redo: Vec::new(),
             overlay: Overlay::None,
             mention: Mention::default(),
             pastes: Vec::new(),
@@ -297,6 +327,9 @@ impl App {
             content_rev: 0,
             permissions: PermissionMemory::default(),
             pending_tools: VecDeque::new(),
+            approved: VecDeque::new(),
+            judging: None,
+            judge_rx: None,
             agent_iterations: 0,
             streams: Vec::new(),
             agent_session: None,
@@ -343,7 +376,34 @@ impl App {
     }
 
     pub fn theme(&self) -> Theme {
-        Theme::default()
+        Theme::named(&self.config.ui.theme)
+    }
+
+    /// Geometry + label of the "↓ N below" jump pill (bottom-right of the chat
+    /// pane), or `None` when the tail is already visible so no pill shows. Shared by
+    /// the renderer (to draw it) and the click handler (to hit-test it), so the two
+    /// can never drift out of sync.
+    pub fn jump_pill(&self) -> Option<(ratatui::layout::Rect, String)> {
+        let chat = self.layout.chat;
+        if chat.height == 0 {
+            return None;
+        }
+        let hidden = self.chat.rows_below(chat.height as usize);
+        if hidden == 0 {
+            return None;
+        }
+        let label = format!(" ↓ {} below · {} ", hidden, self.keymap.scroll_bottom.label());
+        let w = (label.chars().count() as u16).min(chat.width);
+        if w == 0 {
+            return None;
+        }
+        let rect = ratatui::layout::Rect {
+            x: chat.x + chat.width.saturating_sub(w),
+            y: chat.y + chat.height - 1,
+            width: w,
+            height: 1,
+        };
+        Some((rect, label))
     }
 
     pub fn current_model(&self) -> &str {
@@ -367,8 +427,11 @@ impl App {
         let active = self.sessions.active_id();
         self.sessions.active().is_streaming()
             || self.streams.iter().any(|s| s.session_id == active)
+            || self.judging.as_ref().is_some_and(|j| j.session_id == active)
             || (self.agent_session == Some(active)
-                && (self.agent_tool_rx.is_some() || !self.pending_tools.is_empty()))
+                && (self.agent_tool_rx.is_some()
+                    || !self.pending_tools.is_empty()
+                    || !self.approved.is_empty()))
             || matches!(
                 self.overlay,
                 Overlay::Permission(_) | Overlay::Decision(_) | Overlay::Plan(_)

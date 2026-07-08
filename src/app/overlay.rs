@@ -244,162 +244,10 @@ impl Picker {
     }
 }
 
-/// A discoverable slash command.
-#[derive(Debug, Clone, Copy)]
-pub struct SlashCommand {
-    pub name: &'static str,
-    pub icon: &'static str,
-    pub desc: &'static str,
-    pub run: &'static str,
-}
+pub use crate::app::commands::SlashCommand;
 
-pub fn slash_commands() -> &'static [SlashCommand] {
-    &[
-        SlashCommand {
-            name: "send",
-            icon: "▸",
-            desc: "Send the message",
-            run: "w",
-        },
-        SlashCommand {
-            name: "agent",
-            icon: "◇",
-            desc: "Toggle agent (tool-using) mode",
-            run: "agent",
-        },
-        SlashCommand {
-            name: "mock",
-            icon: "⚗",
-            desc: "Toggle offline mock/test mode",
-            run: "mock",
-        },
-        SlashCommand {
-            name: "model",
-            icon: "◆",
-            desc: "Pick the model",
-            run: "models",
-        },
-        SlashCommand {
-            name: "attach",
-            icon: "▤",
-            desc: "Attach a file",
-            run: "files",
-        },
-        SlashCommand {
-            name: "new",
-            icon: "+",
-            desc: "Start a new session",
-            run: "new",
-        },
-        SlashCommand {
-            name: "fork",
-            icon: "⑂",
-            desc: "Fork this session into a parallel branch",
-            run: "fork",
-        },
-        SlashCommand {
-            name: "retry",
-            icon: "↻",
-            desc: "Regenerate the last reply",
-            run: "retry",
-        },
-        SlashCommand {
-            name: "edit-last",
-            icon: "✎",
-            desc: "Edit your last message and resend",
-            run: "edit-last",
-        },
-        SlashCommand {
-            name: "copy",
-            icon: "⧉",
-            desc: "Copy the last reply to the clipboard",
-            run: "copy",
-        },
-        SlashCommand {
-            name: "copy-code",
-            icon: "⧉",
-            desc: "Copy the last code block to the clipboard",
-            run: "copy-code",
-        },
-        SlashCommand {
-            name: "effort",
-            icon: "🧠",
-            desc: "Cycle reasoning effort (low/medium/high/off)",
-            run: "effort",
-        },
-        SlashCommand {
-            name: "sessions",
-            icon: "≡",
-            desc: "Switch session",
-            run: "sessions",
-        },
-        SlashCommand {
-            name: "skills",
-            icon: "✦",
-            desc: "Toggle skills (personas / instructions)",
-            run: "skills",
-        },
-        SlashCommand {
-            name: "editor",
-            icon: "⌨",
-            desc: "Open conversation in $EDITOR",
-            run: "editor",
-        },
-        SlashCommand {
-            name: "edit",
-            icon: "✎",
-            desc: "Open a file in $EDITOR (edited files first)",
-            run: "edit",
-        },
-        SlashCommand {
-            name: "shell",
-            icon: "▮",
-            desc: "Drop into a shell, then return",
-            run: "shell",
-        },
-        SlashCommand {
-            name: "rename",
-            icon: "✎",
-            desc: "Rename the current session",
-            run: "rename ",
-        },
-        SlashCommand {
-            name: "clear",
-            icon: "⌫",
-            desc: "Clear the conversation",
-            run: "clear",
-        },
-        SlashCommand {
-            name: "setup",
-            icon: "🔑",
-            desc: "Set API endpoint URL + key",
-            run: "setup",
-        },
-        SlashCommand {
-            name: "settings",
-            icon: "⚙",
-            desc: "Open settings",
-            run: "settings",
-        },
-        SlashCommand {
-            name: "system",
-            icon: "✦",
-            desc: "Edit the system prompt",
-            run: "settings",
-        },
-        SlashCommand {
-            name: "help",
-            icon: "?",
-            desc: "Keybinding help",
-            run: "help",
-        },
-        SlashCommand {
-            name: "quit",
-            icon: "⏻",
-            desc: "Quit",
-            run: "quit",
-        },
-    ]
+pub fn slash_commands() -> Vec<&'static SlashCommand> {
+    crate::app::commands::slash_commands().collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -435,7 +283,7 @@ impl Palette {
     pub fn selected_cmd(&self) -> Option<&'static SlashCommand> {
         self.filtered
             .get(self.selected)
-            .map(|&i| &slash_commands()[i])
+            .and_then(|&i| slash_commands().get(i).copied())
     }
     pub fn up(&mut self) {
         self.selected = self.selected.saturating_sub(1);

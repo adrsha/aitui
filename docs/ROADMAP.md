@@ -31,7 +31,7 @@ The architectural foundation. _Done (commits `85a173a`, `47eb13f`)._
 Finish migrating the monolithic renderer into clean `ui/` widgets and delete the
 dead `render/`-side duplicates.
 
-- [ ] Decide the boundary: `render/` = document model (blocks→rows), `ui/` = widgets. Document it in `ARCHITECTURE.md`.
+- [x] Decide the boundary: `render/` = document model (blocks→rows), `ui/` = widgets. Document it in `ARCHITECTURE.md`.
 - [ ] Port remaining rendering into `ui/{chat,sidebar,input,statusbar,overlay,help}`
 - [x] Remove dead `render::chat::render` / `apply_cursor` / unused helpers
 - [x] Clear all unused-import / dead-code warnings (build is now warning-clean)
@@ -66,7 +66,9 @@ mock mode still work on the fenced path.
 Make the agent something you can let run.
 
 - [ ] Diff preview in the permission prompt for `write_file` / `edit_file`
-- [ ] `edit_file`: require a unique match (error on 0 or >1) or take an occurrence index
+- [x] Composer auto-sizes by wrapped visual rows so long single-line prompts remain visible up to the configured input-height cap
+- [x] Manual model-list reload command (`:reload-models` / `:models-reload`)
+- [x] `edit_file`: require a unique match (error on 0 or >1) before replacing
 - [ ] Path sandboxing: confine tool paths to the project root by default; explicit opt-out
 - [ ] `run_shell`: timeout, output cap (already 8 KiB), and a clear "this runs arbitrary commands" gate
 - [ ] Cancel an in-flight tool / agent round cleanly (`AgentCancel` mid-execution)

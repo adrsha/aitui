@@ -244,6 +244,25 @@ pub struct ImageData {
     pub revised_prompt: Option<String>,
 }
 
+/// A non-streaming chat completion response (used by the access-policy judge,
+/// which needs a single short answer, not a token stream).
+#[derive(Debug, Deserialize)]
+pub struct ChatResponse {
+    #[serde(default)]
+    pub choices: Vec<ChatChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatChoice {
+    pub message: ChatResponseMessage,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatResponseMessage {
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
 /// Token accounting reported by the endpoint at the end of a stream.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct Usage {

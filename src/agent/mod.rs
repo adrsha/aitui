@@ -1,7 +1,9 @@
+pub mod access;
 pub mod executor;
 pub mod parser;
 pub mod tools;
 
+pub use access::{describe_call, needs_hard_prompt, AccessVerdict};
 pub use tools::{
     agent_system_prompt, Permission, PermissionDecision, PermissionMemory, PermissionScope,
     ToolCall, ToolResult,

@@ -16,6 +16,7 @@ pub enum Dir {
     Down,
     WordForward,
     WordBackward,
+    WordEnd,
 }
 
 #[derive(Debug)]
@@ -42,6 +43,17 @@ pub enum Action {
     /// Visual-mode: delete the selection and enter insert.
     VisualChange,
     DeleteLine,
+    ChangeLine,
+    DeleteTo(Dir),
+    ChangeTo(Dir),
+    DeleteToLineEnd,
+    ChangeToLineEnd,
+    YankToLineEnd,
+    YankTo(Dir),
+    OpenLineBelow,
+    OpenLineAbove,
+    UndoInput,
+    RedoInput,
     YankLine,
     Paste,
     /// A bracketed paste from the terminal. Large → saved to a file and attached;
@@ -49,6 +61,7 @@ pub enum Action {
     PasteText(String),
     Move(Dir),
     LineStart,
+    FirstNonBlank,
     LineEnd,
 
     // Command palette — `:`/`/` open an overlay; RunCommand runs the typed line.
@@ -73,10 +86,16 @@ pub enum Action {
     CancelStream,
     /// Attach a new stream for the given session id.
     AttachStream(usize, mpsc::Receiver<StreamEvent>),
+    /// Attach a restarted stream for the same turn, preserving the cold retry count.
+    RetryStream(usize, u8),
+    /// Attach a restarted stream for the given session id.
+    AttachRetriedStream(usize, mpsc::Receiver<StreamEvent>, u8),
     /// Stream events, each tagged with the session id they belong to.
     StreamToken(usize, String),
     StreamReasoning(usize, String),
     StreamUsage(usize, crate::api::Usage),
+    /// Native tool-call metadata arrived before the complete runnable call.
+    StreamToolCallStarted(usize, String),
     StreamDone(usize),
     StreamError(usize, String),
     /// Start (or queue) the agent tool round for a session whose stream was cut
@@ -145,6 +164,7 @@ pub enum Action {
     SelectModel(String),
     NextModel,
     PrevModel,
+    ReloadModels,
     ModelsLoaded(Vec<String>),
     /// The `/v1/models` fetch failed (connection/timeout) — fall back to mock.
     ModelsFailed,
@@ -191,6 +211,21 @@ pub enum Action {
     AgentPermissionEdit,
     /// The edited permission buffer came back from `$EDITOR`; apply it.
     AgentPermissionEdited(String),
+    /// Set (or clear, when empty) the natural-language session access policy the
+    /// judge model uses to auto-allow/deny tool calls.
+    SetAccessPolicy(String),
+    /// Open `$EDITOR` to write/revise the session access policy (from the prompt).
+    AgentEditPolicy,
+    /// The judge model's verdicts for the in-flight batch came back (per-call).
+    AccessJudged(usize, Vec<crate::agent::AccessVerdict>),
+    /// Start an autonomous loop with the given goal (default stop criteria + cap).
+    StartLoop(String),
+    /// Open `$EDITOR` to specify a loop (goal / stop criteria / max iterations).
+    AgentEditLoop,
+    /// The loop spec came back from `$EDITOR`; parse its fields and start the loop.
+    StartLoopSpec(String),
+    /// Stop the active session's autonomous loop.
+    StopLoop,
     AgentDecisionToggle,
     AgentResolveDecision,
     AgentPlanEdit,

@@ -40,7 +40,7 @@ fn render_notice(f: &mut Frame, title: &str, body: &str, theme: &Theme) {
     lines.push(Line::from(Span::styled(
         "Press any key to dismiss",
         Style::default()
-            .fg(theme.faint)
+            .fg(theme.accent)
             .add_modifier(Modifier::ITALIC),
     )));
     f.render_widget(
@@ -127,7 +127,7 @@ fn render_browser(f: &mut Frame, b: &FileBrowser, theme: &Theme) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint,
-            Style::default().fg(theme.faint),
+            Style::default().fg(theme.accent),
         ))),
         Rect {
             x: inner.x,
@@ -156,7 +156,7 @@ fn render_startup(f: &mut Frame, app: &App, s: &Startup, theme: &Theme) {
     };
     items.push(ListItem::new(Line::from(vec![
         Span::styled("  ＋  Start a new session", new_style),
-        Span::styled(format!("   {}", cwd), Style::default().fg(theme.faint)),
+        Span::styled(format!("   {}", cwd), Style::default().fg(theme.muted)),
     ])));
 
     for (i, sess) in app.sessions.all().iter().enumerate() {
@@ -174,7 +174,7 @@ fn render_startup(f: &mut Frame, app: &App, s: &Startup, theme: &Theme) {
         let meta = format!("   {} · {} msg", dir, sess.messages.len());
         items.push(ListItem::new(Line::from(vec![
             Span::styled(format!("  ≡  {}", sess.name), style),
-            Span::styled(meta, Style::default().fg(theme.faint)),
+            Span::styled(meta, Style::default().fg(theme.muted)),
         ])));
     }
 
@@ -193,7 +193,7 @@ fn render_startup(f: &mut Frame, app: &App, s: &Startup, theme: &Theme) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint,
-            Style::default().fg(theme.faint),
+            Style::default().fg(theme.accent),
         ))),
         Rect {
             x: inner.x,
@@ -418,10 +418,7 @@ fn render_permission(f: &mut Frame, req: &crate::app::overlay::PermissionRequest
     // Scroll affordances at the list's edges.
     if start > 0 {
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "▲ more (PgUp)",
-                Style::default().fg(theme.faint),
-            ))),
+            Paragraph::new(Line::from(Span::styled("▲ more (PgUp)", theme.subtle()))),
             Rect {
                 x: inner.x + inner.width.saturating_sub(14),
                 y: inner.y + 2,
@@ -432,10 +429,7 @@ fn render_permission(f: &mut Frame, req: &crate::app::overlay::PermissionRequest
     }
     if end < total {
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "▼ more (PgDn)",
-                Style::default().fg(theme.faint),
-            ))),
+            Paragraph::new(Line::from(Span::styled("▼ more (PgDn)", theme.subtle()))),
             Rect {
                 x: inner.x + inner.width.saturating_sub(14),
                 y: inner.y + 1 + list_h,
@@ -494,7 +488,7 @@ fn render_permission(f: &mut Frame, req: &crate::app::overlay::PermissionRequest
     // ── Shortcut legend (always visible) ────────────────────────────────────────
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ option · PgUp/PgDn scroll · a allow · d deny · e edit in $EDITOR · ⏎ run · Esc cancel",
+            "↑↓ option · PgUp/PgDn scroll · a allow · d deny · e edit · p set policy · ⏎ run · Esc cancel",
             Style::default().fg(theme.accent),
         ))),
         Rect {
@@ -533,10 +527,7 @@ fn command_lines(
                 format!("▸ {} {}. {}", icon, i + 1, name),
                 Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!("   risk: {} · {}", risk, scope),
-                Style::default().fg(theme.faint),
-            ),
+            Span::styled(format!("   risk: {} · {}", risk, scope), theme.subtle()),
         ]));
         for key in call.editable_arg_keys() {
             let Some(val) = call.get_arg(key) else {
@@ -544,7 +535,7 @@ fn command_lines(
             };
             out.push(Line::from(Span::styled(
                 format!("    {}:", key),
-                Style::default().fg(theme.faint),
+                theme.subtle(),
             )));
             let lang = value_lang(call, key);
             out.extend(value_lines(&lang, val, 6, width, theme));
@@ -684,7 +675,7 @@ fn render_decision(f: &mut Frame, req: &DecisionRequest, theme: &Theme) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint,
-            Style::default().fg(theme.faint),
+            Style::default().fg(theme.accent),
         ))),
         Rect {
             x: inner.x,
@@ -849,7 +840,7 @@ fn render_api_setup(f: &mut Frame, s: &ApiSetup, theme: &Theme) {
         Line::from(Span::styled(
             "Tab switch field · ⏎ save · Esc cancel",
             Style::default()
-                .fg(theme.faint)
+                .fg(theme.accent)
                 .add_modifier(Modifier::ITALIC),
         )),
     ];

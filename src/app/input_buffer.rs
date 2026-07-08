@@ -26,6 +26,14 @@ impl Default for InputBuffer {
     }
 }
 
+fn ordered_bounds(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usize, usize)) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
 impl InputBuffer {
     pub fn text(&self) -> String {
         self.lines.join("\n")
@@ -36,6 +44,7 @@ impl InputBuffer {
         self.lines = vec![String::new()];
         self.row = 0;
         self.col = 0;
+        self.end_visual();
         t
     }
 
@@ -52,6 +61,7 @@ impl InputBuffer {
         };
         self.row = self.lines.len() - 1;
         self.col = self.lines[self.row].chars().count();
+        self.end_visual();
     }
 
     // ── Visual-mode selection ────────────────────────────────────────────────
@@ -133,17 +143,67 @@ impl InputBuffer {
             return String::new();
         };
         let text = self.selection_text();
+        self.delete_range((r0, c0), (r1, c1), true);
+        self.visual_anchor = None;
+        text
+    }
+
+    pub fn range_text(&self, a: (usize, usize), b: (usize, usize), inclusive: bool) -> String {
+        let ((r0, c0), (r1, c1)) = ordered_bounds(a, b);
+        if r0 >= self.lines.len() || r1 >= self.lines.len() {
+            return String::new();
+        }
         if r0 == r1 {
-            let from = Self::byte_idx(&self.lines[r0], c0);
-            let to = Self::byte_idx(&self.lines[r0], (c1 + 1).min(self.line_chars(r0)));
+            let chars: Vec<char> = self.lines[r0].chars().collect();
+            let end = if inclusive { c1 + 1 } else { c1 }.min(chars.len());
+            return chars
+                .get(c0.min(chars.len())..end)
+                .map(|s| s.iter().collect())
+                .unwrap_or_default();
+        }
+        let mut out = String::new();
+        for r in r0..=r1 {
+            let chars: Vec<char> = self.lines[r].chars().collect();
+            let (s, e) = if r == r0 {
+                (c0.min(chars.len()), chars.len())
+            } else if r == r1 {
+                let end = if inclusive { c1 + 1 } else { c1 }.min(chars.len());
+                (0, end)
+            } else {
+                (0, chars.len())
+            };
+            out.extend(chars.get(s..e).unwrap_or(&[]).iter());
+            if r != r1 {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    pub fn delete_range(
+        &mut self,
+        a: (usize, usize),
+        b: (usize, usize),
+        inclusive: bool,
+    ) -> String {
+        let text = self.range_text(a, b, inclusive);
+        let ((r0, c0), (r1, c1)) = ordered_bounds(a, b);
+        if r0 >= self.lines.len() || r1 >= self.lines.len() || text.is_empty() {
+            return text;
+        }
+        if r0 == r1 {
+            let from = Self::byte_idx(&self.lines[r0], c0.min(self.line_chars(r0)));
+            let end_col = if inclusive { c1 + 1 } else { c1 }.min(self.line_chars(r0));
+            let to = Self::byte_idx(&self.lines[r0], end_col);
             self.lines[r0].replace_range(from..to, "");
         } else {
             let head = {
-                let b = Self::byte_idx(&self.lines[r0], c0);
+                let b = Self::byte_idx(&self.lines[r0], c0.min(self.line_chars(r0)));
                 self.lines[r0][..b].to_string()
             };
             let tail = {
-                let b = Self::byte_idx(&self.lines[r1], (c1 + 1).min(self.line_chars(r1)));
+                let end_col = if inclusive { c1 + 1 } else { c1 }.min(self.line_chars(r1));
+                let b = Self::byte_idx(&self.lines[r1], end_col);
                 self.lines[r1][b..].to_string()
             };
             self.lines.drain(r0..=r1);
@@ -154,8 +214,43 @@ impl InputBuffer {
         }
         self.row = r0.min(self.lines.len() - 1);
         self.col = c0.min(self.line_chars(self.row));
-        self.visual_anchor = None;
         text
+    }
+
+    pub fn change_line(&mut self) -> String {
+        let text = self.yank_line();
+        if let Some(line) = self.lines.get_mut(self.row) {
+            line.clear();
+        }
+        self.col = 0;
+        text
+    }
+
+    pub fn delete_to_line_end(&mut self) -> String {
+        let len = self.line_chars(self.row);
+        if self.col >= len {
+            return String::new();
+        }
+        self.delete_range((self.row, self.col), (self.row, len), false)
+    }
+
+    pub fn change_to_line_end(&mut self) -> String {
+        self.delete_to_line_end()
+    }
+
+    pub fn open_line_below(&mut self) {
+        self.row += 1;
+        self.lines.insert(self.row, String::new());
+        self.col = 0;
+    }
+
+    pub fn open_line_above(&mut self) {
+        self.lines.insert(self.row, String::new());
+        self.col = 0;
+    }
+
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.row, self.col)
     }
 
     fn line_chars(&self, row: usize) -> usize {
@@ -303,6 +398,10 @@ impl InputBuffer {
     pub fn line_start(&mut self) {
         self.col = 0;
     }
+    pub fn first_nonblank(&mut self) {
+        let chars: Vec<char> = self.lines[self.row].chars().collect();
+        self.col = chars.iter().position(|c| !c.is_whitespace()).unwrap_or(0);
+    }
     pub fn line_end(&mut self) {
         self.col = self.line_chars(self.row).saturating_sub(1);
     }
@@ -314,6 +413,25 @@ impl InputBuffer {
             c += 1;
         }
         while c < chars.len() && chars[c].is_whitespace() {
+            c += 1;
+        }
+        self.col = c;
+    }
+    pub fn word_end(&mut self) {
+        let chars: Vec<char> = self.lines[self.row].chars().collect();
+        if chars.is_empty() {
+            self.col = 0;
+            return;
+        }
+        let mut c = (self.col + 1).min(chars.len() - 1);
+        while c < chars.len() && chars[c].is_whitespace() {
+            c += 1;
+        }
+        if c >= chars.len() {
+            self.col = chars.len() - 1;
+            return;
+        }
+        while c + 1 < chars.len() && !chars[c + 1].is_whitespace() {
             c += 1;
         }
         self.col = c;
@@ -457,5 +575,22 @@ mod tests {
         assert_eq!(b.col, 8);
         b.word_backward();
         assert_eq!(b.col, 4);
+        b.word_end();
+        assert_eq!(b.col, 6);
+    }
+
+    #[test]
+    fn delete_range_and_open_lines() {
+        let mut b = InputBuffer::default();
+        b.set_text("hello world");
+        let removed = b.delete_range((0, 0), (0, 4), true);
+        assert_eq!(removed, "hello");
+        assert_eq!(b.text(), " world");
+        b.open_line_below();
+        assert_eq!(b.text(), " world\n");
+        assert_eq!((b.row, b.col), (1, 0));
+        b.open_line_above();
+        assert_eq!(b.text(), " world\n\n");
+        assert_eq!((b.row, b.col), (1, 0));
     }
 }

@@ -47,7 +47,11 @@ changed rather than spinning at a fixed frame rate.
 
 `dispatch()` runs a small work-queue: it applies each action and pushes any
 follow-up action returned by the reducer, so one keystroke can fan out into a
-short deterministic chain (e.g. `Submit → AttachStream`).
+short deterministic chain (e.g. `Submit → AttachStream`). Model discovery follows
+the same reducer/effect split: startup, API setup, and `:reload-models` call
+`App::refresh_models()`, which flips the model chip to loading and spawns a
+`/v1/models` fetch whose result is drained by the main loop into `ModelsLoaded` or
+`ModelsFailed`.
 
 > The tokio runtime is entered via `_guard`; the loop stays synchronous and
 > offloads async work to spawned tasks. The redraw is gated on change, so idle
@@ -90,6 +94,28 @@ short deterministic chain (e.g. `Submit → AttachStream`).
 | **`files/`** | File reading + image encoding (base64) for attachments. |
 | `input/handler.rs` | Event → `Action` translation (focus- and mode-aware). |
 | `input/vim.rs` | `VimMode` enum and helpers (Normal/Insert/Visual/Command/Operator). |
+
+### Render/UI boundary
+
+Rendering is split into two layers with a hard ownership line:
+
+- `render/` owns the terminal-independent document model. It converts session
+  messages into wrapped `RenderedLine`s, records link spans, and maintains chat
+  scroll/cursor/cache state. It must not draw Ratatui widgets or know about frame
+  layout.
+- `ui/` owns Ratatui presentation. It splits the frame, composes panels, applies
+  borders/status/help/overlays, and paints `render/`'s document rows into widgets.
+  It must not parse message bodies, wrap markdown/code, or duplicate chat-document
+  construction.
+
+The intended data flow is one-way:
+
+```text
+Session messages → domain::blocks → render::document/chat → ui::{chat,...} → Frame
+```
+
+That boundary keeps parsing/wrapping testable without a terminal backend and keeps
+widget layout changes from creating a second rendering path.
 
 ## Key data flows
 
@@ -156,4 +182,5 @@ the whole cache. This keeps streaming cost flat regardless of conversation lengt
 - **Prompt-fenced tools:** the agent depends on the model emitting ```` ```tool ````
   blocks; brittle vs. native function-calling. Schemas exist but are unused.
 - **No request timeout / retry / cancellation mid-tool.**
-- **`edit_file` replaces all occurrences** (`str::replace`), not a unique match.
+- **Path sandboxing:** file tools resolve relative paths against the session cwd,
+  but absolute paths / `..` escapes are not confined yet (see CODE_AUDIT).

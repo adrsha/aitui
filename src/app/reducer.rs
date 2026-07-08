@@ -10,6 +10,7 @@ use crate::app::overlay::{
     BrowsePurpose, FileBrowser, Overlay, Picker, PickerKind, Settings, SettingsRow,
 };
 use crate::app::state::{App, PendingExternal};
+use crate::domain::session::LoopState;
 use crate::input::vim::VimMode;
 
 impl App {
@@ -17,7 +18,77 @@ impl App {
         self.layout.chat.height.saturating_sub(2) as usize
     }
 
+    fn snapshot_input(&mut self) {
+        self.input_undo.push(self.input.clone());
+        if self.input_undo.len() > 200 {
+            self.input_undo.remove(0);
+        }
+        self.input_redo.clear();
+    }
+
+    fn undo_input(&mut self) {
+        if let Some(prev) = self.input_undo.pop() {
+            self.input_redo.push(self.input.clone());
+            self.input = prev;
+            self.input.end_visual();
+            self.update_mention();
+        }
+    }
+
+    fn redo_input(&mut self) {
+        if let Some(next) = self.input_redo.pop() {
+            self.input_undo.push(self.input.clone());
+            self.input = next;
+            self.input.end_visual();
+            self.update_mention();
+        }
+    }
+
+    fn motion_target(&self, dir: Dir) -> ((usize, usize), bool) {
+        let mut probe = self.input.clone();
+        match dir {
+            Dir::Left => probe.left(),
+            Dir::Right => probe.right(),
+            Dir::Up => probe.up(),
+            Dir::Down => probe.down(),
+            Dir::WordForward => probe.word_forward(),
+            Dir::WordBackward => probe.word_backward(),
+            Dir::WordEnd => probe.word_end(),
+        }
+        let inclusive = matches!(dir, Dir::WordEnd | Dir::Left | Dir::Right);
+        (probe.cursor(), inclusive)
+    }
+
+    fn yank_to(&mut self, dir: Dir) {
+        let start = self.input.cursor();
+        let (end, inclusive) = self.motion_target(dir);
+        let text = self.input.range_text(start, end, inclusive);
+        self.set_yank(text);
+        self.vim = VimMode::Normal;
+    }
+
+    fn delete_to(&mut self, dir: Dir, insert_after: bool) {
+        let start = self.input.cursor();
+        let (end, inclusive) = self.motion_target(dir);
+        if start != end {
+            self.snapshot_input();
+            let text = self.input.delete_range(start, end, inclusive);
+            self.set_yank(text);
+            self.update_mention();
+        }
+        self.vim = if insert_after {
+            VimMode::Insert
+        } else {
+            VimMode::Normal
+        };
+        if !insert_after {
+            self.input.clamp_normal();
+        }
+    }
+
     pub fn apply(&mut self, action: Action) -> Option<Action> {
+        // TODO(audit): break this reducer into domain-specific reducers once new
+        // action families are added; this match is already the central change bottleneck.
         match action {
             Action::Quit => {
                 // Persist the live composer draft with the session before exiting.
@@ -76,38 +147,100 @@ impl App {
 
             // ── Input editing ───────────────────────────────────────────────
             Action::InsertChar(c) => {
+                self.snapshot_input();
                 self.input.insert_char(c);
                 self.update_mention();
                 self.last_insert = Some(c); // track for the jk-style chord
             }
             Action::Newline => {
+                self.snapshot_input();
                 self.mention.reset();
                 self.input.insert_newline();
                 self.last_insert = None;
             }
             Action::Backspace => {
+                self.snapshot_input();
                 self.input.backspace();
                 self.update_mention();
                 self.last_insert = None;
             }
             Action::DeleteWordBack => {
+                self.snapshot_input();
                 self.input.delete_word_back();
                 self.update_mention();
                 self.last_insert = None;
             }
             Action::DeleteWordForward => {
+                self.snapshot_input();
                 self.input.delete_word_forward();
                 self.update_mention();
             }
-            Action::DeleteAt => self.input.delete_at(),
-            Action::DeleteLine => self.input.delete_line(),
+            Action::DeleteAt => {
+                self.snapshot_input();
+                self.input.delete_at();
+                self.update_mention();
+            }
+            Action::DeleteLine => {
+                self.snapshot_input();
+                let line = self.input.yank_line();
+                self.input.delete_line();
+                self.set_yank(line);
+                self.update_mention();
+            }
+            Action::ChangeLine => {
+                self.snapshot_input();
+                let line = self.input.change_line();
+                self.set_yank(line);
+                self.vim = VimMode::Insert;
+                self.update_mention();
+            }
+            Action::DeleteTo(dir) => self.delete_to(dir, false),
+            Action::ChangeTo(dir) => self.delete_to(dir, true),
+            Action::DeleteToLineEnd => {
+                self.snapshot_input();
+                let text = self.input.delete_to_line_end();
+                self.set_yank(text);
+                self.input.clamp_normal();
+                self.update_mention();
+            }
+            Action::ChangeToLineEnd => {
+                self.snapshot_input();
+                let text = self.input.change_to_line_end();
+                self.set_yank(text);
+                self.vim = VimMode::Insert;
+                self.update_mention();
+            }
+            Action::YankToLineEnd => {
+                let start = self.input.cursor();
+                let end = (self.input.row, self.input.current_line().chars().count());
+                let text = self.input.range_text(start, end, false);
+                self.set_yank(text);
+                self.vim = VimMode::Normal;
+            }
+            Action::YankTo(dir) => self.yank_to(dir),
+            Action::OpenLineBelow => {
+                self.snapshot_input();
+                self.input.open_line_below();
+                self.vim = VimMode::Insert;
+                self.update_mention();
+            }
+            Action::OpenLineAbove => {
+                self.snapshot_input();
+                self.input.open_line_above();
+                self.vim = VimMode::Insert;
+                self.update_mention();
+            }
+            Action::UndoInput => self.undo_input(),
+            Action::RedoInput => self.redo_input(),
             Action::YankLine => {
                 let line = self.input.yank_line();
                 self.set_yank(line);
             }
             Action::Paste => {
                 if let Some(t) = self.yank.clone() {
+                    self.snapshot_input();
                     self.input.paste(&t);
+                    self.update_mention();
                 }
             }
             Action::PasteText(t) => self.smart_paste(t),
@@ -118,8 +251,10 @@ impl App {
                 Dir::Down => self.input.down(),
                 Dir::WordForward => self.input.word_forward(),
                 Dir::WordBackward => self.input.word_backward(),
+                Dir::WordEnd => self.input.word_end(),
             },
             Action::LineStart => self.input.line_start(),
+            Action::FirstNonBlank => self.input.first_nonblank(),
             Action::LineEnd => self.input.line_end(),
 
             // ── Command palette ─────────────────────────────────────────────
@@ -137,6 +272,17 @@ impl App {
                 self.streams.push(crate::app::state::StreamHandle {
                     session_id: sid,
                     rx,
+                    cold_retries: 0,
+                });
+            }
+            Action::RetryStream(sid, cold_retries) => {
+                return self.retry_cold_stream(sid, cold_retries)
+            }
+            Action::AttachRetriedStream(sid, rx, cold_retries) => {
+                self.streams.push(crate::app::state::StreamHandle {
+                    session_id: sid,
+                    rx,
+                    cold_retries,
                 });
             }
             Action::StreamToken(sid, t) => {
@@ -167,6 +313,13 @@ impl App {
                 self.touch();
             }
             Action::StreamUsage(_sid, u) => self.usage = Some(u),
+            Action::StreamToolCallStarted(sid, name) => {
+                if let Some(s) = self.sessions.by_id_mut(sid) {
+                    s.mark_stream_progress();
+                }
+                self.set_status(format!("Model is preparing tool call: {}", name));
+                self.touch();
+            }
             Action::StreamDone(sid) => {
                 if let Some(s) = self.sessions.by_id_mut(sid) {
                     s.finalize_assistant_stream();
@@ -224,10 +377,12 @@ impl App {
                 self.touch();
             }
             Action::CancelStream => {
-                // Cancel only the active session's stream.
+                // Cancel only the active session's stream. Also halt an autonomous
+                // loop on it — Ctrl-C is the user's "stop everything" for this session.
                 let active = self.sessions.active_id();
                 self.streams.retain(|h| h.session_id != active);
                 self.sessions.active_mut().finalize_assistant_stream();
+                self.stop_loop();
                 self.sessions.save();
                 self.touch();
             }
@@ -248,6 +403,18 @@ impl App {
                 self.touch();
             }
             Action::ChatClick(col, row) => {
+                // A click on the "↓ N below" jump pill snaps back to the live tail.
+                if let Some((pill, _)) = self.jump_pill() {
+                    if col >= pill.x
+                        && col < pill.x + pill.width
+                        && row >= pill.y
+                        && row < pill.y + pill.height
+                    {
+                        self.chat.bottom(self.chat_h());
+                        self.touch();
+                        return None;
+                    }
+                }
                 // Map the click to a transcript row and toggle the collapsible
                 // tool output whose header sits there. Ignore clicks outside the
                 // chat pane or on non-header rows.
@@ -436,13 +603,16 @@ impl App {
             Action::OpenSkillPicker => {
                 if matches!(&self.overlay, Overlay::Picker(p) if p.kind == PickerKind::Skill) {
                     self.overlay = Overlay::None;
-                } else if self.skills.is_empty() {
-                    self.set_status(format!(
-                        "No skills. Add .md files in {}",
-                        crate::skills::skills_dir().display()
-                    ));
                 } else {
-                    self.overlay = Overlay::Picker(Picker::skills(self.skill_items()));
+                    self.skills = crate::skills::reload_preserving_active(&self.skills);
+                    if self.skills.is_empty() {
+                        self.set_status(format!(
+                            "No skills. Add .md files in {}",
+                            crate::skills::skills_dir().display()
+                        ));
+                    } else {
+                        self.overlay = Overlay::Picker(Picker::skills(self.skill_items()));
+                    }
                 }
             }
             Action::ToggleSkill(i) => {
@@ -492,6 +662,10 @@ impl App {
                 if !self.models.is_empty() {
                     self.model_idx = (self.model_idx + self.models.len() - 1) % self.models.len();
                 }
+            }
+            Action::ReloadModels => {
+                self.refresh_models();
+                self.set_status("Reloading models…");
             }
             Action::ModelsLoaded(mut models) => {
                 use crate::app::state::{ModelLoad, MOCK_MODEL};
@@ -661,6 +835,55 @@ impl App {
                 }
             }
             Action::AgentPermissionEdited(text) => return self.apply_permission_edits(&text),
+            Action::SetAccessPolicy(text) => return self.set_access_policy(&text),
+            Action::AgentEditPolicy => {
+                // Write the current policy (with a header) to a temp file and open
+                // $EDITOR; the saved contents return as SetAccessPolicy.
+                let current = self.permissions.policy.clone().unwrap_or_default();
+                let seed = format!(
+                    "# Session access policy — describe, in plain language, what tool\n\
+                     # access to auto-allow this session. Lines starting with # are\n\
+                     # ignored. Save empty to clear the policy.\n\
+                     # e.g. \"Allow reads and searches anywhere, and any git or cargo\n\
+                     #       command. Ask before writing files or deleting anything.\"\n\
+                     {}\n",
+                    current
+                );
+                let path = std::env::temp_dir()
+                    .join(format!("aitui-policy-{}.txt", std::process::id()));
+                if std::fs::write(&path, seed).is_ok() {
+                    self.pending_external = Some(PendingExternal::PolicyReadback(path));
+                } else {
+                    self.set_status("Couldn't open editor — temp file write failed");
+                }
+            }
+            Action::AccessJudged(sid, verdicts) => {
+                return self.apply_access_verdicts(sid, verdicts)
+            }
+            Action::StartLoop(goal) => {
+                return self.start_loop(goal, String::new(), LoopState::DEFAULT_MAX)
+            }
+            Action::StartLoopSpec(text) => {
+                let (goal, stop, max) = parse_loop_spec(&text);
+                return self.start_loop(goal, stop, max);
+            }
+            Action::AgentEditLoop => {
+                let seed = "# Autonomous loop. Fill in and save; lines starting with # are ignored.\n\
+                            # The agent will keep working on GOAL each turn until STOP is met\n\
+                            # (it calls `finish`), you hit MAX iterations, or you press Ctrl-C.\n\
+                            GOAL: \n\
+                            STOP: \n\
+                            MAX: 25\n"
+                    .to_string();
+                let path = std::env::temp_dir()
+                    .join(format!("aitui-loop-{}.txt", std::process::id()));
+                if std::fs::write(&path, seed).is_ok() {
+                    self.pending_external = Some(PendingExternal::LoopReadback(path));
+                } else {
+                    self.set_status("Couldn't open editor — temp file write failed");
+                }
+            }
+            Action::StopLoop => self.stop_loop(),
             Action::AgentPlanEdit => {
                 if let Overlay::Plan(r) = &self.overlay {
                     self.pending_external =
@@ -675,8 +898,14 @@ impl App {
                 return self.process_next_tool();
             }
             Action::AgentCancel => {
+                // FIXME(audit): propagate cancellation to spawned tool/speculation tasks;
+                // clearing UI state does not stop already-running blocking work.
                 self.overlay = Overlay::None;
                 self.pending_tools.clear();
+                self.approved.clear();
+                // Drop any in-flight access judgment so its late verdicts no-op.
+                self.judging = None;
+                self.judge_rx = None;
                 self.active_tool = None;
                 self.agent_iterations = 0;
                 self.set_status("Agent round cancelled");
@@ -1011,6 +1240,10 @@ impl App {
         self.command_history_idx = None;
         self.command.clear();
 
+        if let Some(action) = crate::app::commands::exact_command_action(&cmd) {
+            return Some(action);
+        }
+
         match cmd.as_str() {
             "q" | "quit" => return Some(Action::Quit),
             "w" | "write" | "send" => return Some(Action::Submit),
@@ -1029,6 +1262,9 @@ impl App {
                 self.set_status("Chat cleared");
             }
             "models" | "model" => return Some(Action::OpenModelPicker),
+            "reload-models" | "models-reload" | "refresh-models" | "model-reload" => {
+                return Some(Action::ReloadModels)
+            }
             "files" | "attach" => return Some(Action::OpenFilePicker),
             "detach" | "noattach" => return Some(Action::ClearAttachment),
             "agent" | "agentmode" => return Some(Action::ToggleAgentMode),
@@ -1097,6 +1333,16 @@ impl App {
             "shell" | "term" | "terminal" | "sh" => return Some(Action::OpenShell),
             "?" | "help" => return Some(Action::ToggleHelp),
             "nosystem" | "system" => return Some(Action::SetSystemPrompt(None)),
+            "loop" => return Some(Action::AgentEditLoop),
+            "loop stop" | "loopstop" | "noloop" | "unloop" => return Some(Action::StopLoop),
+            other if other.starts_with("loop ") => {
+                return Some(Action::StartLoop(other[5..].trim().to_string()))
+            }
+            "access" | "policy" => return Some(Action::AgentEditPolicy),
+            "noaccess" | "nopolicy" => return Some(Action::SetAccessPolicy(String::new())),
+            other if other.starts_with("access ") => {
+                return Some(Action::SetAccessPolicy(other[7..].trim().to_string()))
+            }
             other if other.starts_with("model ") => {
                 return Some(Action::SelectModel(other[6..].trim().to_string()))
             }
@@ -1135,6 +1381,29 @@ fn looks_like_base_url_error(err: &str) -> bool {
         || e.contains("without a base")
         || e.contains("builder error")
         || e.contains("no api client")
+}
+
+/// Parse a `GOAL:`/`STOP:`/`MAX:` loop spec (from the `:loop` editor form) into
+/// `(goal, stop, max)`. Comment (`#`) lines are ignored; a bad/absent MAX falls
+/// back to the default cap.
+fn parse_loop_spec(text: &str) -> (String, String, usize) {
+    let (mut goal, mut stop, mut max) = (String::new(), String::new(), LoopState::DEFAULT_MAX);
+    for line in text.lines() {
+        let l = line.trim_start();
+        if l.starts_with('#') {
+            continue;
+        }
+        if let Some(v) = l.strip_prefix("GOAL:") {
+            goal = v.trim().to_string();
+        } else if let Some(v) = l.strip_prefix("STOP:") {
+            stop = v.trim().to_string();
+        } else if let Some(v) = l.strip_prefix("MAX:") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                max = n.max(1);
+            }
+        }
+    }
+    (goal, stop, max)
 }
 
 /// Whether a stream error is the endpoint rejecting the request for exceeding the
@@ -1182,6 +1451,8 @@ mod tests {
             input_history: Vec::new(),
             input_history_idx: None,
             input_draft: String::new(),
+            input_undo: Vec::new(),
+            input_redo: Vec::new(),
             overlay: Overlay::None,
             mention: Mention::default(),
             pastes: Vec::new(),
@@ -1206,6 +1477,9 @@ mod tests {
             content_rev: 0,
             permissions: crate::agent::PermissionMemory::default(),
             pending_tools: VecDeque::new(),
+            approved: VecDeque::new(),
+            judging: None,
+            judge_rx: None,
             agent_iterations: 0,
             streams: Vec::new(),
             agent_session: None,
@@ -1224,6 +1498,121 @@ mod tests {
             layout: PanelLayout::default(),
             api: None,
         }
+    }
+
+    // ── Access-policy judging ───────────────────────────────────────────────────
+
+    fn tool_call(name: &str, args: serde_json::Value) -> crate::agent::ToolCall {
+        crate::agent::ToolCall {
+            name: name.to_string(),
+            args,
+            id: None,
+        }
+    }
+
+    #[test]
+    fn verdicts_route_allow_deny_and_floor_overrides_to_ask() {
+        use crate::agent::AccessVerdict;
+        use crate::app::state::JudgeBatch;
+
+        let mut app = test_app();
+        let sid = app.sessions.active_id();
+        app.agent_session = Some(sid);
+        let calls = vec![
+            tool_call("read", serde_json::json!({ "path": "a.rs" })),
+            tool_call("list", serde_json::json!({ "path": "." })),
+            tool_call("delete", serde_json::json!({ "path": "a.rs" })),
+        ];
+        app.judging = Some(JudgeBatch {
+            session_id: sid,
+            calls,
+        });
+        // Judge says allow all three — but delete is on the safety floor, so it must
+        // be forced to a human prompt regardless.
+        app.apply(Action::AccessJudged(
+            sid,
+            vec![
+                AccessVerdict::Allow,
+                AccessVerdict::Deny,
+                AccessVerdict::Allow,
+            ],
+        ));
+
+        // read → approved (queued to run), list → denied (skip result recorded),
+        // delete → floored → the permission prompt is shown for it.
+        assert_eq!(app.approved.len(), 1);
+        assert_eq!(app.approved.front().unwrap().name, "read");
+        assert!(matches!(app.overlay, Overlay::Permission(_)));
+        if let Overlay::Permission(req) = &app.overlay {
+            assert_eq!(req.calls.len(), 1);
+            assert_eq!(req.calls[0].name, "delete");
+        }
+        assert!(app.judging.is_none());
+    }
+
+    #[test]
+    fn stale_verdicts_for_wrong_session_are_ignored() {
+        use crate::agent::AccessVerdict;
+        use crate::app::state::JudgeBatch;
+
+        let mut app = test_app();
+        let sid = app.sessions.active_id();
+        app.judging = Some(JudgeBatch {
+            session_id: sid,
+            calls: vec![tool_call("read", serde_json::json!({ "path": "a.rs" }))],
+        });
+        app.apply(Action::AccessJudged(sid + 999, vec![AccessVerdict::Allow]));
+        // Wrong session id → the batch is dropped, nothing queued.
+        assert!(app.approved.is_empty());
+        assert!(app.judging.is_none());
+    }
+
+    #[test]
+    fn parse_loop_spec_reads_fields_and_defaults() {
+        let (g, s, m) = parse_loop_spec(
+            "# comment\nGOAL: make tests pass\nSTOP: cargo test is green\nMAX: 8\n",
+        );
+        assert_eq!(g, "make tests pass");
+        assert_eq!(s, "cargo test is green");
+        assert_eq!(m, 8);
+        // Missing MAX → default; blank goal stays blank.
+        let (g2, _, m2) = parse_loop_spec("GOAL: x\n");
+        assert_eq!(g2, "x");
+        assert_eq!(m2, LoopState::DEFAULT_MAX);
+    }
+
+    #[test]
+    fn start_loop_sets_state_and_seeds_goal() {
+        let mut app = test_app();
+        app.apply(Action::StartLoop("build the thing".into()));
+        let s = app.sessions.active();
+        assert!(s.loop_state.is_some());
+        assert!(s.agent_mode, "loop turns agent mode on");
+        assert_eq!(s.loop_state.as_ref().unwrap().goal, "build the thing");
+        // The goal was seeded as the first user turn.
+        assert!(s
+            .messages
+            .iter()
+            .any(|m| matches!(&m.content,
+                crate::api::models::MessageContent::Text(t) if t.contains("build the thing"))));
+    }
+
+    #[test]
+    fn stop_loop_clears_state() {
+        let mut app = test_app();
+        app.apply(Action::StartLoop("x".into()));
+        assert!(app.sessions.active().loop_state.is_some());
+        app.apply(Action::StopLoop);
+        assert!(app.sessions.active().loop_state.is_none());
+    }
+
+    #[test]
+    fn set_policy_then_clear_toggles_memory() {
+        let mut app = test_app();
+        app.apply(Action::SetAccessPolicy("allow all reads".into()));
+        assert_eq!(app.permissions.policy.as_deref(), Some("allow all reads"));
+        app.apply(Action::SetAccessPolicy(String::new()));
+        assert!(app.permissions.policy.is_none());
     }
 
     // ── Mode transitions ───────────────────────────────────────────────────────
@@ -1353,6 +1742,63 @@ mod tests {
         app.input.col = 5;
         app.apply(Action::Paste);
         assert_eq!(app.input.text(), "hello world");
+    }
+
+    #[test]
+    fn undo_and_redo_restore_input_states() {
+        let mut app = test_app();
+        app.apply(Action::InsertChar('a'));
+        app.apply(Action::InsertChar('b'));
+        assert_eq!(app.input.text(), "ab");
+        app.apply(Action::UndoInput);
+        assert_eq!(app.input.text(), "a");
+        app.apply(Action::RedoInput);
+        assert_eq!(app.input.text(), "ab");
+    }
+
+    #[test]
+    fn vim_delete_and_change_word_motions() {
+        let mut app = test_app();
+        app.input.set_text("hello world");
+        app.input.row = 0;
+        app.input.col = 0;
+        app.apply(Action::DeleteTo(Dir::WordForward));
+        assert_eq!(app.input.text(), "world");
+        assert_eq!(app.yank.as_deref(), Some("hello "));
+        app.input.set_text("hello world");
+        app.input.row = 0;
+        app.input.col = 0;
+        app.apply(Action::ChangeTo(Dir::WordForward));
+        assert_eq!(app.input.text(), "world");
+        assert_eq!(app.vim, VimMode::Insert);
+    }
+
+    #[test]
+    fn vim_delete_and_change_line_commands() {
+        let mut app = test_app();
+        app.input.set_text("one\ntwo");
+        app.input.row = 0;
+        app.apply(Action::DeleteLine);
+        assert_eq!(app.input.text(), "two");
+        assert_eq!(app.yank.as_deref(), Some("one"));
+        app.input.set_text("replace me");
+        app.apply(Action::ChangeLine);
+        assert_eq!(app.input.text(), "");
+        assert_eq!(app.vim, VimMode::Insert);
+    }
+
+    #[test]
+    fn vim_open_line_commands_enter_insert() {
+        let mut app = test_app();
+        app.input.set_text("one");
+        app.apply(Action::OpenLineBelow);
+        assert_eq!(app.input.text(), "one\n");
+        assert_eq!((app.input.row, app.input.col), (1, 0));
+        assert_eq!(app.vim, VimMode::Insert);
+        app.apply(Action::EnterNormal);
+        app.apply(Action::OpenLineAbove);
+        assert_eq!(app.input.text(), "one\n\n");
+        assert_eq!((app.input.row, app.input.col), (1, 0));
     }
 
     #[test]
@@ -1492,9 +1938,22 @@ mod tests {
 
     #[test]
     fn empty_skills_opens_no_picker() {
+        let base =
+            std::env::temp_dir().join(format!("aitui_empty_skills_{}_reducer", std::process::id()));
+        let old = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
+        std::fs::create_dir_all(base.join("aitui").join("skills")).unwrap();
+
         let mut app = test_app();
         app.skills.clear();
         app.apply(Action::OpenSkillPicker);
+
+        match old {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&base);
+
         assert!(matches!(app.overlay, Overlay::None));
     }
 
@@ -1636,6 +2095,7 @@ mod tests {
         app.streams.push(crate::app::state::StreamHandle {
             session_id: sid,
             rx: tokio::sync::mpsc::channel(1).1,
+            cold_retries: 0,
         });
         assert!(app.is_busy());
         let out = app.submit();
@@ -2351,6 +2811,7 @@ mod tests {
         app.streams.push(crate::app::state::StreamHandle {
             session_id: sid,
             rx: tokio::sync::mpsc::channel(1).1,
+            cold_retries: 0,
         });
     }
 

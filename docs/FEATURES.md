@@ -9,7 +9,7 @@ Status legend: ✅ done & working · 🟡 partial / needs polish · ⬜ not star
 | OpenAI-compatible chat completions | ✅ | `POST /v1/chat/completions`. |
 | Streaming (SSE) token rendering | ✅ | Incremental, sticks to bottom while generating. |
 | Reasoning / "thinking" stream | ✅ | Separate `reasoning`/`reasoning_content` deltas, rendered as collapsible `<think>`. |
-| Model listing from `/v1/models` | ✅ | Fetched async on startup, falls back to a default list. |
+| Model listing from `/v1/models` | ✅ | Fetched async on startup, falls back to a default list. `:reload-models` / `:models-reload` retries the fetch without restarting and keeps the current model selected when it still exists. |
 | Model picker (fuzzy) + cycle | ✅ | `Ctrl-M`, `:model`, palette. |
 | Request timeout / cancel mid-flight | 🟡 | `CancelStream` drops the receiver; no HTTP-level timeout/abort. |
 | Retry / backoff on transient errors | ⬜ | — |
@@ -36,6 +36,8 @@ Status legend: ✅ done & working · 🟡 partial / needs polish · ⬜ not star
 | Tool sandboxing / path-escape guards | ⬜ | Executor runs against cwd with no boundary checks. |
 | Diff / content preview for edits/writes | ✅ | `edit_file` renders a `-`/`+` diff at the call; write previews are collapsible (D-018). **On update**, the executor also emits a real old→new line diff in the tool *result* (`write_file`/`edit_file`/`append_file`, `line_diff` — common prefix/suffix stripped); tool-result output colours `+`/`-`/`@@` lines (green/red/accent), so `git diff` output is coloured too. New files report "Created", existing "Updated". |
 | `edit_file` unique-match safety | ⬜ | Replaces **all** occurrences via `str::replace`. |
+| Model-judged access policy | ✅ | `:access` (or `p` in the permission prompt) sets a natural-language policy; a fast judge model (`api.access_judge_model`, else the chat model) triages each uncovered tool batch → allow/deny/ask (`agent/access.rs`). **Safety floor** (`needs_hard_prompt`: delete, dangerous shell, mutations escaping cwd) always prompts regardless; any judge failure defaults to ask. Auto-allowed calls run without re-prompting. `⚖policy` status chip. |
+| Autonomous loop mode | ✅ | `:loop` (editor form: GOAL/STOP/MAX) or `:loop <goal>` runs the agent toward a goal across turns without waiting for you. After each plain-reply turn it either continues (injecting a nudge) or stops at the `MAX` iteration cap; the model ends it by calling the `finish` tool once the STOP criteria are met. Per-session, persisted (`Session.loop_state`); `⟳ loop k/max` chip; Ctrl-C / `:loop stop` halts. |
 
 ## Sessions & persistence
 
@@ -67,7 +69,7 @@ Status legend: ✅ done & working · 🟡 partial / needs polish · ⬜ not star
 | Vim file browser (Ctrl-E / Ctrl-F) | ✅ | h/j/k/l navigate, Space multi-select, Enter open-all (or current); l/Enter open file or enter dir, h parent. Both Ctrl-E (edit) and Ctrl-F (attach) toggle the browser open/closed; Ctrl-G also closes it. Edited files pre-selected. Opens in `$EDITOR` (multi-file) / attaches. |
 | Edited-files tracker | ✅ | Successful write/edit/append tracked (delete removes); status bar shows `✎N`; pre-selected in the Ctrl-E browser. |
 | Drop into a shell (Ctrl-G) | ✅ | Suspends TUI → `$SHELL` → returns (`:shell`/`:term`). |
-| Multi-line composer | ✅ | Enter sends (= `:w`); Shift/Alt-Enter inserts a newline (needs terminal keyboard-enhancement for Shift+Enter). |
+| Multi-line composer | ✅ | Enter sends (= `:w`); Shift/Alt-Enter inserts a newline (needs terminal keyboard-enhancement for Shift+Enter). The composer auto-sizes by wrapped visual rows, so a long single-line prompt expands up to the configured input-height cap instead of showing only the cursor tail. |
 | Command line (`:w`, `:q`, `:new`, …) | ✅ | With history + navigation. |
 | Command palette | ✅ | Fuzzy. |
 | `@path` file-mention completion | ✅ | Fuzzy file search, inlines file content on send. |
@@ -75,7 +77,7 @@ Status legend: ✅ done & working · 🟡 partial / needs polish · ⬜ not star
 | File attachment picker | ✅ | `Ctrl-F`; directory browsing. |
 | Image attachments (base64) | ✅ | png/jpeg/gif/webp. |
 | Configurable keybindings | ✅ | All action/mode bindings in `[keybinds]` (config.toml), parsed into a precompiled `Keymap`; help overlay shows live bindings. Vim motions stay fixed. Descriptive nvim-style **aliases** accepted (e.g. `insert_to_normal`, `normal_insert`, `send_message`, `toggle_help`, `open_file_picker`, `open_model_picker`); `insert_to_normal` may be a 2-key chord like `jk`. |
-| Transcript scrollbar w/ turn markers | ✅ | One-column scrollbar on the transcript's right: proportional thumb + coloured pips marking each turn (cyan = you, gray = assistant, green = tool). `ui/scrollbar.rs`, fed by `RenderedLine.role_start`. |
+| Transcript scrollbar (prompt/output map) | ✅ | One-column colour map on the transcript's right edge: a **blue** vertical line for your prompts (user turns) and a **green** line for everything else (model + tool output). No thumb / track / pips — just the two colours. `ui/scrollbar.rs`, per-row role carried forward from `RenderedLine.role_start`. |
 
 ## UI / UX
 
@@ -95,7 +97,9 @@ Status legend: ✅ done & working · 🟡 partial / needs polish · ⬜ not star
 | Minimal flat theme | ✅ | Trimmed to the few ANSI colours a flat UI needs. |
 | Help overlay | ✅ | `?` — updated for the new keymap. |
 | Transcript scrolling | ✅ | Wheel · PgUp/PgDn · Ctrl-Home/End. No cursor (by design). |
-| Mouse support | 🟡 | Wheel scroll only; click-to-focus removed with the `Focus` concept. |
+| Mouse support | 🟡 | Wheel scroll; click a collapsed tool block to expand it; **click the "↓ N below" jump pill to snap to the live tail**. |
+| Clickable jump-to-bottom pill | ✅ | The "↓ N below · <key>" pill (bottom-right when scrolled up) is click-hittable — `App::jump_pill()` gives one rect shared by the renderer and the click handler so they can't drift. |
+| ANSI-8 background pills | ✅ | Default theme paints background pills (cwd/permission/skill, NORMAL vim chip) with ANSI 8 (`DarkGray`) instead of ANSI 4 (Blue). `render::theme::fg_guard` bars ANSI 8 from ever being a foreground. |
 | `ui/` widget refactor | ✅ | `render/` = document model, `ui/` = widgets; sidebar deleted. |
 
 ## Performance
