@@ -172,19 +172,25 @@ fn handle_picker(app: &App, key: &KeyEvent) -> Vec<Action> {
         if p.kind == crate::app::overlay::PickerKind::Session {
             match key.code {
                 KeyCode::Char('a') | KeyCode::Char('n') if !ctrl_pressed(key) => {
-                    return vec![Action::NewSession]
+                    return vec![Action::PickerCancel, Action::NewSession]
                 }
                 KeyCode::Char('d') if !ctrl_pressed(key) => {
                     return p
                         .selected_index()
+                        .and_then(|i| i.checked_sub(1))
                         .map(Action::DeleteSessionAt)
                         .into_iter()
                         .collect();
                 }
                 // Rename still uses the editable command palette/line: type the new
                 // name after the inserted command and press Enter.
-                KeyCode::Char('r') if !ctrl_pressed(key) => {
-                    return vec![Action::RunCommand("rename ".to_string())];
+                KeyCode::Char('r') if !ctrl_pressed(key) && p.selected_index().unwrap_or(0) > 0 => {
+                    return vec![Action::PickerCancel, Action::RunCommand("rename ".to_string())];
+                }
+                KeyCode::Char('j') if !ctrl_pressed(key) => return vec![Action::PickerDown],
+                KeyCode::Char('k') if !ctrl_pressed(key) => return vec![Action::PickerUp],
+                KeyCode::Char('l') | KeyCode::Right if !ctrl_pressed(key) => {
+                    return vec![Action::PickerConfirm]
                 }
                 _ => {}
             }
@@ -219,6 +225,8 @@ fn handle_palette(key: &KeyEvent) -> Vec<Action> {
         KeyCode::Enter => vec![Action::PickerConfirm],
         KeyCode::Up => vec![Action::PickerUp],
         KeyCode::Down => vec![Action::PickerDown],
+        KeyCode::PageUp => (0..8).map(|_| Action::PickerUp).collect(),
+        KeyCode::PageDown => (0..8).map(|_| Action::PickerDown).collect(),
         KeyCode::Backspace => vec![Action::PickerBackspace],
         KeyCode::Char(c) => vec![Action::PickerChar(c)],
         _ => vec![],

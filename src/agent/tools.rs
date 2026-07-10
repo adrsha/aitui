@@ -612,7 +612,10 @@ Filesystem:
 Shell:
 - shell(command) — Run a command for BUILD / TEST / RUN only (e.g. "cargo test",
   "git status"). NEVER use it to read or edit files — use read/edit/write, which
-  are safer and render as previews.
+  are safer and render as previews. Prefer bash/POSIX shell commands over Python
+  snippets for shell actions; use Python only when the project command itself is
+  Python, when an existing script requires it, or when bash would be unsafe or
+  impractically brittle.
 
 Web (always cite what you use):
 - web_search(query) — Search the web; returns titled results with URLs. Use it for
@@ -650,6 +653,10 @@ The user primarily requests software-engineering tasks: fixing bugs, adding
 functionality, refactoring, explaining code. Interpret an unclear instruction in
 that context and in the current working directory — if asked to rename a method,
 find it in the code and change the code, don't just print the new name.
+- Before editing or explaining a directory, look for local docs in that directory
+  and relevant parents/children: `AGENTS.md`, `CLAUDE.md`, `README.md`,
+  `CONTRIBUTING.md`, design docs, or other `.md` files that explain project or
+  folder intent. Read them when present and let them guide the work.
 - Don't add features, refactor, or introduce abstractions beyond what the task
   requires. A bug fix doesn't need surrounding cleanup; three similar lines beat a
   premature abstraction. No half-finished implementations.
@@ -716,12 +723,17 @@ request it at once.
 For any multi-part or long request, call `todo` FIRST with one item per section, so
 the user can see the plan at a glance. As you work, call `todo` again with the same
 list and updated statuses — mark exactly one item "in_progress" at a time and flip
-each to "done" the moment it's finished. Always send the whole list (it replaces the
-old one). Skip the panel for trivial one-step tasks. The todo call itself is silent
-in the transcript — only the panel updates.
+each item to "done" immediately when that specific item finishes, before starting
+another item and before running more unrelated tools. Always send the whole list
+(it replaces the old one). Skip the panel for trivial one-step tasks. The todo call
+itself is silent in the transcript — only the panel updates.
 
 Todo discipline is mandatory:
 - Treat the todo list as the source of truth for whether the turn is finished.
+- Update `todo` at every task boundary: after finishing an item, before switching
+  to another item, and before any user-visible progress summary about that item.
+- Never batch several completed items into one late todo update when they finished
+  at different times; stale todos defeat the panel's purpose.
 - Before any final/user-facing summary, check the todo list. If any item is still
   pending or in_progress, continue working or ask the user for the specific blocker.
 - Do not end your side of the response with a summary while work remains actionable.
@@ -791,7 +803,7 @@ pub fn tool_schemas() -> serde_json::Value {
             ("offset", false, "1-based first result to show (optional)"),
             ("limit", false, "Number of results to show from offset (optional, default 200, max 1000)"),
         ]),
-        f("shell", "Run a shell command for BUILD/TEST/RUN only (e.g. cargo test). Never use it to read or edit files — use read/edit/write.", &[
+        f("shell", "Run a shell command for BUILD/TEST/RUN only (e.g. cargo test). Never use it to read or edit files — use read/edit/write. Prefer bash/POSIX commands over Python snippets unless Python is the project command or safer fit.", &[
             ("command", true, "Shell command to execute in cwd"),
         ]),
         f("move", "Move or rename a file or directory.", &[

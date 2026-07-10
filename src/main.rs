@@ -155,6 +155,15 @@ fn run(
             }
         }
 
+        // ── 5a3. Drain generated session titles ─────────────────────────
+        if let Some(rx) = app.title_rx.as_mut() {
+            if let Ok((sid, title)) = rx.try_recv() {
+                dispatch(app, vec![Action::SessionTitleGenerated(sid, title)]);
+                app.title_rx = None;
+                dirty = true;
+            }
+        }
+
         // ── 5b. Drain speculative (pre-run read-only) tool results ──────
         while let Ok((epoch, result)) = app.spec_rx.try_recv() {
             app.store_spec_result(epoch, result);

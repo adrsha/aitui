@@ -200,30 +200,54 @@ fn render_top_info(f: &mut Frame, app: &App, chat: Rect, theme: &Theme) {
         return;
     }
     let session = app.sessions.active();
-    let mut label = format!(
-        " {}/{} {} ",
-        app.sessions.active_idx() + 1,
-        app.sessions.all().len(),
-        session.name
-    );
+    let mut spans = vec![boxed_span(
+        format!(
+            "{}/{} {}",
+            app.sessions.active_idx() + 1,
+            app.sessions.all().len(),
+            session.name
+        ),
+        theme.muted,
+    )];
     if let Some(u) = app.usage {
         let gauge = context_gauge(u.prompt_tokens, app.config.ui.context_window, 8);
-        label.push_str(&format!(
-            "↑{} ↓{} · {} tok · {} ",
-            u.prompt_tokens, u.completion_tokens, u.total_tokens, gauge
-        ));
+        spans.push(Span::raw(" "));
+        spans.push(boxed_span(format!("↑ {}", u.prompt_tokens), theme.accent));
+        spans.push(Span::raw(" "));
+        spans.push(boxed_span(format!("↓ {}", u.completion_tokens), theme.link));
+        spans.push(Span::raw(" "));
+        spans.push(boxed_span(format!("tok {}", u.total_tokens), theme.warning));
+        spans.push(Span::raw(" "));
+        spans.push(boxed_span(gauge, theme.success));
     }
-    let w = (label.chars().count() as u16).min(chat.width);
-    let clipped: String = label.chars().take(w as usize).collect();
+    let total_w: u16 = spans
+        .iter()
+        .map(|s| s.content.chars().count() as u16)
+        .sum::<u16>()
+        .min(chat.width);
     let area = Rect {
-        x: chat.x + chat.width - w,
+        x: chat.x + chat.width - total_w,
         y: chat.y,
-        width: w,
+        width: total_w,
         height: 1,
     };
     f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(clipped, theme.subtle_pill()))),
-        area,
-    );
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn boxed_span(text: impl Into<String>, bg: ratatui::style::Color) -> Span<'static> {
+    Span::styled(
+        format!(" {} ", text.into()),
+        Style::default()
+            .bg(bg)
+            .fg(crate::render::theme::fg_guard(match bg {
+                ratatui::style::Color::Black
+                | ratatui::style::Color::Blue
+                | ratatui::style::Color::DarkGray
+                | ratatui::style::Color::Red
+                | ratatui::style::Color::Magenta => ratatui::style::Color::White,
+                _ => ratatui::style::Color::Black,
+            }))
+            .add_modifier(ratatui::style::Modifier::BOLD),
+    )
 }

@@ -42,6 +42,45 @@ fn message_text(m: &ChatMessage) -> String {
     }
 }
 
+const TOOL_PREP_FRAMES: [&str; 4] = ["⠁⠂⠄", "⠂⠄⡀", "⠄⡀⢀", "⡀⢀⠁"];
+
+fn native_tool_prep_row(
+    name: &str,
+    started_at: std::time::Instant,
+    mi: usize,
+    theme: &Theme,
+) -> RenderedLine {
+    let elapsed = started_at.elapsed().as_millis();
+    let frame = TOOL_PREP_FRAMES[((elapsed / 160) as usize) % TOOL_PREP_FRAMES.len()];
+    let label = if name.trim().is_empty() {
+        format!("  {} Preparing tool call…", frame)
+    } else {
+        format!("  {} Preparing {}…", frame, name)
+    };
+    RenderedLine::new(
+        Line::from(Span::styled(
+            label.clone(),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        label,
+        mi,
+    )
+}
+
+fn fallback_session_title(prompt: &str) -> String {
+    prompt
+        .split_whitespace()
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(['"', '\'', '.', ':'])
+        .chars()
+        .take(48)
+        .collect::<String>()
+}
+
 impl App {
     /// Render the active conversation as a plain-markdown document for `$EDITOR`.
     /// This is what Ctrl-O opens, so you can read/search history with real vim.
@@ -69,7 +108,15 @@ impl App {
 
     /// Rebuild the chat document if the cache is stale, then keep the cursor valid.
     pub fn sync_chat_doc(&mut self, width: usize, viewport_h: usize) {
-        if self.chat.needs_rebuild(self.content_rev, width) {
+        let active = self.sessions.active_id();
+        let animated = self.sessions.active().is_streaming()
+            || self.streams.iter().any(|s| s.session_id == active)
+            || self
+                .preparing_tool
+                .as_ref()
+                .is_some_and(|(sid, _, _)| *sid == active)
+            || (self.agent_session == Some(active) && self.active_tool.is_some());
+        if animated || self.chat.needs_rebuild(self.content_rev, width) {
             let doc = self.build_chat_doc(width);
             self.chat.set_doc(doc, self.content_rev, width, viewport_h);
         }
@@ -167,7 +214,7 @@ impl App {
                 loading: Some(loading),
                 started_at: session.pending_started_at,
             };
-            out.extend(build_message(
+            let mut rows = build_message(
                 &doc_msg,
                 mi,
                 width,
@@ -175,7 +222,17 @@ impl App {
                 toggled,
                 show_output,
                 true,
-            ));
+            );
+            if let Some((_, name, started_at)) = self
+                .preparing_tool
+                .as_ref()
+                .filter(|(sid, _, _)| *sid == session.id)
+            {
+                let row = native_tool_prep_row(name, *started_at, mi, &theme);
+                let insert_at = rows.len().saturating_sub(1);
+                rows.insert(insert_at, row);
+            }
+            out.extend(rows);
         }
 
         if out.is_empty() {
@@ -389,17 +446,49 @@ impl App {
     }
 
     fn auto_name_session(&mut self) {
-        let is_default = {
+        let should_generate = {
             let s = self.sessions.active();
             s.name.starts_with("Session ") && s.messages.len() == 1
         };
-        if is_default {
-            if let Some(preview) = self.sessions.active().first_message_preview(30) {
-                if !preview.is_empty() {
-                    self.sessions.active_mut().name = preview;
-                }
-            }
+        if !should_generate || self.title_rx.is_some() {
+            return;
         }
+
+        let sid = self.sessions.active_id();
+        let Some(prompt) = self.sessions.active().first_message_preview(800) else {
+            return;
+        };
+        if prompt.trim().is_empty() {
+            return;
+        }
+        self.sessions.active_mut().name = "Naming…".into();
+
+        let model = self.current_model().to_string();
+        let Some(api) = self.api.clone() else {
+            self.sessions.active_mut().name = fallback_session_title(&prompt);
+            return;
+        };
+        let (tx, rx) = mpsc::channel(1);
+        self.title_rx = Some(rx);
+        tokio::spawn(async move {
+            let mut req = ChatRequest::new(
+                &model,
+                vec![
+                    ChatMessage::system(
+                        "Generate a concise chat title. Return only the title, no quotes, no punctuation at the end, max 6 words.",
+                    ),
+                    ChatMessage::user(prompt.clone()),
+                ],
+            );
+            req.stream = false;
+            req.stream_options = None;
+            req.max_tokens = Some(24);
+            let title = match api.complete(req).await {
+                Ok(t) => t,
+                Err(_) => fallback_session_title(&prompt),
+            };
+            let _ = tx.send((sid, title)).await;
+        });
     }
 
     /// Stash the live composer text into the active session so it persists and is

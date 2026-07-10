@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::domain::blocks::Block;
 use crate::render::highlight::{self, Segment};
+use crate::render::search::{render_search_output, search_pattern_from_summary};
 use crate::render::theme::Theme;
 use crate::render::wrap::{hard_chunks, wrap_words};
 
@@ -526,7 +527,7 @@ fn push_code(
 /// Break a line of styled segments into visual rows no wider than `width`,
 /// returning `(spans, plain_text)` per row. Splits happen at the display-width
 /// boundary; each segment keeps its own style across the split.
-fn wrap_segments(segments: &[Segment], width: usize) -> Vec<(Vec<Span<'static>>, String)> {
+pub(crate) fn wrap_segments(segments: &[Segment], width: usize) -> Vec<(Vec<Span<'static>>, String)> {
     let w = width.max(1);
     let mut rows: Vec<(Vec<Span<'static>>, String)> = Vec::new();
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -833,8 +834,9 @@ fn render_diff(
     let gutter_w = num_width + 3;
     let avail = width.saturating_sub(gutter_w + 1).max(1);
     let ctx_style = Style::default().fg(theme.muted);
-    let removed_style = Style::default().fg(theme.danger).bg(Color::Indexed(88));
-    let added_style = Style::default().fg(theme.success).bg(Color::Indexed(28));
+    let changed_style = Style::default().bg(theme.subtle_pill);
+    let removed_border = Style::default().fg(Color::Red).bg(theme.subtle_pill);
+    let added_border = Style::default().fg(Color::Green).bg(theme.subtle_pill);
     let old_hl = highlight::highlight(old, path, theme);
     let new_hl = highlight::highlight(new, path, theme);
 
@@ -846,7 +848,8 @@ fn render_diff(
             old_hl.as_ref().and_then(|lines| lines.get(i).map(Vec::as_slice)),
             i + 1,
             num_width,
-            " │",
+            "│",
+            ctx_style,
             ctx_style,
             avail,
             mi,
@@ -861,8 +864,9 @@ fn render_diff(
             old_hl.as_ref().and_then(|lines| lines.get(i).map(Vec::as_slice)),
             i + 1,
             num_width,
-            " -",
-            removed_style,
+            "▌",
+            changed_style,
+            removed_border,
             avail,
             mi,
             out,
@@ -876,8 +880,9 @@ fn render_diff(
             new_hl.as_ref().and_then(|lines| lines.get(i).map(Vec::as_slice)),
             i + 1,
             num_width,
-            " +",
-            added_style,
+            "▌",
+            changed_style,
+            added_border,
             avail,
             mi,
             out,
@@ -892,7 +897,8 @@ fn render_diff(
             old_hl.as_ref().and_then(|lines| lines.get(i).map(Vec::as_slice)),
             i + 1,
             num_width,
-            " │",
+            "│",
+            ctx_style,
             ctx_style,
             avail,
             mi,
@@ -909,15 +915,20 @@ fn push_diff_line(
     num_width: usize,
     marker: &str,
     style: Style,
+    marker_style: Style,
     avail: usize,
     mi: usize,
     out: &mut Vec<RenderedLine>,
 ) {
     if src.is_empty() {
-        let gutter = format!("{:>width$}{} ", line_num, marker, width = num_width);
-        let plain = format!("{} ", gutter);
+        let prefix = format!("{:>width$}", line_num, width = num_width);
+        let plain = format!("{}{}  ", prefix, marker);
         out.push(RenderedLine::new(
-            Line::from(Span::styled(plain.clone(), style)),
+            Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(marker.to_string(), marker_style),
+                Span::styled("  ".to_string(), style),
+            ]),
             plain,
             mi,
         ));
@@ -940,12 +951,14 @@ fn push_diff_line(
             .into_iter()
             .enumerate()
         {
-            let gutter = if ci == 0 {
-                format!("{:>width$}{} ", line_num, marker, width = num_width)
-            } else {
-                format!("{:>width$}  ", "", width = num_width + 1)
-            };
-            let mut row_spans = vec![Span::styled(gutter.clone(), style)];
+            let (mut row_spans, gutter) = diff_gutter(
+                line_num,
+                num_width,
+                marker,
+                style,
+                marker_style,
+                ci == 0,
+            );
             row_spans.extend(spans);
             out.push(RenderedLine::new(
                 Line::from(row_spans),
@@ -957,17 +970,43 @@ fn push_diff_line(
     }
 
     for (ci, chunk) in hard_chunks(src, avail).into_iter().enumerate() {
-        let gutter = if ci == 0 {
-            format!("{:>width$}{} ", line_num, marker, width = num_width)
-        } else {
-            format!("{:>width$}  ", "", width = num_width + 1)
-        };
+        let (row_spans, gutter) = diff_gutter(
+            line_num,
+            num_width,
+            marker,
+            style,
+            marker_style,
+            ci == 0,
+        );
         let plain = format!("{}{}", gutter, chunk);
-        out.push(RenderedLine::new(
-            Line::from(Span::styled(plain.clone(), style)),
+        let mut spans = row_spans;
+        spans.push(Span::styled(chunk, style));
+        out.push(RenderedLine::new(Line::from(spans), plain, mi));
+    }
+}
+
+fn diff_gutter(
+    line_num: usize,
+    num_width: usize,
+    marker: &str,
+    style: Style,
+    marker_style: Style,
+    first: bool,
+) -> (Vec<Span<'static>>, String) {
+    if first {
+        let prefix = format!("{:>width$}", line_num, width = num_width);
+        let plain = format!("{}{} ", prefix, marker);
+        (
+            vec![
+                Span::styled(prefix, style),
+                Span::styled(marker.to_string(), marker_style),
+                Span::styled(" ".to_string(), style),
+            ],
             plain,
-            mi,
-        ));
+        )
+    } else {
+        let plain = format!("{:>width$}  ", "", width = num_width + 1);
+        (vec![Span::styled(plain.clone(), style)], plain)
     }
 }
 
@@ -1122,6 +1161,9 @@ fn render_tool_result(
             );
         } else if as_markdown {
             render_markdown(output, mi, avail, theme, out);
+        } else if ok && kind == Some(ToolKind::Search) {
+            let pattern = search_pattern_from_summary(summary);
+            render_search_output(output, pattern.as_deref(), mi, avail, theme, out);
         } else {
             for l in &lines {
                 // Colour diff lines (`git diff`, patches): `+` added green, `-`
@@ -1373,6 +1415,32 @@ mod tests {
         );
         assert!(!rows.iter().any(|r| r.plain.contains("line5")));
         assert!(rows.iter().any(|r| r.toggle.is_some()));
+    }
+
+    #[test]
+    fn search_result_highlights_path_line_and_match() {
+        let block = Block::ToolResult {
+            ok: true,
+            name: Some("search".into()),
+            summary: "search(\"needle\")".into(),
+            output: "2 match(es) for 'needle' (showing 1-2):\n  src/a.rs:12: let needle = true;".into(),
+        };
+        let rows = build(
+            &doc("tool", vec![block]),
+            80,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|r| r.plain.contains("src/a.rs:12")));
+        assert!(rows.iter().any(|r| {
+            r.line.spans.iter().any(|s| {
+                s.content.as_ref() == "needle"
+                    && s.style.fg == Some(Theme::default().warning)
+                    && s.style.bg == Some(Theme::default().subtle_pill)
+            })
+        }));
     }
 
     #[test]
@@ -1662,8 +1730,8 @@ mod tests {
             false,
             false,
         );
-        assert!(rows.iter().any(|r| r.plain.contains("- foo")));
-        assert!(rows.iter().any(|r| r.plain.contains("+ bar")));
+        assert!(rows.iter().any(|r| r.plain.contains("▌ foo")));
+        assert!(rows.iter().any(|r| r.plain.contains("▌ bar")));
     }
 
     #[test]

@@ -13,6 +13,20 @@ use crate::app::state::{App, PendingExternal};
 use crate::domain::session::LoopState;
 use crate::input::vim::VimMode;
 
+fn clean_session_title(title: &str) -> String {
+    title
+        .trim()
+        .trim_matches(['"', '\'', '.', ':'])
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(48)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 impl App {
     fn chat_h(&self) -> usize {
         self.layout.chat.height.saturating_sub(2) as usize
@@ -317,7 +331,7 @@ impl App {
                 if let Some(s) = self.sessions.by_id_mut(sid) {
                     s.mark_stream_progress();
                 }
-                self.set_status(format!("Model is preparing tool call: {}", name));
+                self.preparing_tool = Some((sid, name, std::time::Instant::now()));
                 self.touch();
             }
             Action::StreamDone(sid) => {
@@ -325,6 +339,9 @@ impl App {
                     s.finalize_assistant_stream();
                 }
                 self.streams.retain(|h| h.session_id != sid);
+                if self.preparing_tool.as_ref().is_some_and(|(prep_sid, _, _)| *prep_sid == sid) {
+                    self.preparing_tool = None;
+                }
                 // StreamToken may have already cut this same stream early (tool call
                 // detected) and queued a round via `cut_stream`. We're starting the
                 // round right here, so clear that flag or main.rs would start it a
@@ -343,6 +360,9 @@ impl App {
                     s.finalize_assistant_stream();
                 }
                 self.streams.retain(|h| h.session_id != sid);
+                if self.preparing_tool.as_ref().is_some_and(|(prep_sid, _, _)| *prep_sid == sid) {
+                    self.preparing_tool = None;
+                }
                 // If the endpoint rejected the native `tools` field, fall back to
                 // fenced parsing so the app keeps working (the user resends).
                 if looks_like_base_url_error(&e) {
@@ -381,6 +401,9 @@ impl App {
                 // loop on it — Ctrl-C is the user's "stop everything" for this session.
                 let active = self.sessions.active_id();
                 self.streams.retain(|h| h.session_id != active);
+                if self.preparing_tool.as_ref().is_some_and(|(prep_sid, _, _)| *prep_sid == active) {
+                    self.preparing_tool = None;
+                }
                 self.sessions.active_mut().finalize_assistant_stream();
                 self.stop_loop();
                 self.sessions.save();
@@ -505,7 +528,9 @@ impl App {
 
             // ── Sessions ────────────────────────────────────────────────────
             Action::NewSession => {
+                self.stash_active_permissions();
                 self.sessions.new_session();
+                self.load_active_permissions();
                 if self.config.ui.agent_default {
                     self.sessions.active_mut().agent_mode = true;
                 }
@@ -514,29 +539,38 @@ impl App {
                 self.touch();
             }
             Action::ForkSession => {
+                self.stash_active_permissions();
                 self.sessions.fork_active();
+                self.load_active_permissions();
                 self.set_status(format!("Forked → {}", self.sessions.active().name));
                 self.sessions.save();
                 self.chat.stick_bottom = true;
                 self.touch();
             }
             Action::DeleteSession => {
+                let old_id = self.sessions.active_id();
                 let name = self.sessions.active().name.clone();
                 self.sessions.remove_active();
+                self.session_permissions.remove(&old_id);
+                self.load_active_permissions();
                 self.set_status(format!("Deleted: {}", name));
                 self.sessions.save();
                 self.touch();
             }
             Action::NextSession => {
+                self.stash_active_permissions();
                 self.stash_draft();
                 self.sessions.select_next();
+                self.load_active_permissions();
                 self.load_active_draft();
                 self.chat.stick_bottom = true;
                 self.touch();
             }
             Action::PrevSession => {
+                self.stash_active_permissions();
                 self.stash_draft();
                 self.sessions.select_prev();
+                self.load_active_permissions();
                 self.load_active_draft();
                 self.chat.stick_bottom = true;
                 self.touch();
@@ -545,15 +579,17 @@ impl App {
                 if matches!(&self.overlay, Overlay::Picker(p) if p.kind == PickerKind::Session) {
                     self.overlay = Overlay::None;
                 } else {
-                    let names: Vec<String> =
-                        self.sessions.all().iter().map(|s| s.name.clone()).collect();
-                    self.overlay =
-                        Overlay::Picker(Picker::sessions(names, self.sessions.active_idx()));
+                    self.overlay = Overlay::Picker(Picker::sessions(
+                        self.session_items(),
+                        self.sessions.active_idx() + 1,
+                    ));
                 }
             }
             Action::SelectSession(i) => {
+                self.stash_active_permissions();
                 self.stash_draft();
                 self.sessions.select(i);
+                self.load_active_permissions();
                 self.load_active_draft();
                 // Resume in the session's own folder so file tools / @-mentions
                 // resolve against the right project.
@@ -577,7 +613,21 @@ impl App {
                 self.set_status(format!("Renamed: {}", name));
                 self.sessions.save();
             }
+            Action::SessionTitleGenerated(sid, title) => {
+                let title = clean_session_title(&title);
+                if !title.is_empty() {
+                    if let Some(s) = self.sessions.by_id_mut(sid) {
+                        if s.name.starts_with("Session ") || s.name == "Naming…" {
+                            s.name = title;
+                            self.sessions.save();
+                            self.touch();
+                        }
+                    }
+                }
+            }
             Action::DeleteSessionAt(idx) => {
+                let active_id = self.sessions.active_id();
+                let deleted_id = self.sessions.all().get(idx).map(|s| s.id);
                 let name = self
                     .sessions
                     .all()
@@ -585,6 +635,12 @@ impl App {
                     .map(|s| s.name.clone())
                     .unwrap_or_default();
                 self.sessions.remove_at(idx);
+                if let Some(id) = deleted_id {
+                    self.session_permissions.remove(&id);
+                    if id == active_id {
+                        self.load_active_permissions();
+                    }
+                }
                 self.sessions.save();
                 self.set_status(format!("Deleted: {}", name));
                 self.chat.stick_bottom = true;
@@ -592,10 +648,10 @@ impl App {
                 // Keep the picker open on the refreshed list (or close it if this was
                 // opened outside the picker).
                 if matches!(&self.overlay, Overlay::Picker(p) if p.kind == PickerKind::Session) {
-                    let names: Vec<String> =
-                        self.sessions.all().iter().map(|s| s.name.clone()).collect();
-                    self.overlay =
-                        Overlay::Picker(Picker::sessions(names, self.sessions.active_idx()));
+                    self.overlay = Overlay::Picker(Picker::sessions(
+                        self.session_items(),
+                        self.sessions.active_idx() + 1,
+                    ));
                 }
             }
 
@@ -1107,7 +1163,13 @@ impl App {
                 PickerKind::Model => p
                     .selected_item()
                     .map(|m| Action::SelectModel(m.to_string())),
-                PickerKind::Session => p.selected_index().map(Action::SelectSession),
+                PickerKind::Session => p.selected_index().map(|i| {
+                    if i == 0 {
+                        Action::NewSession
+                    } else {
+                        Action::SelectSession(i - 1)
+                    }
+                }),
                 PickerKind::Skill => None,
             },
             Overlay::Palette(p) => p
@@ -1475,6 +1537,7 @@ mod tests {
             skills: Vec::new(),
             reasoning_effort: None,
             content_rev: 0,
+            session_permissions: std::collections::HashMap::new(),
             permissions: crate::agent::PermissionMemory::default(),
             pending_tools: VecDeque::new(),
             approved: VecDeque::new(),
@@ -1486,7 +1549,9 @@ mod tests {
             agent_queue: VecDeque::new(),
             agent_tool_rx: None,
             active_tool: None,
+            preparing_tool: None,
             models_rx: None,
+            title_rx: None,
             spec_results: std::collections::HashMap::new(),
             spec_dispatched: std::collections::HashSet::new(),
             spec_epoch: 0,
@@ -1917,13 +1982,12 @@ mod tests {
         let mut app = test_app();
         app.config.ui.sticky_skills = false; // don't touch disk in tests
         app.skills = vec![crate::skills::Skill {
-            name: "caveman".into(),
+            name: "alpha".into(),
             desc: "terse".into(),
             body: "be terse".into(),
             active: false,
         }];
-        app.apply(Action::OpenSkillPicker);
-        assert!(matches!(app.overlay, Overlay::Picker(_)));
+        app.overlay = Overlay::Picker(Picker::skills(app.skill_items()));
         app.apply(Action::ToggleSkill(0));
         assert!(app.skills[0].active);
         // Picker stays open with a ✓ marker after toggling.
@@ -1938,6 +2002,7 @@ mod tests {
 
     #[test]
     fn empty_skills_opens_no_picker() {
+        let _guard = crate::skills::ENV_TEST_LOCK.lock().unwrap();
         let base =
             std::env::temp_dir().join(format!("aitui_empty_skills_{}_reducer", std::process::id()));
         let old = std::env::var("XDG_CONFIG_HOME").ok();

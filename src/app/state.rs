@@ -186,6 +186,9 @@ pub struct App {
     /// Bumped whenever chat content/collapse changes, to invalidate the doc cache.
     pub content_rev: u64,
 
+    /// Per-session access state. `permissions` is the active session's working copy;
+    /// this map stores inactive sessions' copies.
+    pub session_permissions: std::collections::HashMap<usize, PermissionMemory>,
     pub permissions: PermissionMemory,
     pub pending_tools: VecDeque<ToolCall>,
     /// Calls already cleared to run (by the access-policy judge or a batch allow)
@@ -210,7 +213,11 @@ pub struct App {
     pub agent_tool_rx: Option<mpsc::Receiver<ToolResult>>,
     /// The tool currently executing, for the transcript header animation.
     pub active_tool: Option<(String, std::time::Instant)>,
+    /// The tool call the model is currently assembling natively, shown inline
+    /// beneath the live assistant turn instead of in the status bar.
+    pub preparing_tool: Option<(usize, String, std::time::Instant)>,
     pub models_rx: Option<oneshot::Receiver<anyhow::Result<Vec<String>>>>,
+    pub title_rx: Option<mpsc::Receiver<(usize, String)>>,
 
     /// Speculative tool execution: while an agent-mode reply streams, complete
     /// read-only tool blocks are pre-run in the background so their results are
@@ -325,6 +332,7 @@ impl App {
             skills: crate::skills::load(),
             reasoning_effort,
             content_rev: 0,
+            session_permissions: std::collections::HashMap::new(),
             permissions: PermissionMemory::default(),
             pending_tools: VecDeque::new(),
             approved: VecDeque::new(),
@@ -336,7 +344,9 @@ impl App {
             agent_queue: std::collections::VecDeque::new(),
             agent_tool_rx: None,
             active_tool: None,
+            preparing_tool: None,
             models_rx: Some(models_rx),
+            title_rx: None,
             spec_results: std::collections::HashMap::new(),
             spec_dispatched: std::collections::HashSet::new(),
             spec_epoch: 0,
@@ -361,8 +371,10 @@ impl App {
         // start fresh. A clean first run drops straight into an empty session.
         let resumable = app.sessions.all().iter().any(|s| !s.messages.is_empty());
         if resumable {
-            let n = app.sessions.all().len();
-            app.overlay = Overlay::Startup(crate::app::overlay::Startup::new(n));
+            app.overlay = Overlay::Picker(crate::app::overlay::Picker::sessions(
+                app.session_items(),
+                app.sessions.active_idx() + 1,
+            ));
         } else {
             // No launch screen: we drop straight into the active session, so it
             // should operate where the binary was launched — not the stale folder
@@ -413,6 +425,28 @@ impl App {
             .unwrap_or(MOCK_MODEL)
     }
 
+    pub fn session_items(&self) -> Vec<String> {
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "—".to_string());
+        let mut items = Vec::with_capacity(self.sessions.all().len() + 1);
+        items.push(format!("＋  Start a new session   {}", cwd));
+        for sess in self.sessions.all() {
+            let dir = sess
+                .cwd
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "—".to_string());
+            items.push(format!(
+                "≡  {}   {} · {} msg",
+                sess.name,
+                dir,
+                sess.messages.len()
+            ));
+        }
+        items
+    }
+
     /// Whether the selected model is the offline mock backend. Mock is just a model
     /// now, so "mock mode" is simply having it selected.
     pub fn is_mock(&self) -> bool {
@@ -452,6 +486,17 @@ impl App {
         self.status = Some(msg.into());
     }
 
+    pub fn stash_active_permissions(&mut self) {
+        let sid = self.sessions.active_id();
+        self.session_permissions.insert(sid, self.permissions.clone());
+    }
+
+    pub fn load_active_permissions(&mut self) {
+        let sid = self.sessions.active_id();
+        self.permissions = self.session_permissions.remove(&sid).unwrap_or_default();
+        sync_auto_approvals(&mut self.permissions, self.config.ui.auto_approve_reads);
+    }
+
     // ── @ mention completion ────────────────────────────────────────────────
 
     /// Re-evaluate whether the cursor sits inside an `@token` and refresh matches.
@@ -479,14 +524,21 @@ impl App {
             i -= 1;
         }
         match at {
-            Some(idx) => {
+            Some(idx) if idx < cur => {
                 self.mention.active = true;
                 self.mention.anchor_row = self.input.row;
                 self.mention.anchor_col = idx;
                 self.mention.query = chars[idx + 1..cur].iter().collect();
                 self.refresh_mention_matches();
             }
-            None => self.mention.reset(),
+            Some(idx) if idx == cur.saturating_sub(1) => {
+                self.mention.active = true;
+                self.mention.anchor_row = self.input.row;
+                self.mention.anchor_col = idx;
+                self.mention.query.clear();
+                self.refresh_mention_matches();
+            }
+            _ => self.mention.reset(),
         }
     }
 
@@ -654,6 +706,9 @@ pub fn find_project_files(max: usize) -> Vec<String> {
             let name = entry.file_name().to_string_lossy().to_string();
             if path.is_dir() {
                 if name.starts_with('.') || skip.contains(&name.as_str()) {
+                    continue;
+                }
+                if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
                     continue;
                 }
                 stack.push(path);

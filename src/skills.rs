@@ -130,11 +130,15 @@ code blocks and error text unchanged.\n\n\
 Pattern: `[thing] [action] [reason]. [next step].`\n";
 
 #[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn reload_preserves_in_memory_active_skills() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
         let base = std::env::temp_dir().join(format!(
             "aitui_skills_reload_{}_{}",
             std::process::id(),

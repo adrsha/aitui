@@ -198,83 +198,7 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
             Ok(truncate(result, 8192))
         }
 
-        Some(ToolKind::Search) => {
-            let pattern = call
-                .args
-                .get("pattern")
-                .or_else(|| call.args.get("query"))
-                .and_then(|v| v.as_str())
-                .ok_or("Missing 'pattern' argument")?;
-            let path_str = call
-                .args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            let path = resolve_path(path_str, cwd);
-            // Optional glob to restrict files (e.g. "*.rs"); passed to ripgrep when present.
-            let glob = call.args.get("glob").and_then(|v| v.as_str());
-            let offset = usize_arg(call, "offset").unwrap_or(1).max(1);
-            let limit = usize_arg(call, "limit")
-                .unwrap_or(200)
-                .clamp(1, SEARCH_PAGE_LIMIT);
-            let collect = offset
-                .saturating_sub(1)
-                .saturating_add(limit)
-                .min(SEARCH_COLLECT_LIMIT);
-
-            // Prefer ripgrep: regex, .gitignore-aware, skips binaries, fast. Fall back
-            // to the built-in literal-substring walker when `rg` isn't installed.
-            let (matches, capped) = match ripgrep(pattern, &path, glob, collect) {
-                Some(m) => m,
-                None => {
-                    let mut m: Vec<String> = Vec::new();
-                    search_recursive(&path, pattern, &path, &mut m, 0, collect);
-                    let capped = m.len() >= collect;
-                    (m, capped)
-                }
-            };
-
-            if matches.is_empty() {
-                Ok(format!(
-                    "No matches for '{}' in {}",
-                    pattern,
-                    path.display()
-                ))
-            } else {
-                let total = matches.len();
-                let page: Vec<String> = matches.into_iter().skip(offset - 1).take(limit).collect();
-                let shown = page.len();
-                let end = offset + shown.saturating_sub(1);
-                let total_label = if capped {
-                    format!("{}+", total)
-                } else {
-                    total.to_string()
-                };
-                let header = if shown == 0 {
-                    format!(
-                        "{} match(es) for '{}' (showing 0 from offset {}):",
-                        total_label, pattern, offset
-                    )
-                } else {
-                    format!(
-                        "{} match(es) for '{}' (showing {}-{}):",
-                        total_label, pattern, offset, end
-                    )
-                };
-                let mut out = vec![header];
-                out.extend(page);
-                if capped {
-                    out.push(format!(
-                        "  … more matches possible; rerun with offset {}",
-                        offset
-                            .saturating_sub(1)
-                            .saturating_add(limit)
-                            .saturating_add(1)
-                    ));
-                }
-                Ok(truncate(out.join("\n"), 16_000))
-            }
-        }
+        Some(ToolKind::Search) => crate::agent::file_search::execute(call, cwd),
 
         Some(ToolKind::Edit) => {
             // TODO(audit): make edit writes atomic and preserve file metadata where
@@ -649,6 +573,18 @@ fn web_search(query: &str) -> Result<String, String> {
         }
     }
 
+    if provider == "google" {
+        match search_google(query) {
+            Ok(results) if !results.is_empty() => {
+                return Ok(format_search_results(query, "Google", &results))
+            }
+            Ok(_) => diagnostics.push(
+                "Google returned no parseable results; likely blocked/challenged".to_string(),
+            ),
+            Err(e) => diagnostics.push(format!("Google failed: {}", e)),
+        }
+    }
+
     if provider == "bing" || tried_primary || provider == "duckduckgo" || provider == "ddg" {
         match search_bing(query) {
             Ok(results) if !results.is_empty() => {
@@ -661,10 +597,10 @@ fn web_search(query: &str) -> Result<String, String> {
 
     if !matches!(
         provider.as_str(),
-        "" | "searx" | "searxng" | "duckduckgo" | "ddg" | "bing"
+        "" | "searx" | "searxng" | "duckduckgo" | "ddg" | "bing" | "google"
     ) {
         diagnostics.push(format!(
-            "Unknown search provider '{}'; supported: searxng, duckduckgo, bing",
+            "Unknown search provider '{}'; supported: searxng, duckduckgo, bing, google",
             provider
         ));
     }
@@ -684,6 +620,11 @@ fn search_duckduckgo(query: &str) -> Result<Vec<(String, String, String)>, Strin
 fn search_bing(query: &str) -> Result<Vec<(String, String, String)>, String> {
     let html = fetch_search_html("https://www.bing.com/search", query)?;
     Ok(parse_bing_results(&html))
+}
+
+fn search_google(query: &str) -> Result<Vec<(String, String, String)>, String> {
+    let html = fetch_search_html("https://www.google.com/search", query)?;
+    Ok(parse_google_results(&html))
 }
 
 fn search_searxng(
@@ -944,6 +885,43 @@ fn parse_bing_results(html: &str) -> Vec<(String, String, String)> {
     out
 }
 
+/// Parse Google HTML results. Google changes markup often; keep this parser
+/// conservative: find organic-looking anchors under `/url?q=` that contain an h3.
+fn parse_google_results(html: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = html[pos..].find("/url?q=") {
+        let href_idx = pos + rel;
+        let tag_start = html[..href_idx].rfind("<a").unwrap_or(href_idx);
+        let tag = &html[tag_start..(tag_start + 4_000).min(html.len())];
+        let href = extract_attr(tag, "href").unwrap_or_default();
+        let link = decode_google_url(&html_unescape(&href));
+        let Some(h3_rel) = tag.find("<h3") else {
+            pos = href_idx + 7;
+            continue;
+        };
+        let h3 = &tag[h3_rel..];
+        let Some(gt) = h3.find('>') else {
+            pos = href_idx + 7;
+            continue;
+        };
+        let start = gt + 1;
+        let Some(close) = h3[start..].find("</h3>") else {
+            pos = href_idx + 7;
+            continue;
+        };
+        let title = strip_tags(&h3[start..start + close]);
+        if !title.is_empty() && !link.is_empty() {
+            out.push((title, link, String::new()));
+        }
+        pos = href_idx + 7;
+        if out.len() >= 20 {
+            break;
+        }
+    }
+    out
+}
+
 /// Read an HTML attribute value (`name="..."`) from the start of a tag.
 fn extract_attr(tag: &str, name: &str) -> Option<String> {
     let pat = format!("{}=\"", name);
@@ -967,6 +945,15 @@ fn decode_uddg(href: &str) -> String {
     } else {
         href.to_string()
     }
+}
+
+fn decode_google_url(href: &str) -> String {
+    if let Some(idx) = href.find("/url?q=") {
+        let rest = &href[idx + 7..];
+        let enc = rest.split('&').next().unwrap_or(rest);
+        return pct_decode(enc);
+    }
+    href.to_string()
 }
 
 /// Decode Bing click-tracking URLs. Bing often wraps organic result URLs as
@@ -1136,10 +1123,6 @@ const READ_FULL_BYTE_LIMIT: usize = 60_000;
 const READ_PAGE_LINES: usize = 400;
 /// Hard cap on read page size, including explicit `limit` requests.
 const READ_PAGE_LIMIT: usize = 1000;
-/// Max search matches returned to a single page.
-const SEARCH_PAGE_LIMIT: usize = 1000;
-/// Max search matches collected internally while paging.
-const SEARCH_COLLECT_LIMIT: usize = 20_000;
 
 fn usize_arg(call: &ToolCall, key: &str) -> Option<usize> {
     let v = call.args.get(key)?;
@@ -1238,85 +1221,6 @@ fn list_recursive(
         }
         lines.push(line);
         *count += 1;
-    }
-}
-
-/// Run ripgrep for `pattern` under `path`, returning `file:line: text` matches.
-/// Returns `None` if `rg` isn't on PATH (caller falls back to the built-in walker).
-/// `rg`'s own exit code 1 (no matches) maps to an empty vec, not a fallback.
-fn ripgrep(
-    pattern: &str,
-    path: &Path,
-    glob: Option<&str>,
-    collect: usize,
-) -> Option<(Vec<String>, bool)> {
-    let mut cmd = Command::new("rg");
-    cmd.arg("--line-number")
-        .arg("--no-heading")
-        .arg("--color=never")
-        .arg("--max-columns=300");
-    if let Some(g) = glob {
-        cmd.arg("--glob").arg(g);
-    }
-    cmd.arg("-e").arg(pattern).arg(path);
-    let output = cmd.output().ok()?;
-    // rg missing → Command::output errors above → None. Here rg ran: 0 = matches,
-    // 1 = no matches (both fine), 2 = actual error (still return what we parsed).
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut capped = false;
-    let mut out = Vec::new();
-    for line in stdout.lines() {
-        if out.len() >= collect {
-            capped = true;
-            break;
-        }
-        out.push(format!("  {}", line));
-    }
-    Some((out, capped))
-}
-
-fn search_recursive(
-    dir: &Path,
-    pattern: &str,
-    base: &Path,
-    matches: &mut Vec<String>,
-    depth: usize,
-    collect: usize,
-) {
-    if depth > 8 || matches.len() >= collect {
-        return;
-    }
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        // Skip hidden and common non-text dirs
-        if name.starts_with('.') || name == "target" || name == "node_modules" {
-            continue;
-        }
-        if path.is_dir() {
-            search_recursive(&path, pattern, base, matches, depth + 1, collect);
-        } else {
-            if let Ok(content) = fs::read_to_string(&path) {
-                for (line_no, line) in content.lines().enumerate() {
-                    if matches.len() >= collect {
-                        return;
-                    }
-                    if line.to_lowercase().contains(&pattern.to_lowercase()) {
-                        let rel = path.strip_prefix(base).unwrap_or(&path);
-                        matches.push(format!(
-                            "  {}:{}: {}",
-                            rel.display(),
-                            line_no + 1,
-                            line.trim()
-                        ));
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -1547,6 +1451,20 @@ mod tests {
             decode_bing_url("https://example.com/direct"),
             "https://example.com/direct"
         );
+    }
+
+    #[test]
+    fn parse_google_results_extracts_redirect_title() {
+        let html = r#"
+          <div class="g">
+            <a href="/url?q=https%3A%2F%2Fexample.com%2Fpage%3Fq%3Drust&amp;sa=U"><h3>Example <em>Page</em></h3></a>
+          </div>"#;
+        let results = parse_google_results(html);
+        assert_eq!(results.len(), 1);
+        let (title, url, snippet) = &results[0];
+        assert_eq!(title, "Example Page");
+        assert_eq!(url, "https://example.com/page?q=rust");
+        assert_eq!(snippet, "");
     }
 
     #[tokio::test]

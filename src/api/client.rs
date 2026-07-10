@@ -23,6 +23,7 @@ pub enum StreamEvent {
     Error(String),
 }
 
+#[derive(Clone)]
 pub struct ApiClient {
     client: reqwest::Client,
     endpoint: String,

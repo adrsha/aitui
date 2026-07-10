@@ -154,6 +154,7 @@ pub enum Action {
     OpenSessionPicker,
     SelectSession(usize),
     RenameSession(String),
+    SessionTitleGenerated(usize, String),
 
     // Skills (toggleable instruction snippets)
     OpenSkillPicker,

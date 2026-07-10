@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::agent::tools::{PermissionDecision, PermissionScope};
+use crate::agent::tools::{PermissionDecision, PermissionScope, ToolKind};
 use crate::app::state::App;
 use crate::render::theme::Theme;
 
@@ -449,17 +449,40 @@ fn cwd_label(app: &App) -> String {
     format!("cwd {}", display)
 }
 
+fn short_path(path: &std::path::Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|name| format!("…/{}", name))
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn access_root_label(app: &App) -> String {
+    if let Some(cwd) = app.sessions.active().cwd.as_deref() {
+        return short_path(cwd);
+    }
+    std::env::current_dir()
+        .ok()
+        .map(|p| short_path(&p))
+        .unwrap_or_else(|| "cwd".to_string())
+}
+
 fn permission_summary(app: &App) -> String {
     let mut parts: Vec<String> = Vec::new();
-    // A ⚖ marks that a natural-language access policy is judging tool calls.
+    let root = access_root_label(app);
+    // A ⚖ marks that a natural-language access policy is judging uncovered calls.
     if app.permissions.policy.is_some() {
-        parts.push("⚖policy".to_string());
+        parts.push("⚖ policy".to_string());
     }
     for kind in &app.permissions.always_allow {
-        parts.push(format!("✓{}", kind.name()));
+        let scope = if matches!(kind, ToolKind::Read | ToolKind::List | ToolKind::Search) {
+            format!("{} {}", kind.icon(), root)
+        } else {
+            format!("{} session", kind.icon())
+        };
+        parts.push(format!("✓{}", scope));
     }
     for kind in &app.permissions.always_deny {
-        parts.push(format!("✕{}", kind.name()));
+        parts.push(format!("✕{} session", kind.icon()));
     }
     for rule in &app.permissions.rules {
         let mark = match rule.decision {
@@ -467,19 +490,15 @@ fn permission_summary(app: &App) -> String {
             PermissionDecision::Deny => "✕",
         };
         let scope = match &rule.scope {
-            PermissionScope::Kind(kind) => kind.name().to_string(),
-            PermissionScope::Directory(dir) => dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|name| format!("…/{}", name))
-                .unwrap_or_else(|| dir.display().to_string()),
-            PermissionScope::Timed => "all".to_string(),
+            PermissionScope::Kind(kind) => format!("{} session", kind.icon()),
+            PermissionScope::Directory(dir) => format!("📁 {}", short_path(dir)),
+            PermissionScope::Timed => "⏱ all tools".to_string(),
         };
-        let timed = if rule.expires_at.is_some() { "⏱" } else { "" };
+        let timed = if rule.expires_at.is_some() { " ⏱" } else { "" };
         parts.push(format!("{}{}{}", mark, scope, timed));
     }
     if parts.is_empty() {
-        "access ask".to_string()
+        "access ⛔ ask".to_string()
     } else {
         format!("access {}", parts.join(" "))
     }
@@ -518,8 +537,6 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     left.push(chip(mode_label, mode_bg));
     left.push(Span::raw(" "));
 
-    left.push(Span::styled(cwd_label(app), theme.subtle_pill()));
-    left.push(Span::raw(" "));
     left.push(Span::styled(permission_summary(app), theme.subtle_pill()));
 
     let mut chips: Vec<(String, Color)> = Vec::new();
@@ -556,27 +573,22 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     }
 
     use crate::app::state::ModelLoad;
-    let (right, right_bg) = match app.model_load {
+    let (model_label, model_bg) = match app.model_load {
         ModelLoad::Loading => (
-            format!(" {} loading models ", Motion::Dots.frame(ms)),
+            format!("{} loading models", Motion::Dots.frame(ms)),
             theme.warning,
         ),
-        ModelLoad::Failed => (" ⚠ models unavailable ".to_string(), theme.danger),
-        ModelLoad::Loaded => (format!(" {} ", model), theme.accent),
+        ModelLoad::Failed => ("⚠ models unavailable".to_string(), theme.danger),
+        ModelLoad::Loaded => (model.to_string(), theme.accent),
     };
+    let right = vec![chip(model_label, model_bg), Span::raw(" "), chip(cwd_label(app), theme.muted)];
     let left_len: usize = left.iter().map(|s| s.content.chars().count()).sum();
-    let right_len = right.chars().count();
+    let right_len: usize = right.iter().map(|s| s.content.chars().count()).sum();
     let pad = area.width.saturating_sub((left_len + right_len) as u16) as usize;
 
     let mut spans = left;
     spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(Span::styled(
-        right,
-        Style::default()
-            .bg(right_bg)
-            .fg(chip_fg(right_bg))
-            .add_modifier(Modifier::BOLD),
-    ));
+    spans.extend(right);
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }

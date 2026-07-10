@@ -56,8 +56,9 @@ pub struct ApiConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchConfig {
-    /// Default web-search backend. `searxng` is preferred; `duckduckgo` and `bing`
-    /// are kept as fallbacks when SearxNG instances reject automated requests.
+    /// Default web-search backend. `searxng` is preferred; `duckduckgo`, `bing`,
+    /// and `google` are kept as fallbacks when SearxNG instances reject automated
+    /// requests.
     #[serde(default = "default_search_provider")]
     pub provider: String,
     /// Optional SearxNG base URL, e.g. `https://searx.example.com/`. Empty means

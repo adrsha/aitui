@@ -207,7 +207,7 @@ fn render_startup(f: &mut Frame, app: &App, s: &Startup, theme: &Theme) {
 // ── Picker (models / sessions) ────────────────────────────────────────────────
 
 fn render_picker(f: &mut Frame, _app: &App, picker: &Picker, theme: &Theme) {
-    let area = centered(60, 60, f.area());
+    let area = centered(70, 70, f.area());
     let title = match picker.kind {
         PickerKind::Model => " Model Picker ",
         PickerKind::Session => " Sessions ",
@@ -235,7 +235,7 @@ fn render_picker(f: &mut Frame, _app: &App, picker: &Picker, theme: &Theme) {
         x: inner.x,
         y: inner.y + 2,
         width: inner.width,
-        height: inner.height.saturating_sub(3),
+        height: inner.height.saturating_sub(4),
     };
     let items: Vec<ListItem> = picker
         .filtered
@@ -252,6 +252,23 @@ fn render_picker(f: &mut Frame, _app: &App, picker: &Picker, theme: &Theme) {
         })
         .collect();
     f.render_widget(List::new(items), list_area);
+
+    let hint = match picker.kind {
+        PickerKind::Session => " j/k move · ⏎/l open · n new · d delete · r rename · type search · Esc close ",
+        PickerKind::Model | PickerKind::Skill => " ↑↓ move · ⏎ select · type search · Esc close ",
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(theme.accent),
+        ))),
+        Rect {
+            x: inner.x,
+            y: inner.y + inner.height - 1,
+            width: inner.width,
+            height: 1,
+        },
+    );
 }
 
 // ── Command palette ───────────────────────────────────────────────────────────
@@ -280,11 +297,21 @@ fn render_palette(f: &mut Frame, palette: &crate::app::overlay::Palette, theme: 
         width: inner.width,
         height: inner.height.saturating_sub(3),
     };
+    let visible = list_area.height as usize;
+    if visible == 0 {
+        return;
+    }
+    let start = palette
+        .selected
+        .saturating_sub(visible.saturating_sub(1));
+    let end = (start + visible).min(palette.filtered.len());
     let commands = crate::app::overlay::slash_commands();
     let items: Vec<ListItem> = palette
         .filtered
         .iter()
         .enumerate()
+        .skip(start)
+        .take(end.saturating_sub(start))
         .map(|(i, &idx)| {
             let cmd = &commands[idx];
             let style = if i == palette.selected {

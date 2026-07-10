@@ -1,5 +1,6 @@
 pub mod access;
 pub mod executor;
+mod file_search;
 pub mod parser;
 pub mod tools;
 
