@@ -43,7 +43,11 @@ pub(crate) fn execute(call: &ToolCall, cwd: &Path) -> Result<String, String> {
     };
 
     if matches.is_empty() {
-        return Ok(format!("No matches for '{}' in {}", pattern, path.display()));
+        return Ok(format!(
+            "No matches for '{}' in {}",
+            pattern,
+            path.display()
+        ));
     }
 
     let total = matches.len();

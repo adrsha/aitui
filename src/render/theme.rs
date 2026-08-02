@@ -70,29 +70,27 @@ impl Theme {
         Theme {
             text: Color::Reset,
             muted: Color::Reset,
-            // ANSI 8 (DarkGray) as a background pill instead of ANSI 4 (Blue).
-            // Background-only — see `fg_guard`; the fg here is White.
+            // Blue is the primary structural accent; red and ANSI yellow provide
+            // danger and warm orange-like emphasis without leaving ANSI-16.
             subtle_pill: Color::DarkGray,
-            accent: Color::Cyan,
-            success: Color::Green,
+            accent: Color::Blue,
+            success: Color::Blue,
             warning: Color::Yellow,
             danger: Color::Red,
-            // Gutter accents from the ANSI palette (terminal-defined, adapt to
-            // light/dark). No custom RGB — always follow the terminal colours.
             gutter_user: Color::Blue,
             gutter_assistant: Color::Red,
-            gutter_tool: Color::Green,
-            gutter_system: Color::Yellow,
-            thinking: Color::Green,
-            link: Color::Reset,
+            gutter_tool: Color::Yellow,
+            gutter_system: Color::Red,
+            thinking: Color::Blue,
+            link: Color::Blue,
             // Code syntax — ANSI hues so it still follows the terminal palette.
-            hl_keyword: Color::Magenta,
+            hl_keyword: Color::Red,
             hl_function: Color::Blue,
             hl_type: Color::Yellow,
-            hl_string: Color::Green,
-            hl_comment: Color::Green,
-            hl_number: Color::Cyan,
-            hl_constant: Color::Cyan,
+            hl_string: Color::Yellow,
+            hl_comment: Color::Reset,
+            hl_number: Color::Red,
+            hl_constant: Color::Yellow,
             hl_property: Color::Blue,
             hl_variable: Color::Reset,
             hl_punct: Color::Reset,
@@ -129,11 +127,11 @@ impl Theme {
         Style::default().fg(fg_guard(self.muted))
     }
 
-    pub fn subtle_pill(&self) -> Style {
+    /// Opaque surface used to separate UI panels without decorative borders.
+    pub fn surface(&self) -> Style {
         Style::default()
             .bg(self.subtle_pill)
-            .fg(fg_guard(Color::White))
-            .add_modifier(Modifier::BOLD)
+            .fg(fg_guard(self.text))
     }
 
     /// Block cursor cell — reverse video against the terminal default.

@@ -16,7 +16,7 @@ crossterm  = { version = "0.28", features = ["event-stream"] }
 tokio      = { version = "1", features = ["full"] }
 
 # HTTP client
-reqwest    = { version = "0.11", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest    = { version = "0.11", default-features = false, features = ["blocking", "json", "stream", "multipart", "rustls-tls"] }
 
 # Serialization
 serde      = { version = "1", features = ["derive"] }
@@ -37,6 +37,12 @@ futures-util = "0.3"
 
 # Unicode width for correct wrapping / cursor math
 unicode-width = "0.1"
+
+# LSP client support
+lsp-server = "0.7"
+lsp-types  = "0.97"
+
+regex      = "1"
 
 # Syntax highlighting for code / file previews (tree-sitter grammars).
 tree-sitter            = "0.25"

@@ -81,8 +81,8 @@ fn build_reply(request: &ChatRequest) -> String {
     match cmd.to_ascii_lowercase().as_str() {
         "read" | "cat" => with_tool(
             "Reading that file…",
-            "read_file",
-            json!({ "path": arg.trim() }),
+            "file_management",
+            json!({ "action": "read", "path": arg.trim() }),
         ),
         "list" | "ls" => {
             let path = if arg.trim().is_empty() {
@@ -92,24 +92,16 @@ fn build_reply(request: &ChatRequest) -> String {
             };
             with_tool(
                 "Listing the directory…",
-                "list_dir",
-                json!({ "path": path }),
+                "file_management",
+                json!({ "action": "list", "path": path }),
             )
         }
         "write" => {
             let (path, content) = split_first_word(arg);
             with_tool(
                 "Writing the file…",
-                "write_file",
-                json!({ "path": path, "content": content }),
-            )
-        }
-        "append" => {
-            let (path, content) = split_first_word(arg);
-            with_tool(
-                "Appending to the file…",
-                "append_file",
-                json!({ "path": path, "content": content }),
+                "file_management",
+                json!({ "action": "write", "path": path, "content": content }),
             )
         }
         "edit" => {
@@ -117,16 +109,16 @@ fn build_reply(request: &ChatRequest) -> String {
             match rest.split_once("=>") {
                 Some((old, new)) => with_tool(
                     "Editing the file…",
-                    "edit_file",
-                    json!({ "path": path, "old_string": old.trim(), "new_string": new.trim() }),
+                    "file_management",
+                    json!({ "action": "edit", "path": path, "old": old.trim(), "new": new.trim() }),
                 ),
                 None => "Usage: `edit <path> <old text> => <new text>` (mock mode)".to_string(),
             }
         }
         "delete" | "rm" => with_tool(
             "Deleting the file…",
-            "delete_file",
-            json!({ "path": arg.trim() }),
+            "file_management",
+            json!({ "action": "delete", "path": arg.trim() }),
         ),
         "search" | "grep" => {
             let (pattern, path) = match arg.split_once(" in ") {
@@ -135,13 +127,13 @@ fn build_reply(request: &ChatRequest) -> String {
             };
             with_tool(
                 "Searching files…",
-                "search_files",
-                json!({ "pattern": pattern, "path": path }),
+                "file_management",
+                json!({ "action": "search", "pattern": pattern, "path": path }),
             )
         }
         "run" | "sh" | "shell" => with_tool(
             "Running the command…",
-            "run_shell",
+            "shell",
             json!({ "command": arg.trim() }),
         ),
         "demo" => demo_reply(),
@@ -157,19 +149,27 @@ fn build_reply(request: &ChatRequest) -> String {
 /// Prose followed by a single `tool` fence the agent will execute.
 fn with_tool(prose: &str, name: &str, args: serde_json::Value) -> String {
     let call = json!({ "name": name, "args": args });
-    format!("{prose}\n\n```tool\n{call}\n```\n")
+    format!(
+        "{prose}\n\n{}\n{call}\n{}\n",
+        crate::agent::parser::TOOL_OPEN,
+        crate::agent::parser::TOOL_CLOSE
+    )
 }
 
 /// A multi-step showcase: create a file, read it back, then list the directory —
 /// three tool calls in one turn (exercises the queue and per-tool permissions).
 fn demo_reply() -> String {
     let path = "aitui_mock_demo.txt";
-    let write = json!({ "name": "write_file", "args": { "path": path, "content": "Hello from AiTUI mock mode!\n" } });
-    let read = json!({ "name": "read_file", "args": { "path": path } });
-    let list = json!({ "name": "list_dir", "args": { "path": "." } });
+    let write = json!({ "name": "file_management", "args": { "action": "write", "path": path, "content": "Hello from AiTUI mock mode!\n" } });
+    let read = json!({ "name": "file_management", "args": { "action": "read", "path": path } });
+    let list = json!({ "name": "file_management", "args": { "action": "list", "path": "." } });
+    let (o, c) = (
+        crate::agent::parser::TOOL_OPEN,
+        crate::agent::parser::TOOL_CLOSE,
+    );
     format!(
         "Quick demo: create a file, read it back, then list the directory.\n\n\
-         ```tool\n{write}\n```\n\n```tool\n{read}\n```\n\n```tool\n{list}\n```\n"
+         {o}\n{write}\n{c}\n\n{o}\n{read}\n{c}\n\n{o}\n{list}\n{c}\n"
     )
 }
 
@@ -180,7 +180,6 @@ fn help_reply() -> String {
      - `read <path>`\n\
      - `list [dir]`\n\
      - `write <path> <text…>`\n\
-     - `append <path> <text…>`\n\
      - `edit <path> <old> => <new>`\n\
      - `delete <path>`\n\
      - `search <pattern> [in <dir>]`\n\
@@ -226,15 +225,17 @@ mod tests {
     #[test]
     fn read_command_emits_read_tool() {
         let r = reply_for("read src/main.rs");
-        assert!(r.contains("```tool"));
-        assert!(r.contains("\"name\":\"read_file\""));
+        assert!(r.contains("<tool>"));
+        assert!(r.contains("\"name\":\"file_management\""));
+        assert!(r.contains("\"action\":\"read\""));
         assert!(r.contains("src/main.rs"));
     }
 
     #[test]
     fn write_command_splits_path_and_content() {
         let r = reply_for("write notes.txt hello there");
-        assert!(r.contains("\"name\":\"write_file\""));
+        assert!(r.contains("\"name\":\"file_management\""));
+        assert!(r.contains("\"action\":\"write\""));
         assert!(r.contains("notes.txt"));
         assert!(r.contains("hello there"));
     }
@@ -242,15 +243,16 @@ mod tests {
     #[test]
     fn edit_command_parses_arrow() {
         let r = reply_for("edit a.txt foo => bar");
-        assert!(r.contains("\"name\":\"edit_file\""));
-        assert!(r.contains("\"old_string\":\"foo\""));
-        assert!(r.contains("\"new_string\":\"bar\""));
+        assert!(r.contains("\"action\":\"edit\""));
+        assert!(r.contains("\"old\":\"foo\""));
+        assert!(r.contains("\"new\":\"bar\""));
     }
 
     #[test]
     fn search_with_in_clause() {
         let r = reply_for("search TODO in src");
-        assert!(r.contains("\"name\":\"search_files\""));
+        assert!(r.contains("\"name\":\"file_management\""));
+        assert!(r.contains("\"action\":\"search\""));
         assert!(r.contains("\"pattern\":\"TODO\""));
         assert!(r.contains("\"path\":\"src\""));
     }
@@ -258,7 +260,7 @@ mod tests {
     #[test]
     fn demo_emits_three_tools() {
         let r = reply_for("demo");
-        assert_eq!(r.matches("```tool").count(), 3);
+        assert_eq!(r.matches("<tool>").count(), 3);
     }
 
     #[test]
@@ -277,7 +279,8 @@ mod tests {
     #[test]
     fn command_taken_from_last_line() {
         let r = reply_for("File: x\n```\nctx\n```\n\nread foo.txt");
-        assert!(r.contains("\"name\":\"read_file\""));
+        assert!(r.contains("\"name\":\"file_management\""));
+        assert!(r.contains("\"action\":\"read\""));
         assert!(r.contains("foo.txt"));
     }
 
@@ -304,8 +307,9 @@ mod tests {
             }
         }
         assert!(done, "stream must end with Done");
-        assert!(text.contains("```tool"));
-        assert!(text.contains("read_file"));
+        assert!(text.contains("<tool>"));
+        assert!(text.contains("file_management"));
+        assert!(text.contains("\"action\":\"read\""));
         assert!(text.contains("a.txt"));
     }
 }

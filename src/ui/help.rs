@@ -1,197 +1,199 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+use crate::app::commands::HELP_ENTRIES;
 use crate::app::state::App;
 use crate::render::theme::Theme;
 
+fn help_popup(area: Rect) -> Option<Rect> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let margin_x = if area.width >= 80 { 4 } else { 1 }.min(area.width / 2);
+    let margin_y = if area.height >= 24 { 1 } else { 0 }.min(area.height / 2);
+    let width = area.width.saturating_sub(margin_x * 2).clamp(1, 120);
+    let height = area.height.saturating_sub(margin_y * 2).max(1);
+    Some(Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    })
+}
+
+fn render_main(f: &mut Frame, app: &App, inner: Rect, theme: &Theme) {
+    let avail = inner.height as usize;
+    let scroll = app.help_scroll;
+    let mut lines: Vec<Line> = Vec::new();
+    let mut prev_section = "";
+
+    for (i, entry) in HELP_ENTRIES.iter().enumerate() {
+        if i < scroll {
+            continue;
+        }
+        if lines.len() >= avail {
+            break;
+        }
+
+        if entry.section != prev_section {
+            if !prev_section.is_empty() {
+                lines.push(Line::from(vec![]));
+            }
+            lines.push(Line::from(vec![Span::styled(
+                format!(" {} ", entry.section),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            prev_section = entry.section;
+        }
+
+        let is_sel = i == app.help_selected;
+        let style = if is_sel {
+            theme.selection()
+        } else {
+            Style::default().fg(theme.text)
+        };
+        let icon_style = if is_sel {
+            theme.selection().fg(theme.accent)
+        } else {
+            Style::default().fg(theme.accent)
+        };
+        let sel_mark = if is_sel { " ▸" } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(sel_mark.to_string(), icon_style),
+            Span::styled(format!(" {} ", entry.icon), icon_style),
+            Span::styled(
+                if entry.key.is_empty() {
+                    format!("  {}", entry.summary)
+                } else {
+                    format!(" {:<12}  {}", entry.key, entry.summary)
+                },
+                if is_sel {
+                    style.add_modifier(Modifier::BOLD)
+                } else {
+                    style
+                },
+            ),
+        ]));
+    }
+
+    // Footer hint
+    lines.push(Line::from(vec![]));
+    lines.push(Line::from(vec![Span::styled(
+        " ↑↓ — navigate  ·  →/Enter — details  ·  ←/q/Esc — close  ·  PgUp/PgDn — scroll",
+        Style::default().fg(theme.muted),
+    )]));
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_detail(
+    f: &mut Frame,
+    entry: &crate::app::commands::HelpEntry,
+    inner: Rect,
+    theme: &Theme,
+    _app: &App,
+) {
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(
+                format!(" {} ", entry.icon),
+                Style::default().fg(theme.accent),
+            ),
+            Span::styled(
+                entry.key,
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            entry.summary,
+            Style::default().fg(theme.text),
+        )]),
+        Line::from(vec![]),
+        Line::from(vec![Span::styled(
+            format!(" {} — Details", entry.section),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        )]),
+    ];
+
+    for line in entry.details {
+        if line.is_empty() {
+            lines.push(Line::from(vec![]));
+        } else {
+            lines.push(Line::from(vec![Span::styled(
+                format!(" {}", line),
+                Style::default().fg(theme.text),
+            )]));
+        }
+    }
+
+    lines.push(Line::from(vec![]));
+    lines.push(Line::from(vec![Span::styled(
+        " ← / q / Esc — back to overview  ·  ? — close help  ·  ↑↓ / PgUp/PgDn — scroll",
+        Style::default().fg(theme.muted),
+    )]));
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 pub fn render(f: &mut Frame, app: &App, theme: &Theme) {
-    let area = f.area();
-    let popup = Rect {
-        x: area.width / 6,
-        y: area.height / 8,
-        width: area.width * 2 / 3,
-        height: area.height * 3 / 4,
+    let Some(popup) = help_popup(f.area()) else {
+        return;
     };
 
     f.render_widget(Clear, popup);
 
+    let title = match app.help_detail {
+        Some(idx) => {
+            let name = HELP_ENTRIES
+                .get(idx)
+                .map(|e| format!("{} {} — Details", e.icon, e.key))
+                .unwrap_or_else(|| "Details".to_string());
+            format!(" {} ", name)
+        }
+        None => " Help — Keybindings & Commands ".to_string(),
+    };
+
     let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default())
         .title(Span::styled(
-            " Keybindings ",
+            title,
             Style::default().add_modifier(Modifier::BOLD),
         ))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .padding(Padding::uniform(1));
+        .style(theme.surface());
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let km = &app.keymap;
-    let key = |k: String| {
-        Span::styled(
-            format!(" {:<16}", k),
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )
-    };
-    let lit = |k: &str| {
-        Span::styled(
-            format!(" {:<16}", k),
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )
-    };
-    let val = |v: &str| Span::styled(v.to_string(), Style::default().fg(theme.text));
-    let head = |h: &str| {
-        Line::from(Span::styled(
-            format!(" {}", h),
-            Style::default()
-                .fg(theme.warning)
-                .add_modifier(Modifier::BOLD),
-        ))
-    };
+    match app.help_detail.and_then(|i| HELP_ENTRIES.get(i)) {
+        Some(entry) => render_detail(f, entry, inner, theme, app),
+        None => render_main(f, app, inner, theme),
+    }
+}
 
-    let bindings = vec![
-        head("Input (vim — fixed)"),
-        Line::from(vec![lit("h j k l"), val("Move cursor")]),
-        Line::from(vec![lit("w / b"), val("Word forward / back")]),
-        Line::from(vec![lit("0 / $"), val("Line start / end")]),
-        Line::from(vec![
-            lit("a A · o O · I"),
-            val("Append · open line · insert at start"),
-        ]),
-        Line::from(vec![
-            lit("x · dd · yy · p"),
-            val("Delete char / line · yank · paste"),
-        ]),
-        Line::from(vec![]),
-        head("Mode (configurable)"),
-        Line::from(vec![key(km.insert.label()), val("Insert mode")]),
-        Line::from(vec![key(km.normal_label()), val("Back to normal mode")]),
-        Line::from(vec![key(km.visual.label()), val("Visual mode")]),
-        Line::from(vec![key(km.command.label()), val("Command mode")]),
-        Line::from(vec![
-            lit("Enter"),
-            val("Send message  ·  Shift/Alt-Enter or Ctrl-J = newline"),
-        ]),
-        Line::from(vec![key(km.palette.label()), val("Command palette")]),
-        Line::from(vec![key(km.help.label()), val("Toggle this help")]),
-        Line::from(vec![]),
-        head("Global (configurable)"),
-        Line::from(vec![
-            key(km.open_editor.label()),
-            val("Open conversation in $EDITOR"),
-        ]),
-        Line::from(vec![
-            key(km.open_file.label()),
-            val("File browser → open in $EDITOR (toggle)"),
-        ]),
-        Line::from(vec![key(km.open_shell.label()), val("Drop into a shell")]),
-        Line::from(vec![key(km.session_picker.label()), val("Switch session")]),
-        Line::from(vec![
-            key(km.fork_session.label()),
-            val("Fork session (parallel branch)"),
-        ]),
-        Line::from(vec![
-            key(format!(
-                "{} / {}",
-                km.next_session.label(),
-                km.prev_session.label()
-            )),
-            val("Next / prev session"),
-        ]),
-        Line::from(vec![
-            key(format!(
-                "{} / {}",
-                km.scroll_up.label(),
-                km.scroll_down.label()
-            )),
-            val("Scroll transcript (page)"),
-        ]),
-        Line::from(vec![
-            key(format!(
-                "{} / {}",
-                km.scroll_half_down.label(),
-                km.scroll_half_up.label()
-            )),
-            val("Scroll transcript (half-page)"),
-        ]),
-        Line::from(vec![
-            key(format!(
-                "{} / {}",
-                km.scroll_top.label(),
-                km.scroll_bottom.label()
-            )),
-            val("Scroll to top / bottom"),
-        ]),
-        Line::from(vec![
-            key(km.toggle_output.label()),
-            val("Show / hide tool output"),
-        ]),
-        Line::from(vec![
-            key(format!(
-                "{} / {}",
-                km.file_picker.label(),
-                km.model_picker.label()
-            )),
-            val("File picker / model picker"),
-        ]),
-        Line::from(vec![
-            key(format!(
-                "{} / {}",
-                km.prev_model.label(),
-                km.next_model.label()
-            )),
-            val("Prev / next model"),
-        ]),
-        Line::from(vec![key(km.toggle_agent.label()), val("Toggle agent mode")]),
-        Line::from(vec![key(km.quit.label()), val("Cancel response / quit")]),
-        Line::from(vec![]),
-        head("File browser (Ctrl-E / Ctrl-F)"),
-        Line::from(vec![
-            lit("h j k l"),
-            val("Parent dir · down · up · open file / enter dir"),
-        ]),
-        Line::from(vec![
-            lit("Space · Enter"),
-            val("Select file(s) · open all selected"),
-        ]),
-        Line::from(vec![]),
-        head("Message actions (commands)"),
-        Line::from(vec![lit(":retry :r"), val("Regenerate the last reply")]),
-        Line::from(vec![
-            lit(":edit-last :el"),
-            val("Edit your last message and resend"),
-        ]),
-        Line::from(vec![
-            lit(":copy :y"),
-            val("Copy the last reply to the clipboard"),
-        ]),
-        Line::from(vec![
-            lit(":copy-code :yc"),
-            val("Copy the last code block to the clipboard"),
-        ]),
-        Line::from(vec![
-            lit("yy · visual y"),
-            val("Yank — also copies to the system clipboard (OSC 52)"),
-        ]),
-        Line::from(vec![]),
-        Line::from(vec![lit("@file"), val("Mention a file into the message")]),
-        Line::from(vec![
-            lit(":skills"),
-            val("Toggle skills (personas) — add .md in ~/.config/aitui/skills/"),
-        ]),
-        Line::from(vec![lit(":w :q :new"), val("Send · quit · new session")]),
-        Line::from(vec![
-            lit("(edit ~/.config/aitui/config.toml to rebind)"),
-            val(""),
-        ]),
-    ];
+#[cfg(test)]
+mod tests {
+    use super::help_popup;
+    use ratatui::layout::Rect;
 
-    f.render_widget(Paragraph::new(bindings), inner);
+    #[test]
+    fn help_popup_stays_within_small_and_large_frames() {
+        assert_eq!(help_popup(Rect::new(0, 0, 0, 10)), None);
+        assert_eq!(
+            help_popup(Rect::new(3, 4, 20, 8)),
+            Some(Rect::new(4, 4, 18, 8))
+        );
+        assert_eq!(
+            help_popup(Rect::new(0, 0, 140, 40)),
+            Some(Rect::new(10, 1, 120, 38))
+        );
+    }
 }

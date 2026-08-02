@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
 
 /// A single message in the conversation.
@@ -24,6 +26,14 @@ pub struct ChatMessage {
     /// Native function-calling: the id of the call this `role:"tool"` message answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Local transcript metadata for purpose-built tool rendering. Cleared from
+    /// messages sent to the API, but persisted in sessions so file previews and
+    /// edit comparisons survive reloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_tool_call: Option<crate::agent::ToolCall>,
+    /// Wall-clock unix-timestamp seconds when this message was created.
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 /// A structured tool call in the OpenAI `tools` protocol.
@@ -92,6 +102,11 @@ impl ChatMessage {
             first_ms: None,
             tool_calls: None,
             tool_call_id: None,
+            local_tool_call: None,
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         }
     }
 
@@ -140,10 +155,12 @@ pub struct ChatRequest {
     /// report token counts. Ignored by servers that don't support it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
-    /// Reasoning effort for reasoning-capable models (e.g. "low"/"medium"/"high"
-    /// for GPT-5 / o-series). Omitted when None so non-reasoning models are fine.
+    /// Free-form reasoning effort. Omitted when None.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Free-form reasoning mode. Omitted when None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_mode: Option<String>,
     /// Native function-calling tool schemas (`agent::tool_schemas()`). Omitted for
     /// non-agent turns / endpoints without tool support.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,15 +190,17 @@ impl ChatRequest {
                 include_usage: true,
             }),
             reasoning_effort: None,
+            reasoning_mode: None,
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
         }
     }
 
-    /// Set the reasoning effort ("low"/"medium"/"high"); None clears it.
-    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+    /// Set free-form reasoning controls; None clears the corresponding field.
+    pub fn with_reasoning(mut self, effort: Option<String>, mode: Option<String>) -> Self {
         self.reasoning_effort = effort;
+        self.reasoning_mode = mode;
         self
     }
 
@@ -325,6 +344,15 @@ pub struct FnDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_controls_serialize_free_form_values() {
+        let request = ChatRequest::new("model", vec![])
+            .with_reasoning(Some("custom-effort".into()), Some("deep-think".into()));
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["reasoning_effort"], "custom-effort");
+        assert_eq!(json["reasoning_mode"], "deep-think");
+    }
 
     #[test]
     fn image_models_detected_chat_models_not() {

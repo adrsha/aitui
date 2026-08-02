@@ -44,6 +44,8 @@ fn run(
     // Draw only when something changed, instead of spinning at ~250fps. `dirty`
     // starts true so the first frame always draws.
     let mut dirty = true;
+    let mut last_session_sync = std::time::Instant::now();
+    app.sessions.publish_presence(&app.running_session_ids());
     loop {
         // Animations (streaming spinner, "working" indicator) need periodic
         // redraws even without new events; a busy state forces a fast repaint.
@@ -52,7 +54,7 @@ fn run(
         // ── 1. Render (ui::render owns layout + chat-doc sync) ───────────
         if dirty || animating {
             terminal.draw(|f| ui::render(f, app))?;
-            dirty = false;
+            dirty = display_pending_image(app);
         }
 
         // ── 1b. Pending external program: suspend TUI, run it, restore ───
@@ -76,6 +78,12 @@ fn run(
                 dispatch(app, actions);
             }
             dirty = true; // an event may move the cursor / selection even with no action
+        }
+
+        // ── 2b. Drain actionable desktop-notification responses ─────────
+        while let Ok(action) = app.notification_rx.try_recv() {
+            dispatch(app, vec![Action::DesktopNotification(action)]);
+            dirty = true;
         }
 
         // ── 3. Drain model fetch channel ─────────────────────────────────
@@ -113,6 +121,13 @@ fn run(
                         Ok(api::StreamEvent::ToolCallStarted(name)) => {
                             actions.push(Action::StreamToolCallStarted(sid, name))
                         }
+                        Ok(api::StreamEvent::ImageReady(path)) => {
+                            actions.push(Action::StreamImageReady(sid, path))
+                        }
+                        Ok(api::StreamEvent::ImageError(error)) => {
+                            actions.push(Action::StreamImageError(sid, error));
+                            break;
+                        }
                         Ok(api::StreamEvent::Done) => {
                             actions.push(Action::StreamDone(sid));
                             break;
@@ -137,14 +152,24 @@ fn run(
 
         // ── 5. Drain agent tool result channel ─────────────────────────
         if let Some(rx) = app.agent_tool_rx.as_mut() {
-            match rx.try_recv() {
-                Ok(result) => {
-                    dispatch(app, vec![Action::AgentToolResult(result)]);
-                    app.agent_tool_rx = None;
-                    dirty = true;
-                }
-                Err(_) => {}
+            if let Ok(result) = rx.try_recv() {
+                dispatch(app, vec![Action::AgentToolResult(result)]);
+                app.agent_tool_rx = None;
+                dirty = true;
             }
+        }
+        if let Some(rx) = app.agent_tool_batch_rx.as_mut() {
+            if let Ok(results) = rx.try_recv() {
+                dispatch(app, vec![Action::AgentToolBatchResult(results)]);
+                app.agent_tool_batch_rx = None;
+                dirty = true;
+            }
+        }
+
+        // ── 5a. Drain parallel child-agent progress/results ────────────────
+        while let Ok(event) = app.subtask_rx.try_recv() {
+            dispatch(app, vec![Action::SubtaskEvent(event)]);
+            dirty = true;
         }
 
         // ── 5a2. Drain access-policy judge verdicts ─────────────────────
@@ -162,6 +187,38 @@ fn run(
                 app.title_rx = None;
                 dirty = true;
             }
+        }
+
+        // ── 5a4. Drain optional response suggestions ───────────────────
+        while let Ok((sid, signature, suggestions)) = app.suggestion_rx.try_recv() {
+            dispatch(
+                app,
+                vec![Action::ResponseSuggestionsReady(
+                    sid,
+                    signature,
+                    suggestions,
+                )],
+            );
+            dirty = true;
+        }
+
+        // ── 5a5. Drain session-memory extraction results ───────────────
+        while let Ok((session_id, source_turn, result)) = app.memory_rx.try_recv() {
+            dispatch(
+                app,
+                vec![Action::SessionMemoryExtracted {
+                    session_id,
+                    source_turn,
+                    result,
+                }],
+            );
+            dirty = true;
+        }
+
+        // ── 5a6. Drain parallel task-tracker results ──────────────────
+        while let Ok((sid, signature, result)) = app.todo_rx.try_recv() {
+            dispatch(app, vec![Action::TodoUpdateReady(sid, signature, result)]);
+            dirty = true;
         }
 
         // ── 5b. Drain speculative (pre-run read-only) tool results ──────
@@ -183,13 +240,46 @@ fn run(
             dirty = true;
         }
 
+        // ── 5e. Reconcile sessions written by other AiTUI clients ───────
+        if last_session_sync.elapsed() >= Duration::from_millis(500) {
+            app.sessions.publish_presence(&app.running_session_ids());
+            dispatch(app, vec![Action::SyncSessions]);
+            last_session_sync = std::time::Instant::now();
+            dirty = true;
+        }
+
         // ── 6. Check quit flag ─────────────────────────────────────────
         if app.should_quit {
             break;
         }
     }
 
+    app.sessions.clear_presence();
     Ok(())
+}
+
+fn display_pending_image(app: &mut app::App) -> bool {
+    let Some(path) = app.pending_image.take() else {
+        return false;
+    };
+    let area = app.layout.chat;
+    if area.width < 8 || area.height < 4 {
+        app.set_status(format!("Image saved: {}", path.display()));
+        return true;
+    }
+    let cols = area.width.saturating_sub(4).min(80);
+    let rows = area.height.saturating_sub(2).min((cols / 2).max(4));
+    if let Err(error) = crate::render::image::display_image(
+        &path,
+        area.x.saturating_add(2),
+        area.y.saturating_add(1),
+        cols,
+        rows,
+    ) {
+        app.set_status(format!("Image saved: {} · {}", path.display(), error));
+        return true;
+    }
+    false
 }
 
 fn dispatch(app: &mut app::App, actions: Vec<Action>) {
@@ -289,6 +379,16 @@ fn run_external_inner(ext: app::state::PendingExternal) -> anyhow::Result<Option
             let contents = std::fs::read_to_string(&path).unwrap_or_default();
             let _ = std::fs::remove_file(&path);
             return Ok(Some(Action::AgentPermissionEdited(contents)));
+        }
+        PendingExternal::DecisionReadback(path) => {
+            let ed = editor();
+            Command::new(&ed)
+                .arg(&path)
+                .status()
+                .map_err(|e| anyhow::anyhow!("Failed to launch {ed}: {e}"))?;
+            let contents = std::fs::read_to_string(&path).unwrap_or_default();
+            let _ = std::fs::remove_file(&path);
+            return Ok(Some(Action::AgentDecisionEdited(contents)));
         }
         PendingExternal::PolicyReadback(path) => {
             let ed = editor();

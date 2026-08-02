@@ -96,6 +96,10 @@ pub enum Action {
     StreamUsage(usize, crate::api::Usage),
     /// Native tool-call metadata arrived before the complete runnable call.
     StreamToolCallStarted(usize, String),
+    /// A generated image has been saved and is ready for inline display.
+    StreamImageReady(usize, PathBuf),
+    /// A non-streaming image-generation request failed.
+    StreamImageError(usize, String),
     StreamDone(usize),
     StreamError(usize, String),
     /// Start (or queue) the agent tool round for a session whose stream was cut
@@ -112,13 +116,27 @@ pub enum Action {
     ChatHalfDown,
     ChatHalfUp,
     ChatScroll(i32),
+    /// Scroll the task list in the sidebar when the pointer is over it.
+    SidebarTaskScroll(i32),
     /// Expand / collapse the full output of executed tools.
     ToggleOutput,
     /// A left-click in the transcript at (column, row) — toggles the individual
     /// tool output whose collapsible header sits on that row.
     ChatClick(u16, u16),
-    /// Dismiss the transient `Notice` dialog.
+    /// Mouse drag in the transcript — updates the text selection.
+    ChatDrag(u16, u16),
+    /// Mouse button release — finalises the text selection and copies to clipboard.
+    ChatRelease,
+    /// Dismiss a notice or child-agent detail dialog.
     DismissNotice,
+    PrevSubtask,
+    NextSubtask,
+    SubtaskDetailUp,
+    SubtaskDetailDown,
+    /// Enter a child agent: chat + sidebar switch to its own content.
+    InspectSubtask(u64),
+    /// Leave the currently viewed agent, going up to its parent (or root).
+    NavigateBack,
 
     // Open the current conversation in $EDITOR (read/search with real vim)
     OpenEditor,
@@ -137,13 +155,9 @@ pub enum Action {
     BrowserSelect,
     BrowserClose,
 
-    // Startup launcher (resume a session or start new)
-    StartupUp,
-    StartupDown,
-    StartupNew,
-    StartupConfirm,
-
     // Sessions
+    /// Reconcile session creations/removals written by another AiTUI client.
+    SyncSessions,
     NewSession,
     /// Duplicate the active session into a new one and switch to it (branch the
     /// conversation to explore in parallel).
@@ -155,6 +169,21 @@ pub enum Action {
     SelectSession(usize),
     RenameSession(String),
     SessionTitleGenerated(usize, String),
+    /// Optional model-generated follow-up replies for a completed session turn.
+    ResponseSuggestionsReady(usize, u64, Vec<String>),
+    /// Validated memory operations extracted from one completed session turn.
+    SessionMemoryExtracted {
+        session_id: usize,
+        source_turn: u64,
+        result: Result<Vec<crate::app::memory::MemoryOperation>, String>,
+    },
+    /// The parallel task-tracker agent revised the session checklist after a
+    /// completed turn (per-item status/percent + overall progress).
+    TodoUpdateReady(usize, u64, Result<crate::app::state::TodoUpdate, String>),
+    /// Insert one displayed suggestion into the empty composer for editing.
+    AcceptResponseSuggestion(usize),
+    /// Enable or disable non-blocking follow-up suggestions.
+    SetResponseSuggestions(bool),
 
     // Skills (toggleable instruction snippets)
     OpenSkillPicker,
@@ -177,10 +206,14 @@ pub enum Action {
 
     // Overlays (generic)
     OpenCommandPalette,
+    OpenCommandLine,
     OpenSettings,
     PickerUp,
     PickerDown,
     PickerConfirm,
+    CommandLineNext,
+    CommandLinePrev,
+    CommandLineAccept,
     PickerCancel,
     PickerChar(char),
     PickerBackspace,
@@ -197,24 +230,51 @@ pub enum Action {
     /// Delete the session at the given index in the picker list.
     DeleteSessionAt(usize),
 
-    // Agent
-    ToggleAgentMode,
-    /// Apply the currently-highlighted option in the permission menu.
+    // Agent (always on)
+    /// Ask the automated review model to judge the pending batch against the
+    /// access-rule phrases currently selected in the permission overlay.
+    AgentReviewPermission,
+    /// Apply the currently-highlighted option in the permission menu directly.
     AgentResolvePermission,
     /// Quick keys: allow / deny this one call without opening the full menu.
+    /// A deny opens the optional-reason box rather than resolving immediately.
     AgentQuickAllow,
     AgentQuickDeny,
+    /// Back out of the deny reason box, returning to the permission menu.
+    AgentDenyCancel,
     /// Scroll the command list in the permission prompt (independent of the
     /// allow/deny option selection).
     AgentPermScrollUp,
     AgentPermScrollDown,
+    AgentPermScrollLeft,
+    AgentPermScrollRight,
+    /// Toggle typing for a custom directory, duration, or request count.
+    /// Open or accept the popup selector for the highlighted access-rule phrase.
+    AgentPermissionSelector,
+    /// Navigate to the parent directory in the access-rule folder picker.
+    AgentPermissionFolderParent,
+    /// Close the access-rule popup selector without changing the current value.
+    AgentPermissionSelectorCancel,
+    /// Toggle direct editing for custom directory/count values.
+    AgentPermissionCustom,
     /// Open the pending permission batch in `$EDITOR` to edit the commands.
     AgentPermissionEdit,
     /// The edited permission buffer came back from `$EDITOR`; apply it.
     AgentPermissionEdited(String),
+    /// Open the exact session access entries; selected entries can be crossed off.
+    OpenAccessManager,
+    /// Edit the selected remembered access entry in the structured rule form.
+    EditAccessEntry(usize),
+    /// Remove the selected entry from the access manager.
+    RemoveAccessEntry(usize),
+    /// Disable automated permission review. If a review is currently in flight,
+    /// cancel it and ask the user about that pending batch immediately.
+    DisableAccessReview,
     /// Set (or clear, when empty) the natural-language session access policy the
     /// judge model uses to auto-allow/deny tool calls.
     SetAccessPolicy(String),
+    /// Select the default automated permission-review strictness.
+    SetAccessReviewMode(crate::config::AccessReviewMode),
     /// Open `$EDITOR` to write/revise the session access policy (from the prompt).
     AgentEditPolicy,
     /// The judge model's verdicts for the in-flight batch came back (per-call).
@@ -228,11 +288,16 @@ pub enum Action {
     /// Stop the active session's autonomous loop.
     StopLoop,
     AgentDecisionToggle,
+    AgentDecisionCustom,
+    AgentDecisionEdit,
+    AgentDecisionEdited(String),
     AgentResolveDecision,
     AgentPlanEdit,
     AgentPlanAccept,
     AgentPlanDeny,
     AgentToolResult(crate::agent::ToolResult),
+    AgentToolBatchResult(Vec<crate::agent::ToolResult>),
+    SubtaskEvent(crate::app::state::SubtaskEvent),
     AgentCancel,
     /// The model emitted tool calls while agent mode is off: enable agent mode
     /// and run them, or decline and let the model answer without tools.
@@ -243,9 +308,17 @@ pub enum Action {
     SetSystemPrompt(Option<String>),
 
     // UI / misc
+    /// Action selected from an OS desktop notification.
+    DesktopNotification(crate::app::notify::DesktopResponse),
     FocusGained,
     FocusLost,
     ToggleHelp,
+    HelpUp,
+    HelpDown,
+    HelpPageUp,
+    HelpPageDown,
+    HelpSelect,
+    HelpBack,
     Resize,
     Quit,
 }

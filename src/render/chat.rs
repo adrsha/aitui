@@ -78,6 +78,10 @@ pub struct ChatState {
     /// After the next rebuild, scroll so the tail of this message's rows sits at
     /// the bottom of the viewport — used to reveal a just-expanded tool output.
     pub focus_msg: Option<usize>,
+    /// The child agent currently shown in place of the session transcript
+    /// (`None` = root chat). Compared against `App.view_node` each frame so the
+    /// doc is rebuilt the moment the user enters or exits an agent.
+    pub viewed_node: Option<u64>,
 
     // ── cache ───────────────────────────────────────────────────────────────
     doc: Vec<RenderedLine>,
@@ -138,8 +142,34 @@ impl ChatState {
         row.toggle
     }
 
+    /// Walk backwards from the given viewport row to find an enclosing toggle
+    /// header within the same message. Used so clicking any visible row of a
+    /// collapsible block (not just its header) collapses/expands it.
+    pub fn enclosing_toggle(&self, vp_row: usize) -> Option<(usize, usize)> {
+        let abs_row = self.scroll + vp_row;
+        let clicked = self.doc.get(abs_row)?;
+        let msg = clicked.msg;
+        for i in (0..=abs_row).rev() {
+            let row = self.doc.get(i)?;
+            if row.msg != msg {
+                return None;
+            }
+            if let Some(key) = row.toggle {
+                return Some(key);
+            }
+        }
+        None
+    }
+
     pub fn doc(&self) -> &[RenderedLine] {
         &self.doc
+    }
+
+    /// Stored-message index owning the transcript row at the top of the viewport.
+    pub fn viewport_message(&self) -> Option<usize> {
+        self.doc
+            .get(self.scroll.min(self.doc.len().saturating_sub(1)))
+            .map(|row| row.msg)
     }
 
     fn max_scroll(&self, h: usize) -> usize {
@@ -161,6 +191,17 @@ impl ChatState {
             self.scroll = self.scroll.saturating_sub(delta as usize);
         }
         self.stick_bottom = self.scroll >= max_scroll;
+    }
+
+    pub fn scroll_to_track(&mut self, row: usize, track_height: usize, viewport_height: usize) {
+        let max_scroll = self.max_scroll(viewport_height);
+        if track_height <= 1 || max_scroll == 0 {
+            self.scroll = 0;
+        } else {
+            self.scroll = row.min(track_height - 1) * max_scroll / (track_height - 1);
+        }
+        self.stick_bottom = self.scroll >= max_scroll;
+        self.focus_msg = None;
     }
 
     pub fn page_up(&mut self, h: usize) {
@@ -206,15 +247,48 @@ mod tests {
             role: "assistant".into(),
             blocks: vec![Block::Markdown(body)],
             duration_ms: None,
-            first_ms: None,
-            loading: None,
-            started_at: None,
+            created_at: None,
         }];
         let doc = build(&msgs, 40, &Theme::default(), &HashSet::new(), false, false);
         let mut s = ChatState::new();
         s.stick_bottom = false;
         s.set_doc(doc, 1, 40, 10);
         s
+    }
+
+    #[test]
+    fn viewport_message_tracks_the_top_visible_row() {
+        let msgs = vec![
+            DocMessage {
+                role: "user".into(),
+                blocks: vec![Block::Markdown("first prompt".into())],
+                duration_ms: None,
+                created_at: None,
+            },
+            DocMessage {
+                role: "assistant".into(),
+                blocks: vec![Block::Markdown("first result\nmore result".into())],
+                duration_ms: None,
+                created_at: None,
+            },
+            DocMessage {
+                role: "user".into(),
+                blocks: vec![Block::Markdown("second prompt".into())],
+                duration_ms: None,
+                created_at: None,
+            },
+        ];
+        let doc = build(&msgs, 40, &Theme::default(), &HashSet::new(), false, false);
+        let first_result = doc.iter().position(|row| row.msg == 1).unwrap();
+        let second_prompt = doc.iter().position(|row| row.msg == 2).unwrap();
+        let mut state = ChatState::new();
+        state.stick_bottom = false;
+        state.set_doc(doc, 1, 40, 2);
+
+        state.scroll = first_result;
+        assert_eq!(state.viewport_message(), Some(1));
+        state.scroll = second_prompt;
+        assert_eq!(state.viewport_message(), Some(2));
     }
 
     #[test]
@@ -227,6 +301,21 @@ mod tests {
         s.scroll_by(1000, 10); // scroll way up
         assert_eq!(s.scroll, 0);
         assert!(!s.stick_bottom);
+    }
+
+    #[test]
+    fn scrollbar_track_click_maps_top_middle_and_bottom() {
+        let mut s = sample_state(100);
+        s.scroll_to_track(0, 10, 10);
+        assert_eq!(s.scroll, 0);
+        assert!(!s.stick_bottom);
+
+        s.scroll_to_track(5, 10, 10);
+        assert!(s.scroll > 0 && s.scroll < s.max_scroll(10));
+
+        s.scroll_to_track(9, 10, 10);
+        assert_eq!(s.scroll, s.max_scroll(10));
+        assert!(s.stick_bottom);
     }
 
     #[test]
@@ -261,9 +350,7 @@ mod tests {
             role: "assistant".into(),
             blocks: vec![Block::Markdown(text.into())],
             duration_ms: None,
-            first_ms: None,
-            loading: None,
-            started_at: None,
+            created_at: None,
         }];
         build(&msgs, 40, &Theme::default(), &HashSet::new(), false, false)
     }

@@ -17,8 +17,10 @@ The architectural foundation. _Done (commits `85a173a`, `47eb13f`)._
 - [x] Elm-style `Action → reducer → effect` core
 - [x] OpenAI-compatible streaming client + model listing
 - [x] Sessions with JSON persistence
+- [x] Per-session structured memory with non-blocking extraction, replacement, and capped prompt injection
 - [x] Vim-modal multi-line input, command line, palette
 - [x] `@mention`, file & image attachments
+- [x] Text-to-image context handoff + inline Kitty/Sixel generated-image previews
 - [x] Prompt-fenced agent loop with permissions
 - [x] Broad unit-test coverage of reducer/session/executor/parser
 
@@ -65,13 +67,20 @@ mock mode still work on the fenced path.
 
 Make the agent something you can let run.
 
+- [x] Adaptive decision workflow: obvious paths proceed directly; genuine alternatives use explained `interaction(ask|propose)` choices
+- [x] Rich decision UI: wrapped/scrolling options, selected detail pane, custom response, and `$EDITOR` option edits
+- [x] Agent todo discipline: inspect/update task list at every step boundary
 - [ ] Diff preview in the permission prompt for `write_file` / `edit_file`
 - [x] Composer auto-sizes by wrapped visual rows so long single-line prompts remain visible up to the configured input-height cap
 - [x] Manual model-list reload command (`:reload-models` / `:models-reload`)
+- [x] Optional generated follow-up replies as inline empty-composer ghost text (`:suggestions`, insert-mode `Tab`, or `Alt+1`–`Alt+3`)
+- [x] Compact clickable top-right access control opens the session policy editor
+- [x] Display `$HOME` paths as `~/…` across CWD metadata, overlays, and tool transcript output
 - [x] `edit_file`: require a unique match (error on 0 or >1) before replacing
-- [ ] Path sandboxing: confine tool paths to the project root by default; explicit opt-out
+- [x] Named agent registry: `[agents.<name>]` config with description/model/role and per-agent tool policy (D-023)
+- [x] Unrestricted tool paths: CWD is the base for relative paths, while absolute paths and `..` escapes remain available subject to normal permissions (supersedes D-024)
 - [ ] `run_shell`: timeout, output cap (already 8 KiB), and a clear "this runs arbitrary commands" gate
-- [ ] Cancel an in-flight tool / agent round cleanly (`AgentCancel` mid-execution)
+- [x] Cancel an in-flight tool / agent round cleanly (`AgentCancel` mid-execution: abort flag kills shell process groups, short-circuits pending tool starts)
 - [ ] Surface tool errors as first-class, retryable UI events
 
 **Exit:** every mutating tool shows what it will change before it changes it, and
@@ -81,10 +90,11 @@ nothing can touch files outside the project without explicit consent.
 
 ## Phase 4 — Resilience & correctness ⬜
 
-- [ ] HTTP request timeout + cancellable stream (drop = abort the request)
+- [x] Web tools avoid nested async runtimes; provider panics return failed tool results without tearing down or printing over Ratatui
+- [x] HTTP request timeout + cancellable stream (drop = abort the request: 120s idle timeout, `tx.closed()` races the receive loop)
 - [ ] Retry with backoff on transient network errors
 - [ ] Graceful, legible error surface for API errors (status + body, not a raw string)
-- [ ] Usage/token accounting in the statusbar (parse `usage` when present)
+- [x] Usage/token accounting in permanent top metadata (session-scoped counts + context gauge; explicit pending state when absent)
 - [ ] SSE parser unit tests (`api/stream.rs`)
 - [ ] Agent-loop integration test (Phase 2 dependency)
 - [ ] Persist permission memory across runs (optional)
@@ -96,6 +106,10 @@ tells you what happened and what it cost.
 
 ## Phase 5 — UX polish ⬜
 
+- [x] Dedicated top header with clickable session tabs and permanent token/access metadata; active cwd lives beside the model at the bottom-right
+- [x] Thin color-matched diff gutter and line numbers for added/removed rows
+- [x] Whole-word wrapping for styled transcript rows, preserving Tree-sitter styles and opaque continuation backgrounds
+- [x] Group search matches below one home-shortened path header per file
 - [ ] Theme selection actually switches palettes; ship 2–3 good themes
 - [ ] Finish vim visual mode (selection ops are currently dead code)
 - [ ] Discoverable keybinding hints / which-key style affordances
@@ -118,6 +132,8 @@ Only once features are stable. Measure before optimizing.
 - [ ] Profile redraw cost on very large transcripts; confirm the per-message cache holds at 10k lines
 - [ ] Bound session history / transcript memory; lazy-load old sessions
 - [ ] Audit remaining allocations on the hot streaming path (`mark_gutter` clones)
+- [x] Execute already-authorized consecutive read-only tools as bounded parallel waves with deterministic source-order commit
+- [x] Add adaptive evidence-gated child replication and independent disagreement verification
 
 **Exit:** smooth at 10k-line transcripts; idle CPU near zero.
 

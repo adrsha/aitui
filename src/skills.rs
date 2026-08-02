@@ -22,6 +22,11 @@ pub struct Skill {
 }
 
 fn config_base() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_CONFIG_BASE.with(|base| base.borrow().clone()) {
+        return path;
+    }
+
     std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -109,15 +114,22 @@ fn load_with_active(extra_active: &HashSet<String>) -> Vec<Skill> {
                 .unwrap_or("")
                 .to_string();
             let is_active = active.iter().any(|a| a == &name) || extra_active.contains(&name);
+            // Cap skill body at 2000 chars to prevent arbitrary prompt inflation.
+            let body = body.trim();
+            let body = if body.len() > 2000 {
+                format!("{}\n… (trimmed to 2000 chars)", &body[..2000])
+            } else {
+                body.to_string()
+            };
             skills.push(Skill {
                 name,
                 desc,
-                body: body.trim().to_string(),
+                body,
                 active: is_active,
             });
         }
     }
-    skills.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    skills.sort_by_key(|skill| skill.name.to_lowercase());
     skills
 }
 
@@ -130,7 +142,24 @@ code blocks and error text unchanged.\n\n\
 Pattern: `[thing] [action] [reason]. [next step].`\n";
 
 #[cfg(test)]
-pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+thread_local! {
+    static TEST_CONFIG_BASE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_config_base() -> Option<PathBuf> {
+    TEST_CONFIG_BASE.with(|base| base.borrow().clone())
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_config_base<T>(base: PathBuf, f: impl FnOnce() -> T) -> T {
+    TEST_CONFIG_BASE.with(|slot| {
+        let previous = slot.replace(Some(base));
+        let result = f();
+        slot.replace(previous);
+        result
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -138,7 +167,6 @@ mod tests {
 
     #[test]
     fn reload_preserves_in_memory_active_skills() {
-        let _guard = ENV_TEST_LOCK.lock().unwrap();
         let base = std::env::temp_dir().join(format!(
             "aitui_skills_reload_{}_{}",
             std::process::id(),
@@ -147,19 +175,14 @@ mod tests {
         let dir = base.join("aitui").join("skills");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("style.md"), "# Style\nBe direct.").unwrap();
-        let old = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &base) };
 
-        let mut skills = load();
-        assert_eq!(skills.len(), 1);
-        skills[0].active = true;
-        std::fs::write(dir.join("style.md"), "# Style\nBe very direct.").unwrap();
-        let reloaded = reload_preserving_active(&skills);
-
-        match old {
-            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
+        let reloaded = with_test_config_base(base.clone(), || {
+            let mut skills = load();
+            assert_eq!(skills.len(), 1);
+            skills[0].active = true;
+            std::fs::write(dir.join("style.md"), "# Style\nBe very direct.").unwrap();
+            reload_preserving_active(&skills)
+        });
         let _ = std::fs::remove_dir_all(&base);
 
         assert_eq!(reloaded.len(), 1);

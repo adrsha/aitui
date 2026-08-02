@@ -15,8 +15,12 @@ pub enum StreamEvent {
     /// Final token accounting, when the endpoint reports it.
     Usage(super::models::Usage),
     /// A native structured tool call started streaming; the runnable call is still
-    /// emitted as a synthesized tool fence once complete.
+    /// emitted as a synthesized `<tool>` block once complete.
     ToolCallStarted(String),
+    /// A generated image was fully written and is ready for terminal preview.
+    ImageReady(std::path::PathBuf),
+    /// The non-streaming image-generation request failed.
+    ImageError(String),
     /// The stream finished cleanly.
     Done,
     /// A network or protocol error occurred.
@@ -95,6 +99,7 @@ impl ApiClient {
                     headers.clone(),
                     request.clone(),
                     tx.clone(),
+                    STREAM_IDLE_TIMEOUT,
                 )
                 .await
                 {
@@ -118,15 +123,13 @@ impl ApiClient {
         Ok(rx)
     }
 
-    /// Generate an image via `/v1/images/generations` (image models can't be sent
-    /// to chat completions — they 503). Spawns a task that saves the result to a
-    /// file and reports it back over the same `StreamEvent` channel the chat path
-    /// uses, so the UI/agent loop treats it like any other turn.
+    /// Generate an image via `/v1/images/generations`. Spawns a task that saves
+    /// the result and reports the completed path over the normal stream channel.
     pub fn generate_image(
         &self,
         model: &str,
         prompt: &str,
-    ) -> anyhow::Result<(mpsc::Receiver<StreamEvent>, String)> {
+    ) -> anyhow::Result<mpsc::Receiver<StreamEvent>> {
         let url = format!("{}/v1/images/generations", self.endpoint);
         let headers = self.auth_headers()?;
         let client = self.client.clone();
@@ -145,10 +148,10 @@ impl ApiClient {
         tokio::spawn(async move {
             let result = image_inner(client, url, headers, request, out_path2, tx.clone()).await;
             if let Err(e) = result {
-                let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+                let _ = tx.send(StreamEvent::ImageError(e.to_string())).await;
             }
         });
-        Ok((rx, out_str))
+        Ok(rx)
     }
 
     /// One-shot, non-streaming chat completion — used by the access-policy judge,
@@ -251,6 +254,11 @@ async fn image_inner(
         return Err(anyhow::anyhow!("Image API error {}: {}", status, body));
     }
 
+    // Cancelled while the image was still coming down? Stop before decode/write.
+    if tx.is_closed() {
+        return Ok(());
+    }
+
     let parsed: ImageResponse = response
         .json()
         .await
@@ -283,21 +291,29 @@ async fn image_inner(
         ));
     };
 
+    let image = image::load_from_memory(&bytes)
+        .map_err(|e| anyhow::anyhow!("Generated image could not be decoded: {}", e))?;
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| anyhow::anyhow!("Generated image could not be encoded as PNG: {}", e))?;
+
     let path = std::path::PathBuf::from(&path_str);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("Cannot create {}: {}", parent.display(), e))?;
     }
-    std::fs::write(&path, &bytes)
+    std::fs::write(&path, &png)
         .map_err(|e| anyhow::anyhow!("Cannot write {}: {}", path.display(), e))?;
 
-    let mut msg = format!("🖼 Image saved → `{}`", path.display());
+    let mut msg = format!("Image saved → `{}`", path.display());
     if let Some(revised) = first.revised_prompt {
         if !revised.trim().is_empty() {
             msg.push_str(&format!("\n\n**Revised prompt:** {}", revised.trim()));
         }
     }
     let _ = tx.send(StreamEvent::Token(msg)).await;
+    let _ = tx.send(StreamEvent::ImageReady(path)).await;
     let _ = tx.send(StreamEvent::Done).await;
     Ok(())
 }
@@ -313,12 +329,18 @@ struct StreamFail {
     retryable: bool,
 }
 
+/// How long a stream may go without any bytes before it is considered dead.
+/// Generous: reasoning models can think for a while, but a silent socket past
+/// this is almost certainly a dropped gateway connection.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 async fn stream_inner(
     client: reqwest::Client,
     url: String,
     headers: HeaderMap,
     request: ChatRequest,
     tx: mpsc::Sender<StreamEvent>,
+    idle: std::time::Duration,
 ) -> Result<(), StreamFail> {
     use futures_util::StreamExt;
 
@@ -366,10 +388,26 @@ async fn stream_inner(
     // Native tool-call fragments, accumulated by index across deltas.
     let mut tool_acc: Vec<AccCall> = Vec::new();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(c) => c,
-            Err(e) => fail!(true, anyhow::anyhow!("Stream read error: {}", e)),
+    loop {
+        // Cancellation: when the app drops the receiver (`CancelStream`), stop
+        // reading. Dropping the response here closes the connection, so a cancelled
+        // request really aborts instead of quietly downloading to the end.
+        let next = tokio::select! {
+            biased;
+            _ = tx.closed() => return Ok(()),
+            n = tokio::time::timeout(idle, stream.next()) => n,
+        };
+        let chunk = match next {
+            Err(_elapsed) => fail!(
+                !emitted,
+                anyhow::anyhow!(
+                    "Stream idle timeout after {}s (no bytes received)",
+                    idle.as_secs()
+                )
+            ),
+            Ok(Some(Ok(c))) => c,
+            Ok(Some(Err(e))) => fail!(true, anyhow::anyhow!("Stream read error: {}", e)),
+            Ok(None) => break,
         };
         buffer.extend_from_slice(&chunk);
 
@@ -406,18 +444,19 @@ async fn stream_inner(
                         // Accumulate native tool-call fragments by index.
                         if let Some(tcs) = choice.delta.tool_calls {
                             emitted = true;
-                            for tc in &tcs {
-                                if let Some(name) = tc
-                                    .function
-                                    .as_ref()
-                                    .and_then(|f| f.name.as_ref())
-                                    .filter(|n| !n.trim().is_empty())
-                                {
-                                    let _ =
-                                        tx.send(StreamEvent::ToolCallStarted(name.clone())).await;
+                            let indices: Vec<usize> = tcs.iter().map(|tc| tc.index).collect();
+                            accumulate_tool_calls(&mut tool_acc, tcs);
+                            for fence in take_completed_interaction_fences(&mut tool_acc) {
+                                let _ = tx.send(StreamEvent::Token(fence)).await;
+                            }
+                            for index in indices {
+                                let Some(call) = tool_acc.get(index) else {
+                                    continue;
+                                };
+                                if let Some(label) = preparing_tool_label(call) {
+                                    let _ = tx.send(StreamEvent::ToolCallStarted(label)).await;
                                 }
                             }
-                            accumulate_tool_calls(&mut tool_acc, tcs);
                         }
                         // Finish reason signals stream end even without [DONE].
                         if choice.finish_reason.is_some() {
@@ -444,6 +483,39 @@ struct AccCall {
     id: String,
     name: String,
     args: String,
+    emitted: bool,
+}
+
+fn preparing_tool_label(call: &AccCall) -> Option<String> {
+    let name = call.name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if matches!(name, "file_management" | "web" | "interaction" | "workflow") {
+        if let Some(action) = streamed_action(&call.args) {
+            return Some(action);
+        }
+    }
+    Some(name.to_string())
+}
+
+fn streamed_action(args: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(args) {
+        return value
+            .get("action")
+            .and_then(|action| action.as_str())
+            .filter(|action| !action.trim().is_empty())
+            .map(str::to_string);
+    }
+
+    let action = args.find("\"action\"")?;
+    let after_key = &args[action + "\"action\"".len()..];
+    let colon = after_key.find(':')?;
+    let value = after_key[colon + 1..].trim_start();
+    let value = value.strip_prefix('"')?;
+    let end = value.find('"')?;
+    let action = &value[..end];
+    (!action.is_empty()).then(|| action.to_string())
 }
 
 /// Merge a batch of streamed `tool_calls` fragments into the by-index accumulator.
@@ -475,12 +547,42 @@ fn accumulate_tool_calls(acc: &mut Vec<AccCall>, deltas: Vec<super::models::Tool
     }
 }
 
-/// Emit each accumulated tool call as a synthesized ```` ```tool ```` block token,
+fn take_completed_interaction_fences(acc: &mut [AccCall]) -> Vec<String> {
+    let mut fences = Vec::new();
+    for call in acc {
+        if call.emitted || call.name.trim().is_empty() {
+            continue;
+        }
+        let Ok(args) = serde_json::from_str::<serde_json::Value>(call.args.trim()) else {
+            continue;
+        };
+        let blocking = match call.name.as_str() {
+            "interaction" => matches!(
+                args.get("action").and_then(|action| action.as_str()),
+                Some("ask" | "propose" | "plan")
+            ),
+            "workflow" => matches!(
+                args.get("action").and_then(|action| action.as_str()),
+                Some("propose")
+            ),
+            "ask" | "decide" | "plan" | "propose_step" => true,
+            _ => false,
+        };
+        if !blocking {
+            continue;
+        }
+        call.emitted = true;
+        fences.push(synth_tool_fence(&call.name, &call.args, &call.id));
+    }
+    fences
+}
+
+/// Emit each accumulated tool call as a synthesized `<tool>…</tool>` block token,
 /// so the rest of the app (parse_blocks → execute → render) handles native calls
 /// through the same path as fenced ones.
 async fn flush_tool_calls(acc: &[AccCall], tx: &mpsc::Sender<StreamEvent>) {
     for call in acc {
-        if call.name.trim().is_empty() {
+        if call.emitted || call.name.trim().is_empty() {
             continue;
         }
         let fence = synth_tool_fence(&call.name, &call.args, &call.id);
@@ -488,23 +590,140 @@ async fn flush_tool_calls(acc: &[AccCall], tx: &mpsc::Sender<StreamEvent>) {
     }
 }
 
-/// Build a ```` ```tool ```` block from a native tool call. The streamed
-/// `arguments` is a JSON string; parse it into an object (falling back to `{}` so a
-/// malformed payload still produces a runnable call that surfaces the error).
+/// Build a `<tool>…</tool>` block from a native tool call. The streamed `arguments`
+/// is a JSON string; parse it into an object (falling back to `{}` so a malformed
+/// payload still produces a runnable call that surfaces the error).
+///
+/// The payload is brace-balanced JSON, so the parser recovers the whole object even
+/// when a string value contains the closing `</tool>` marker — no escaping needed,
+/// unlike the old ```` ```tool ```` fence which a code fence in the content could
+/// close early.
 fn synth_tool_fence(name: &str, args: &str, id: &str) -> String {
+    use crate::agent::parser::{TOOL_CLOSE, TOOL_OPEN};
     let args_val: serde_json::Value =
         serde_json::from_str(args.trim()).unwrap_or_else(|_| serde_json::json!({}));
     let obj = serde_json::json!({ "name": name, "args": args_val, "id": id });
-    format!(
-        "\n```tool\n{}\n```\n",
-        serde_json::to_string(&obj).unwrap_or_default()
-    )
+    let json = serde_json::to_string(&obj).unwrap_or_default();
+    format!("\n{}\n{}\n{}\n", TOOL_OPEN, json, TOOL_CLOSE)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::models::{FnDelta, ToolCallDelta};
+
+    #[test]
+    fn categorized_preparing_label_resolves_streamed_leaf_action() {
+        let complete = AccCall {
+            name: "file_management".into(),
+            args: r#"{"action":"copy","from":"a","to":"b"}"#.into(),
+            ..AccCall::default()
+        };
+        assert_eq!(preparing_tool_label(&complete).as_deref(), Some("copy"));
+
+        let partial = AccCall {
+            name: "web".into(),
+            args: r#"{"action": "fetch""#.into(),
+            ..AccCall::default()
+        };
+        assert_eq!(preparing_tool_label(&partial).as_deref(), Some("fetch"));
+    }
+
+    #[test]
+    fn categorized_preparing_label_falls_back_until_action_arrives() {
+        let call = AccCall {
+            name: "file_management".into(),
+            args: "{\"act".into(),
+            ..AccCall::default()
+        };
+        assert_eq!(
+            preparing_tool_label(&call).as_deref(),
+            Some("file_management")
+        );
+    }
+
+    #[test]
+    fn completed_interaction_is_emitted_before_stream_finish_once() {
+        let mut acc = Vec::new();
+        accumulate_tool_calls(
+            &mut acc,
+            vec![ToolCallDelta {
+                index: 0,
+                id: Some("call_propose".into()),
+                function: Some(FnDelta {
+                    name: Some("interaction".into()),
+                    arguments: Some(
+                        r#"{"action":"propose","title":"Choose","alternatives":["#.into(),
+                    ),
+                }),
+            }],
+        );
+        assert!(take_completed_interaction_fences(&mut acc).is_empty());
+
+        accumulate_tool_calls(
+            &mut acc,
+            vec![ToolCallDelta {
+                index: 0,
+                id: None,
+                function: Some(FnDelta {
+                    name: None,
+                    arguments: Some(r#"{"label":"A"},{"label":"B"}]}"#.into()),
+                }),
+            }],
+        );
+        let fences = take_completed_interaction_fences(&mut acc);
+        assert_eq!(fences.len(), 1);
+        let calls = crate::agent::parser::extract_tool_calls(&fences[0]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].kind(), Some(crate::agent::ToolKind::ProposeStep));
+        assert_eq!(calls[0].id.as_deref(), Some("call_propose"));
+        assert!(take_completed_interaction_fences(&mut acc).is_empty());
+    }
+
+    #[test]
+    fn normal_native_tools_remain_deferred_for_batching() {
+        let mut acc = vec![AccCall {
+            id: "call_read".into(),
+            name: "file_management".into(),
+            args: r#"{"action":"read","path":"src/main.rs"}"#.into(),
+            emitted: false,
+        }];
+        assert!(take_completed_interaction_fences(&mut acc).is_empty());
+        assert!(!acc[0].emitted);
+    }
+
+    #[test]
+    fn workflow_propose_compatibility_is_emitted_early() {
+        let mut acc = vec![AccCall {
+            id: "call_workflow".into(),
+            name: "workflow".into(),
+            args: r#"{"action":"propose","title":"Choose","alternatives":[{"label":"A"},{"label":"B"}]}"#
+                .into(),
+            emitted: false,
+        }];
+        let fences = take_completed_interaction_fences(&mut acc);
+        assert_eq!(fences.len(), 1);
+        assert_eq!(
+            crate::agent::parser::extract_tool_calls(&fences[0])[0].kind(),
+            Some(crate::agent::ToolKind::ProposeStep)
+        );
+    }
+
+    #[test]
+    fn direct_propose_step_is_emitted_early() {
+        let mut acc = vec![AccCall {
+            id: "call_direct".into(),
+            name: "propose_step".into(),
+            args: r#"{"title":"Choose","alternatives":[{"label":"A"},{"label":"B"}]}"#.into(),
+            emitted: false,
+        }];
+        let fences = take_completed_interaction_fences(&mut acc);
+        assert_eq!(fences.len(), 1);
+        assert_eq!(
+            crate::agent::parser::extract_tool_calls(&fences[0])[0].kind(),
+            Some(crate::agent::ToolKind::ProposeStep)
+        );
+    }
 
     #[test]
     fn accumulate_and_synth_native_tool_call() {
@@ -545,6 +764,27 @@ mod tests {
         assert_eq!(calls[0].id.as_deref(), Some("call_1"));
     }
 
+    /// A native `edit` whose old/new carries a markdown fence: the `<tool>` block
+    /// keeps the backticks verbatim (no escaping) and the payload survives the round
+    /// trip byte-for-byte, because extraction is brace-balanced, not fence-delimited.
+    #[test]
+    fn synth_block_round_trips_fence_in_payload() {
+        let args = serde_json::json!({
+            "path": "docs/README.md",
+            "old": "run:\n```sh\nmake\n```",
+            "new": "run:\n```sh\nmake all\n```",
+        })
+        .to_string();
+        let block = synth_tool_fence("edit", &args, "call_1");
+        assert!(block.contains("<tool>") && block.contains("</tool>"));
+
+        let calls = crate::agent::parser::extract_tool_calls(&block);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "edit");
+        assert_eq!(calls[0].args["old"], "run:\n```sh\nmake\n```");
+        assert_eq!(calls[0].args["new"], "run:\n```sh\nmake all\n```");
+    }
+
     #[test]
     fn accumulate_ignores_absurd_index_without_oom() {
         // A server (or bug) sending a huge index must not trigger a giant
@@ -580,5 +820,204 @@ mod tests {
         let calls = crate::agent::parser::extract_tool_calls(&fence);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "list_dir");
+    }
+
+    /// A local HTTP server that accepts one connection, consumes the request
+    /// headers, writes a canned SSE body (or stays silent when `silent`), then
+    /// holds the socket open.
+    fn sse_server(silent: bool) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            let mut stream = reader.into_inner();
+            let mut body = String::from(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            );
+            if !silent {
+                body.push_str(
+                    "c1\r\ndata: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\r\n0\r\n\r\n",
+                );
+            }
+            if let Err(_) = stream.write_all(body.as_bytes()) {
+                return;
+            }
+            if let Err(_) = stream.flush() {
+                return;
+            }
+            // Hold the connection open (no more bytes) until the test ends.
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Server that answers the first connection with a transient 500 and the
+    /// second with a valid SSE body — for retry-with-backoff tests.
+    fn retry_server() -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            for attempt in 0..2u32 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                }
+                let mut stream = reader.into_inner();
+                if attempt == 0 {
+                    let body = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+                    if let Err(_) = stream.write_all(body.as_bytes()) {
+                        return;
+                    }
+                } else {
+                    let body = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nc1\r\ndata: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\r\n0\r\n\r\n";
+                    if let Err(_) = stream.write_all(body.as_bytes()) {
+                        return;
+                    }
+                }
+                if let Err(_) = stream.flush() {
+                    return;
+                }
+            }
+            // Hold the socket open until the test ends.
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn stream_retries_transient_500_with_backoff_before_emission() {
+        let (url, server) = retry_server();
+        let client = ApiClient::new(&url, "test-key").unwrap();
+        let mut rx = client
+            .stream(ChatRequest {
+                model: String::new(),
+                messages: Vec::new(),
+                stream: true,
+                max_tokens: None,
+                stream_options: None,
+                reasoning_effort: None,
+                reasoning_mode: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+            })
+            .unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await;
+        assert!(
+            matches!(first, Ok(Some(StreamEvent::Token(_)))),
+            "expected token after retry, got: {:?}",
+            first
+        );
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_fires_when_server_goes_silent() {
+        let (url, server) = sse_server(true);
+        let client = reqwest::Client::builder().http1_only().build().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let start = std::time::Instant::now();
+        let err = stream_inner(
+            client,
+            format!("{}/v1/chat/completions", url),
+            HeaderMap::new(),
+            ChatRequest {
+                model: String::new(),
+                messages: Vec::new(),
+                stream: true,
+                max_tokens: None,
+                stream_options: None,
+                reasoning_effort: None,
+                reasoning_mode: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+            },
+            tx,
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err();
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        assert!(
+            err.retryable,
+            "silent pre-emission failure should be retried"
+        );
+        assert!(
+            err.err.to_string().contains("idle timeout"),
+            "got: {}",
+            err.err
+        );
+        drop(server);
+    }
+
+    #[test]
+    fn stream_aborts_connection_when_receiver_is_dropped() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (url, server) = sse_server(false);
+            let client = reqwest::Client::builder().http1_only().build().unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            let idle = std::time::Duration::from_secs(60);
+            let task = tokio::spawn(async move {
+                stream_inner(
+                    client,
+                    format!("{}/v1/chat/completions", url),
+                    HeaderMap::new(),
+                    ChatRequest {
+                        model: String::new(),
+                        messages: Vec::new(),
+                        stream: true,
+                        max_tokens: None,
+                        stream_options: None,
+                        reasoning_effort: None,
+                        reasoning_mode: None,
+                        tools: None,
+                        tool_choice: None,
+                        parallel_tool_calls: None,
+                    },
+                    tx,
+                    idle,
+                )
+                .await
+            });
+            let first = rx.recv().await;
+            assert!(
+                matches!(first, Some(StreamEvent::Token(_))),
+                "expected first token, got: {:?}",
+                first
+            );
+            drop(rx); // simulate CancelStream: receiver dropped
+            let start = std::time::Instant::now();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), task).await;
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+            let ok = matches!(result, Ok(Ok(Ok(()))));
+            assert!(ok, "dropped receiver should abort cleanly");
+            drop(server);
+        });
     }
 }

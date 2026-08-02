@@ -1,2 +1,3 @@
-pub mod config;
-pub use config::Config;
+pub mod types;
+
+pub use types::{AccessReviewMode, AgentConfig, Config, KeybindConfig};

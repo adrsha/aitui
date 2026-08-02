@@ -1,17 +1,164 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessReviewMode {
+    Strict,
+    Lenient,
+    #[default]
+    Off,
+}
+
+impl AccessReviewMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Lenient => "lenient",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn cycle(self, direction: i32) -> Self {
+        match (self, direction < 0) {
+            (Self::Strict, false) | (Self::Off, true) => Self::Lenient,
+            (Self::Lenient, false) | (Self::Strict, true) => Self::Off,
+            (Self::Off, false) | (Self::Lenient, true) => Self::Strict,
+        }
+    }
+
+    pub fn default_policy(self) -> Option<&'static str> {
+        match self {
+            Self::Strict => Some(
+                "Allow clearly safe, reversible work inside the current project: reads, searches, web lookups, file copies, and narrowly scoped edits or writes. Ask before shell commands, moves, downloads, broad rewrites, credential access, external-system changes, or anything ambiguous. Deny actions that conflict with the user's request.",
+            ),
+            Self::Lenient => Some(
+                "Allow ordinary coding work inside the current project when it directly supports the user's request, including reads, searches, web lookups, edits, writes, copies, moves, downloads, and build/test/run shell commands. Ask when intent is ambiguous or the action affects credentials, external systems, or paths outside the project. Deny actions that conflict with the user's request.",
+            ),
+            Self::Off => None,
+        }
+    }
+}
 
 /// Top-level application configuration, loaded from ~/.config/aichat-tui/config.toml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub api: ApiConfig,
     #[serde(default)]
+    pub agent: AgentConfig,
+    /// Named child agents the model can target with `workflow(agent)` /
+    /// `agent` calls. Mirrors opencode's named subagents: a description the
+    /// model uses to pick an agent, an optional model override, an optional
+    /// role line injected into the child's system prompt, and an optional
+    /// tool allow/deny policy (default: built-in read-only surface).
+    #[serde(default)]
+    pub agents: BTreeMap<String, AgentDef>,
+    #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
     pub keybinds: KeybindConfig,
+}
+
+/// One named child agent, configurable like an opencode subagent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentDef {
+    /// Shown to the model so it can choose the right agent for a task.
+    #[serde(default)]
+    pub description: String,
+    /// Overrides the parent session's model for this agent.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Injected into the child's system prompt ("You are {role}.").
+    #[serde(default)]
+    pub role: String,
+    /// Tool allowlist by kind name (e.g. "read", "search", "shell", "web_fetch").
+    /// Empty means the built-in read-only child surface applies.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Tool denylist by kind name; wins over `tools`.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentConfig {
+    /// Normal tool-use rounds available before the child is forced to synthesize.
+    #[serde(default = "default_subagent_soft_rounds")]
+    pub subagent_soft_rounds: usize,
+    /// Absolute request ceiling, including the final synthesis request.
+    #[serde(default = "default_subagent_hard_rounds")]
+    pub subagent_hard_rounds: usize,
+    /// Maximum seconds without streamed output or a completed tool result.
+    #[serde(default = "default_subagent_lease_secs")]
+    pub subagent_lease_secs: u64,
+    /// Absolute wall-clock lifetime for one child agent.
+    #[serde(default = "default_subagent_max_duration_secs")]
+    pub subagent_max_duration_secs: u64,
+    /// Maximum time allowed for one tool or nested-agent batch.
+    #[serde(default = "default_subagent_operation_timeout_secs")]
+    pub subagent_operation_timeout_secs: u64,
+    /// Model used for child agents (`workflow(agent)` calls). Empty = the
+    /// active chat model; a named `[agents.<name>].model` still wins for that
+    /// specific agent.
+    #[serde(default)]
+    pub child_model: String,
+    /// Model used for the parallel task-tracker agent (the background model
+    /// that maintains the task checklist). Empty = the active chat model.
+    #[serde(default)]
+    pub task_model: String,
+}
+
+impl AgentConfig {
+    pub fn normalized(self) -> Self {
+        let hard = self.subagent_hard_rounds.max(2);
+        Self {
+            subagent_soft_rounds: self.subagent_soft_rounds.clamp(1, hard - 1),
+            subagent_hard_rounds: hard,
+            subagent_lease_secs: self.subagent_lease_secs.max(1),
+            subagent_max_duration_secs: self.subagent_max_duration_secs.max(1),
+            subagent_operation_timeout_secs: self.subagent_operation_timeout_secs.max(1),
+            child_model: self.child_model,
+            task_model: self.task_model,
+        }
+    }
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            subagent_soft_rounds: default_subagent_soft_rounds(),
+            subagent_hard_rounds: default_subagent_hard_rounds(),
+            subagent_lease_secs: default_subagent_lease_secs(),
+            subagent_max_duration_secs: default_subagent_max_duration_secs(),
+            subagent_operation_timeout_secs: default_subagent_operation_timeout_secs(),
+            child_model: String::new(),
+            task_model: String::new(),
+        }
+    }
+}
+
+fn default_subagent_soft_rounds() -> usize {
+    48
+}
+
+fn default_subagent_hard_rounds() -> usize {
+    60
+}
+
+fn default_subagent_lease_secs() -> u64 {
+    90
+}
+
+fn default_subagent_max_duration_secs() -> u64 {
+    900
+}
+
+fn default_subagent_operation_timeout_secs() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,21 +184,30 @@ pub struct ApiConfig {
     /// `:system`) are added on top of this. Empty = none.
     #[serde(default)]
     pub system_prompt: String,
-    /// Reasoning effort for reasoning-capable models: "low" | "medium" | "high"
-    /// (empty = don't send one). Cycle at runtime with `:effort`. Sent as the
-    /// OpenAI `reasoning_effort` request field.
+    /// Free-form reasoning effort value. Empty means don't send the field.
     #[serde(default)]
     pub reasoning_effort: String,
+    /// Free-form reasoning mode value. Empty means don't send the field.
+    #[serde(default)]
+    pub reasoning_mode: String,
     /// Use native OpenAI function-calling (`tools`/`tool_calls`) instead of parsing
-    /// ```` ```tool ```` fences from the reply. Toggle at runtime with `:native`;
+    /// `<tool>…</tool>` calls from the reply. Toggle at runtime with `:native`;
     /// auto-disabled if the endpoint rejects the `tools` field. Default on.
     #[serde(default = "default_true")]
     pub native_tools: bool,
     /// Model used to judge tool calls against the session access policy (see
     /// `:access`). A small/fast model is ideal — it runs once per uncovered tool
-    /// batch. Empty falls back to the current chat model.
-    #[serde(default)]
+    /// batch. If this model is unavailable, review retries with the active chat model.
+    #[serde(default = "default_access_judge_model")]
     pub access_judge_model: String,
+    /// Model used for optional follow-up response suggestions. If unavailable,
+    /// suggestion generation retries with the active chat model.
+    #[serde(default = "default_access_judge_model")]
+    pub response_suggestion_model: String,
+    /// Automated review for uncovered tool calls. Off is the default and uses
+    /// manual prompts; strict/lenient opt into review-agent decisions.
+    #[serde(default)]
+    pub access_review_mode: AccessReviewMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,9 +229,6 @@ pub struct UiConfig {
     /// Name of the active colour theme (see `ui::theme::Theme::all()`).
     #[serde(default = "default_theme")]
     pub theme: String,
-    /// New sessions start with agent (tool-using) mode enabled.
-    #[serde(default = "default_true")]
-    pub agent_default: bool,
     /// Auto-approve low-risk read-only tools (read_file/list_dir/search_files)
     /// so the coding agent flows without a permission prompt for safe reads.
     #[serde(default = "default_true")]
@@ -84,10 +237,23 @@ pub struct UiConfig {
     /// to `~/.config/aitui/active_skills.json`). Toggle with `:sticky`.
     #[serde(default = "default_true")]
     pub sticky_skills: bool,
+    /// Generate up to three optional follow-up replies after a plain assistant
+    /// response. Suggestions are ephemeral, non-blocking, and off by default.
+    #[serde(default)]
+    pub response_suggestions: bool,
+    /// Parallel task-tracker: a separate background model call after each agent
+    /// response maintains the task checklist (status, per-item percent, overall
+    /// progress). On by default; disable to skip the extra calls entirely.
+    #[serde(default = "default_true")]
+    pub auto_todo_tracker: bool,
     /// Assumed model context window (tokens), used to draw the context-budget gauge
     /// next to the token counter. A round default that fits most modern models.
     #[serde(default = "default_context_window")]
     pub context_window: u32,
+    /// When dragging the mouse over transcript text, auto-copy the selection to
+    /// the system clipboard on mouse-up.
+    #[serde(default = "default_true")]
+    pub auto_copy_selection: bool,
 }
 
 fn default_context_window() -> u32 {
@@ -96,6 +262,10 @@ fn default_context_window() -> u32 {
 
 fn default_search_provider() -> String {
     "searxng".to_string()
+}
+
+fn default_access_judge_model() -> String {
+    "gpt-5-mini".to_string()
 }
 
 fn default_theme() -> String {
@@ -131,6 +301,10 @@ pub struct KeybindConfig {
     pub next_session: String,
     #[serde(default = "kb_prev_session", alias = "session_prev")]
     pub prev_session: String,
+    #[serde(default = "kb_prev_subtask", alias = "child_agent_prev")]
+    pub prev_subtask: String,
+    #[serde(default = "kb_next_subtask", alias = "child_agent_next")]
+    pub next_subtask: String,
     #[serde(default = "kb_session_picker", alias = "open_session_picker")]
     pub session_picker: String,
     /// Fork the current session into a parallel branch.
@@ -153,8 +327,6 @@ pub struct KeybindConfig {
     pub next_model: String,
     #[serde(default = "kb_prev_model", alias = "model_prev")]
     pub prev_model: String,
-    #[serde(default = "kb_toggle_agent", alias = "toggle_agent_mode")]
-    pub toggle_agent: String,
     #[serde(default = "kb_redraw")]
     pub redraw: String,
     #[serde(default = "kb_scroll_up")]
@@ -208,6 +380,12 @@ fn kb_next_session() -> String {
 fn kb_prev_session() -> String {
     "ctrl-p".into()
 }
+fn kb_prev_subtask() -> String {
+    "alt-[".into()
+}
+fn kb_next_subtask() -> String {
+    "alt-]".into()
+}
 fn kb_session_picker() -> String {
     "ctrl-s".into()
 }
@@ -235,9 +413,6 @@ fn kb_next_model() -> String {
 fn kb_prev_model() -> String {
     "ctrl-[".into()
 }
-fn kb_toggle_agent() -> String {
-    "ctrl-a".into()
-}
 fn kb_redraw() -> String {
     "ctrl-l".into()
 }
@@ -251,7 +426,7 @@ fn kb_scroll_top() -> String {
     "ctrl-home".into()
 }
 fn kb_scroll_bottom() -> String {
-    "ctrl-end".into()
+    "ctrl-shift-d".into()
 }
 fn kb_scroll_half_down() -> String {
     "ctrl-d".into()
@@ -290,6 +465,8 @@ impl Default for KeybindConfig {
             quit: kb_quit(),
             next_session: kb_next_session(),
             prev_session: kb_prev_session(),
+            prev_subtask: kb_prev_subtask(),
+            next_subtask: kb_next_subtask(),
             session_picker: kb_session_picker(),
             fork_session: kb_fork_session(),
             open_editor: kb_open_editor(),
@@ -299,7 +476,6 @@ impl Default for KeybindConfig {
             model_picker: kb_model_picker(),
             next_model: kb_next_model(),
             prev_model: kb_prev_model(),
-            toggle_agent: kb_toggle_agent(),
             redraw: kb_redraw(),
             scroll_up: kb_scroll_up(),
             scroll_down: kb_scroll_down(),
@@ -333,10 +509,12 @@ impl Default for UiConfig {
         Self {
             input_height: 6,
             theme: default_theme(),
-            agent_default: true,
             auto_approve_reads: true,
             sticky_skills: true,
+            response_suggestions: false,
+            auto_todo_tracker: true,
             context_window: default_context_window(),
+            auto_copy_selection: true,
         }
     }
 }
@@ -352,13 +530,18 @@ impl Default for Config {
             api: ApiConfig {
                 endpoint: String::new(),
                 api_key: String::new(),
-                default_model: "gpt-5.5".to_string(),
+                default_model: "gpt5.6-sol".to_string(),
                 mock: false,
                 system_prompt: String::new(),
-                reasoning_effort: String::new(),
+                reasoning_effort: "high".to_string(),
+                reasoning_mode: "pro".to_string(),
                 native_tools: true,
-                access_judge_model: String::new(),
+                access_judge_model: default_access_judge_model(),
+                response_suggestion_model: default_access_judge_model(),
+                access_review_mode: AccessReviewMode::default(),
             },
+            agent: AgentConfig::default(),
+            agents: BTreeMap::new(),
             ui: UiConfig::default(),
             search: SearchConfig::default(),
             keybinds: KeybindConfig::default(),
@@ -394,6 +577,14 @@ impl Config {
                 Config::default()
             }
         };
+
+        if cfg.api.access_judge_model.trim().is_empty() {
+            cfg.api.access_judge_model = default_access_judge_model();
+        }
+        if cfg.api.response_suggestion_model.trim().is_empty() {
+            cfg.api.response_suggestion_model = default_access_judge_model();
+        }
+        cfg.agent = cfg.agent.normalized();
 
         // Environment variables override the config file when present, so
         // secrets can stay out of disk entirely if the user prefers.
@@ -522,5 +713,83 @@ mod tests {
         let bad = "this is not [valid toml";
         let cfg: Config = toml::from_str(bad).unwrap_or_default();
         assert_eq!(cfg.ui.input_height, Config::default().ui.input_height);
+    }
+
+    #[test]
+    fn access_review_defaults_to_manual_fast_model_for_old_configs() {
+        let raw = r#"
+            [api]
+            default_model = "chat-model"
+        "#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.api.access_review_mode, AccessReviewMode::Off);
+        assert_eq!(cfg.api.access_judge_model, "gpt-5-mini");
+    }
+
+    #[test]
+    fn child_agent_budget_defaults_for_old_configs_and_normalizes_bounds() {
+        let raw = r#"
+            [api]
+            default_model = "chat-model"
+        "#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.agent, AgentConfig::default());
+
+        let normalized = AgentConfig {
+            subagent_soft_rounds: 99,
+            subagent_hard_rounds: 1,
+            subagent_lease_secs: 0,
+            subagent_max_duration_secs: 0,
+            subagent_operation_timeout_secs: 0,
+            child_model: String::new(),
+            task_model: String::new(),
+        }
+        .normalized();
+        assert_eq!(normalized.subagent_soft_rounds, 1);
+        assert_eq!(normalized.subagent_hard_rounds, 2);
+        assert_eq!(normalized.subagent_lease_secs, 1);
+        assert_eq!(normalized.subagent_max_duration_secs, 1);
+        assert_eq!(normalized.subagent_operation_timeout_secs, 1);
+    }
+
+    #[test]
+    fn access_review_mode_cycles_in_both_directions() {
+        assert_eq!(AccessReviewMode::Strict.cycle(1), AccessReviewMode::Lenient);
+        assert_eq!(AccessReviewMode::Lenient.cycle(1), AccessReviewMode::Off);
+        assert_eq!(AccessReviewMode::Off.cycle(1), AccessReviewMode::Strict);
+        assert_eq!(AccessReviewMode::Strict.cycle(-1), AccessReviewMode::Off);
+        assert!(AccessReviewMode::Strict.default_policy().is_some());
+        assert!(AccessReviewMode::Lenient.default_policy().is_some());
+        assert!(AccessReviewMode::Off.default_policy().is_none());
+    }
+
+    #[test]
+    fn named_agents_parse_from_toml_and_default_to_empty() {
+        let raw = r#"
+            [api]
+            default_model = "chat-model"
+
+            [agents.reviewer]
+            description = "Read-only code review"
+            model = "review-model"
+            role = "senior reviewer"
+            tools = ["read", "search", "shell"]
+            deny = ["web_fetch"]
+
+            [agents.docs]
+            role = "documentation writer"
+        "#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let reviewer = cfg.agents.get("reviewer").unwrap();
+        assert_eq!(reviewer.description, "Read-only code review");
+        assert_eq!(reviewer.model.as_deref(), Some("review-model"));
+        assert_eq!(reviewer.role, "senior reviewer");
+        assert_eq!(reviewer.tools, vec!["read", "search", "shell"]);
+        assert_eq!(reviewer.deny, vec!["web_fetch"]);
+        assert!(cfg.agents.get("docs").unwrap().model.is_none());
+        assert!(cfg.agents["docs"].tools.is_empty());
+
+        let plain: Config = toml::from_str("[api]\ndefault_model = \"m\"\n").unwrap();
+        assert!(plain.agents.is_empty());
     }
 }

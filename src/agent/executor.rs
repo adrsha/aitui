@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{OnceLock, RwLock};
@@ -41,21 +40,88 @@ fn search_settings() -> SearchSettings {
         .unwrap_or_default()
 }
 
+/// Shared abort flag for an in-flight tool round. Set by `AgentCancel` so a
+/// running tool (notably a shell) stops side effects promptly instead of only
+/// having its result dropped.
+pub type ToolAbort = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
 /// Execute a tool call, returning the result.
 /// `cwd` is the base directory for relative paths.
-pub fn execute(call: ToolCall, cwd: &PathBuf) -> ToolResult {
+pub fn execute(call: ToolCall, cwd: &Path) -> ToolResult {
+    execute_abortable(
+        call,
+        cwd,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+}
+
+/// Like [`execute`], but aborts promptly (with a "Cancelled by user" result)
+/// once `abort` is set — shells are killed at their process group.
+pub fn execute_abortable(mut call: ToolCall, cwd: &Path, abort: &ToolAbort) -> ToolResult {
+    attach_display_metadata(&mut call, cwd);
+    execute_with(call, |call| run(call, cwd, abort))
+}
+
+fn attach_display_metadata(call: &mut ToolCall, cwd: &Path) {
+    use super::tools::ToolKind;
+
+    if call.kind() != Some(ToolKind::Edit) {
+        return;
+    }
+    let Some(path) = call.args.get("path").and_then(|value| value.as_str()) else {
+        return;
+    };
+    let Some(old) = call
+        .args
+        .get("old")
+        .or_else(|| call.args.get("old_string"))
+        .and_then(|value| value.as_str())
+    else {
+        return;
+    };
+    let resolved = resolve_path(path, cwd);
+    let Ok(content) = crate::agent::file_cache::read_file_content(&resolved) else {
+        return;
+    };
+    let Some(byte_index) = content.find(old) else {
+        return;
+    };
+    let line = content[..byte_index]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    if let Some(args) = call.args.as_object_mut() {
+        args.insert("__display_start_line".into(), serde_json::json!(line));
+    }
+}
+
+fn execute_with(
+    call: ToolCall,
+    run_tool: impl FnOnce(&ToolCall) -> Result<String, String>,
+) -> ToolResult {
     let start = Instant::now();
-    let result = run(&call, cwd);
+    let result = crate::tui::catch_recoverable_panic(|| run_tool(&call));
     let duration_ms = start.elapsed().as_millis() as u64;
     match result {
-        Ok(output) => ToolResult::success(call, output, duration_ms),
-        Err(err) => ToolResult::failure(call, err, duration_ms),
+        Ok(Ok(output)) => ToolResult::success(call, output, duration_ms),
+        Ok(Err(err)) => ToolResult::failure(call, err, duration_ms),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic");
+            ToolResult::failure(
+                call,
+                format!("Tool failed unexpectedly: {}", message),
+                duration_ms,
+            )
+        }
     }
 }
 
 fn resolve_path(raw: &str, cwd: &Path) -> PathBuf {
-    // TODO(audit): harden path containment/symlink handling so mutating tools cannot
-    // escape the intended workspace after approval via `..` or symlink pivots.
     let p = PathBuf::from(raw);
     if p.is_absolute() {
         p
@@ -64,25 +130,115 @@ fn resolve_path(raw: &str, cwd: &Path) -> PathBuf {
     }
 }
 
-fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
+fn batch_items(call: &ToolCall) -> Result<Option<Vec<ToolCall>>, String> {
+    let Some(parent) = call.args.as_object() else {
+        return Ok(None);
+    };
+
+    let make_call = |args: serde_json::Map<String, serde_json::Value>| ToolCall {
+        name: call.name.clone(),
+        args: serde_json::Value::Object(args),
+        id: call.id.clone(),
+    };
+
+    if let Some(batch) = parent.get("batch") {
+        let batch = batch
+            .as_array()
+            .ok_or("'batch' must be an array of argument objects")?;
+        let mut base = parent.clone();
+        base.remove("batch");
+        base.remove("paths");
+        base.remove("commands");
+        let mut calls = Vec::with_capacity(batch.len());
+        for item in batch {
+            let item = item
+                .as_object()
+                .ok_or("Every 'batch' item must be an argument object")?;
+            let mut args = base.clone();
+            args.extend(item.clone());
+            calls.push(make_call(args));
+        }
+        return Ok(Some(calls));
+    }
+
+    if let Some(paths) = parent.get("paths") {
+        let paths = paths
+            .as_array()
+            .ok_or("'paths' must be an array of file or directory paths")?;
+        let mut base = parent.clone();
+        base.remove("paths");
+        let mut calls = Vec::with_capacity(paths.len());
+        for path in paths {
+            let path = path.as_str().ok_or("Every 'paths' item must be a string")?;
+            let mut args = base.clone();
+            args.insert("path".into(), serde_json::Value::String(path.into()));
+            calls.push(make_call(args));
+        }
+        return Ok(Some(calls));
+    }
+
+    if let Some(commands) = parent.get("commands") {
+        let commands = commands
+            .as_array()
+            .ok_or("'commands' must be an array of shell command strings")?;
+        let mut base = parent.clone();
+        base.remove("commands");
+        let mut calls = Vec::with_capacity(commands.len());
+        for command in commands {
+            let command = command
+                .as_str()
+                .ok_or("Every 'commands' item must be a string")?;
+            let mut args = base.clone();
+            args.insert("command".into(), serde_json::Value::String(command.into()));
+            calls.push(make_call(args));
+        }
+        return Ok(Some(calls));
+    }
+
+    Ok(None)
+}
+
+fn run(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String> {
     use super::tools::ToolKind;
 
-    // Legacy tools no longer advertised in the schema, kept so a stray call still
-    // does the right thing (append must not silently overwrite like write would).
-    match call.name.as_str() {
-        "append_file" => return append_legacy(call, cwd),
-        "make_dir" => {
-            let path_str = call
-                .args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or("Missing 'path' argument")?;
-            let path = resolve_path(path_str, cwd);
-            fs::create_dir_all(&path)
-                .map_err(|e| format!("Cannot create {}: {}", path.display(), e))?;
-            return Ok(format!("Created directory {}", path.display()));
+    if let Some(items) = batch_items(call)? {
+        if items.is_empty() {
+            return Err("Batch must contain at least one operation".into());
         }
-        _ => {}
+        let total = items.len();
+        let mut output = Vec::with_capacity(total);
+        for (index, item) in items.into_iter().enumerate() {
+            if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                output.push(format!(
+                    "## {}/{} · cancelled\nCancelled by user",
+                    index + 1,
+                    total
+                ));
+                break;
+            }
+            let summary = item.summary();
+            match run(&item, cwd, abort) {
+                Ok(result) => output.push(format!(
+                    "## {}/{} · {} · ok\n{}",
+                    index + 1,
+                    total,
+                    summary,
+                    result
+                )),
+                Err(error) => output.push(format!(
+                    "## {}/{} · {} · error\n{}",
+                    index + 1,
+                    total,
+                    summary,
+                    error
+                )),
+            }
+        }
+        return Ok(output.join("\n\n"));
+    }
+
+    if abort.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("Cancelled by user".into());
     }
 
     match call.kind() {
@@ -93,12 +249,18 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'path' argument")?;
             let path = resolve_path(path_str, cwd);
-            let content = fs::read_to_string(&path)
-                .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
+            // Cache-first: a file read earlier in the process (and unchanged on
+            // disk) is served from memory, so the agent's repeated reads of the
+            // same file cost no IO.
+            let (content, cached) = crate::agent::file_cache::read_file(&path)?;
             // Optional line window: offset = 1-based first line, limit = line count.
             let offset = usize_arg(call, "offset");
             let limit = usize_arg(call, "limit");
-            Ok(read_output(&content, path_str, offset, limit))
+            let mut output = read_output(&content, path_str, offset, limit);
+            if cached && !output.trim().is_empty() {
+                output.push_str("\n\n[cached: file unchanged since last read]");
+            }
+            Ok(output)
         }
 
         Some(ToolKind::Write) => {
@@ -116,13 +278,14 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
                 .ok_or("Missing 'content' argument")?;
             let path = resolve_path(path_str, cwd);
             // Capture the old content first so an update can show a diff.
-            let old = fs::read_to_string(&path).ok();
+            let old = crate::agent::file_cache::read_file_content(&path).ok();
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|e| format!("Cannot create directories: {}", e))?;
             }
             fs::write(&path, content)
                 .map_err(|e| format!("Cannot write {}: {}", path.display(), e))?;
+            crate::agent::file_cache::store(&path, content);
             match old {
                 Some(old) => Ok(format!(
                     "Updated {}\n{}",
@@ -151,7 +314,7 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1)
                 .max(1) as usize;
-            let mut lines: Vec<String> = vec![format!("📂 {}", path.display())];
+            let mut lines: Vec<String> = vec![format!("dir {}", path.display())];
             let mut count = 0usize;
             list_recursive(&path, depth, 1, &mut lines, &mut count);
             if lines.len() == 1 {
@@ -172,7 +335,7 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
                 .get("command")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'command' argument")?;
-            let output = run_shell_command(cmd, cwd)?;
+            let output = run_shell_command(cmd, cwd, abort)?;
 
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -200,6 +363,18 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
 
         Some(ToolKind::Search) => crate::agent::file_search::execute(call, cwd),
 
+        Some(ToolKind::MakeDir) => {
+            let path_str = call
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'path' argument")?;
+            let path = resolve_path(path_str, cwd);
+            fs::create_dir_all(&path)
+                .map_err(|e| format!("Cannot create {}: {}", path.display(), e))?;
+            Ok(format!("Created directory {}", path.display()))
+        }
+
         Some(ToolKind::Edit) => {
             // TODO(audit): make edit writes atomic and preserve file metadata where
             // practical; the current read/replace/write path can leave partial files.
@@ -221,7 +396,7 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
                 .and_then(|v| v.as_str())
                 .ok_or("edit: missing required 'new' argument")?;
             let path = resolve_path(path_str, cwd);
-            let content = fs::read_to_string(&path)
+            let content = crate::agent::file_cache::read_file_content(&path)
                 .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
             let count = content.matches(old_s).count();
             match count {
@@ -229,15 +404,17 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
                 1 => {}
                 n => {
                     return Err(format!(
-                        "old_string matched {} occurrences in {}; include a larger unique snippet",
+                        "old_string matched {} occurrences in {}; include a larger unique snippet from one location. Matching locations:\n{}",
                         n,
-                        path.display()
+                        path.display(),
+                        duplicate_edit_context(&content, old_s)
                     ))
                 }
             }
             let replaced = content.replacen(old_s, new_s, 1);
             fs::write(&path, &replaced)
                 .map_err(|e| format!("Cannot write {}: {}", path.display(), e))?;
+            crate::agent::file_cache::store(&path, &replaced);
             Ok(format!(
                 "Edit {} (1 occurrence)\n{}",
                 path.display(),
@@ -263,6 +440,7 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
             } else {
                 fs::remove_file(&path)
                     .map_err(|e| format!("Cannot delete {}: {}", path.display(), e))?;
+                crate::agent::file_cache::invalidate(&path);
                 Ok(format!("Removed {}", path.display()))
             }
         }
@@ -278,10 +456,14 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
             }
             // Try a fast rename; fall back to copy+remove across filesystems.
             match fs::rename(&from, &to) {
-                Ok(()) => Ok(format!("Moved {} → {}", from.display(), to.display())),
+                Ok(()) => {
+                    crate::agent::file_cache::invalidate(&from);
+                    Ok(format!("Moved {} → {}", from.display(), to.display()))
+                }
                 Err(_) => {
                     copy_recursive(&from, &to)?;
                     remove_any(&from)?;
+                    crate::agent::file_cache::invalidate(&from);
                     Ok(format!("Moved {} → {}", from.display(), to.display()))
                 }
             }
@@ -309,6 +491,18 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
                 .ok_or("Missing 'query' argument")?;
             web_search(query)
         }
+
+        Some(ToolKind::WebImages) => {
+            let query = call
+                .args
+                .get("query")
+                .or_else(|| call.args.get("q"))
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'query' argument")?;
+            web_image_search(query)
+        }
+
+        Some(ToolKind::ReverseImage) => reverse_image_search(call, cwd),
 
         Some(ToolKind::WebFetch) => {
             let url = call
@@ -347,11 +541,27 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
                 fs::create_dir_all(parent)
                     .map_err(|e| format!("Cannot create target dir: {}", e))?;
             }
-            let bytes = http_get_bytes(url)?;
+            let (bytes, content_type) = http_get_bytes(url)?;
+            if content_type.starts_with("text/html") {
+                return Err(format!(
+                    "Refusing to save an HTML page as an asset (Content-Type: {}). Use the direct image or file URL instead.",
+                    content_type
+                ));
+            }
             let n = bytes.len();
             fs::write(&path, &bytes)
                 .map_err(|e| format!("Cannot write {}: {}", path.display(), e))?;
-            Ok(format!("Downloaded {} bytes → {}", n, path.display()))
+            crate::agent::file_cache::invalidate(&path);
+            Ok(format!(
+                "Downloaded {} bytes ({}) → {}",
+                n,
+                if content_type.is_empty() {
+                    "unknown content type"
+                } else {
+                    &content_type
+                },
+                path.display()
+            ))
         }
 
         // These are intercepted by the app layer and never reach the executor;
@@ -359,42 +569,16 @@ fn run(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
         Some(ToolKind::Todo) => Ok("(todo handled by UI)".into()),
         Some(ToolKind::Ask) => Ok("(ask handled by UI)".into()),
         Some(ToolKind::Plan) => Ok("(plan handled by UI)".into()),
+        Some(ToolKind::ProposeStep) => Ok("(propose_step handled by UI)".into()),
+        Some(ToolKind::Task) => Ok("(task handled by UI)".into()),
         Some(ToolKind::Finish) => Ok("(finish handled by UI)".into()),
 
         None => Err(format!("Unknown tool: {}", call.name)),
     }
 }
 
-/// Legacy `append_file`: append content without overwriting. Not advertised in the
-/// current schema, kept so a stray call still appends rather than clobbering.
-fn append_legacy(call: &ToolCall, cwd: &PathBuf) -> Result<String, String> {
-    let path_str = call
-        .args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or("Missing 'path' argument")?;
-    let content = call
-        .args
-        .get("content")
-        .and_then(|v| v.as_str())
-        .ok_or("Missing 'content' argument")?;
-    let path = resolve_path(path_str, cwd);
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| format!("Cannot open {}: {}", path.display(), e))?;
-    file.write_all(content.as_bytes())
-        .map_err(|e| format!("Cannot append to {}: {}", path.display(), e))?;
-    Ok(format!(
-        "Appended to {} ({} lines)",
-        path.display(),
-        content.lines().count()
-    ))
-}
-
 /// Resolve the `from`/`to` (aliases `source`/`dest`/`destination`) path args.
-fn from_to(call: &ToolCall, cwd: &PathBuf) -> Result<(PathBuf, PathBuf), String> {
+fn from_to(call: &ToolCall, cwd: &Path) -> Result<(PathBuf, PathBuf), String> {
     let from = call
         .args
         .get("from")
@@ -408,7 +592,8 @@ fn from_to(call: &ToolCall, cwd: &PathBuf) -> Result<(PathBuf, PathBuf), String>
         .or_else(|| call.args.get("destination"))
         .and_then(|v| v.as_str())
         .ok_or("Missing 'to' argument")?;
-    Ok((resolve_path(from, cwd), resolve_path(to, cwd)))
+    let (from, to) = (resolve_path(from, cwd), resolve_path(to, cwd));
+    Ok((from, to))
 }
 
 /// Recursively copy a file or directory tree.
@@ -436,13 +621,6 @@ fn remove_any(path: &Path) -> Result<(), String> {
         fs::remove_file(path)
     };
     r.map_err(|e| format!("Cannot remove {}: {}", path.display(), e))
-}
-
-/// Run a future to completion from the blocking tool thread (execution already
-/// runs inside `tokio::task::spawn_blocking`, so a current-thread block_on here
-/// is safe and keeps the executor's synchronous signature).
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    tokio::runtime::Handle::current().block_on(fut)
 }
 
 /// A compact line diff of `old` → `new`: strips the common prefix/suffix and shows
@@ -484,57 +662,411 @@ fn line_diff(old: &str, new: &str) -> String {
     truncate(lines.join("\n"), 6000)
 }
 
-fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .user_agent("aitui/0.1 (+agent)")
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))
+fn duplicate_edit_context(content: &str, needle: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = Vec::new();
+    for (i, (byte_idx, _)) in content.match_indices(needle).take(8).enumerate() {
+        let line_no = content[..byte_idx].bytes().filter(|b| *b == b'\n').count() + 1;
+        let start = line_no.saturating_sub(2).max(1);
+        let end = (line_no + needle.lines().count() + 1).min(lines.len().max(1));
+        let mut block = Vec::new();
+        for n in start..=end {
+            if let Some(line) = lines.get(n - 1) {
+                block.push(format!("{}: {}", n, line));
+            }
+        }
+        out.push(format!(
+            "{}. near line {}:\n{}",
+            i + 1,
+            line_no,
+            block.join("\n")
+        ));
+    }
+    truncate(out.join("\n---\n"), 4000)
+}
+
+fn command_exists(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn curl_get_text(url: &str, accept: Option<&str>) -> Result<String, String> {
+    let mut command = Command::new("curl");
+    command.args([
+        "--fail-with-body",
+        "--location",
+        "--silent",
+        "--show-error",
+        "--max-time",
+        "20",
+        "--user-agent",
+        "aitui/0.1 (+agent)",
+    ]);
+    if let Some(accept) = accept {
+        let header = format!("Accept: {}", accept);
+        command.args(["--header", header.as_str()]);
+    }
+    let output = command
+        .arg(url)
+        .output()
+        .map_err(|e| format!("Could not run curl: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "curl failed: {}",
+            truncate(String::from_utf8_lossy(&output.stderr).into_owned(), 500)
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|e| format!("Response was not UTF-8: {}", e))
+}
+
+fn wget_get_text(url: &str, accept: Option<&str>) -> Result<String, String> {
+    let mut command = Command::new("wget");
+    command.args([
+        "--quiet",
+        "--timeout=20",
+        "--tries=1",
+        "--user-agent=aitui/0.1 (+agent)",
+        "--output-document=-",
+    ]);
+    if let Some(accept) = accept {
+        command.arg(format!("--header=Accept: {}", accept));
+    }
+    let output = command
+        .arg(url)
+        .output()
+        .map_err(|e| format!("Could not run wget: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "wget failed: {}",
+            truncate(String::from_utf8_lossy(&output.stderr).into_owned(), 500)
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|e| format!("Response was not UTF-8: {}", e))
+}
+
+fn command_http_get_text(url: &str, accept: Option<&str>) -> Result<String, String> {
+    let mut errors = Vec::new();
+    if command_exists("curl") {
+        match curl_get_text(url, accept) {
+            Ok(text) => return Ok(text),
+            Err(error) => errors.push(error),
+        }
+    }
+    if command_exists("wget") {
+        match wget_get_text(url, accept) {
+            Ok(text) => return Ok(text),
+            Err(error) => errors.push(error),
+        }
+    }
+    if errors.is_empty() {
+        Err("HTTP tools unavailable: install curl or wget".to_string())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn command_http_get_bytes(url: &str) -> Result<(Vec<u8>, String), String> {
+    if command_exists("curl") {
+        let marker = b"\nAITUI_CONTENT_TYPE:";
+        let output = Command::new("curl")
+            .args([
+                "--fail-with-body",
+                "--location",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "20",
+                "--user-agent",
+                "aitui/0.1 (+agent)",
+                "--write-out",
+                "\nAITUI_CONTENT_TYPE:%{content_type}",
+                url,
+            ])
+            .output()
+            .map_err(|e| format!("Could not run curl: {}", e))?;
+        if output.status.success() {
+            if let Some(index) = output
+                .stdout
+                .windows(marker.len())
+                .rposition(|window| window == marker)
+            {
+                let content_type = String::from_utf8_lossy(&output.stdout[index + marker.len()..])
+                    .trim()
+                    .to_string();
+                return Ok((output.stdout[..index].to_vec(), content_type));
+            }
+            return Ok((output.stdout, String::new()));
+        }
+    }
+    if command_exists("wget") {
+        let output = Command::new("wget")
+            .args([
+                "--quiet",
+                "--timeout=20",
+                "--tries=1",
+                "--user-agent=aitui/0.1 (+agent)",
+                "--output-document=-",
+                url,
+            ])
+            .output()
+            .map_err(|e| format!("Could not run wget: {}", e))?;
+        if output.status.success() {
+            let content_type = if looks_like_html(&output.stdout) {
+                "text/html".to_string()
+            } else {
+                String::new()
+            };
+            return Ok((output.stdout, content_type));
+        }
+    }
+    Err("Download failed with both curl and wget".to_string())
+}
+
+fn looks_like_html(bytes: &[u8]) -> bool {
+    let prefix = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]).to_lowercase();
+    prefix.contains("<!doctype html") || prefix.contains("<html")
 }
 
 fn http_get_text(url: &str) -> Result<String, String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err(format!("Refusing non-http(s) URL: {}", url));
     }
-    let client = http_client()?;
-    block_on(async move {
-        let resp = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| format!("Request failed: {}", e))?;
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| format!("Read body failed: {}", e))?;
-        if !status.is_success() {
-            return Err(format!("HTTP {}: {}", status, truncate(text, 500)));
-        }
-        Ok(text)
-    })
+    command_http_get_text(url, None)
 }
 
-fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
+fn http_get_bytes(url: &str) -> Result<(Vec<u8>, String), String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err(format!("Refusing non-http(s) URL: {}", url));
     }
-    let client = http_client()?;
-    block_on(async move {
-        let resp = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| format!("Request failed: {}", e))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(format!("HTTP {}", status));
+    command_http_get_bytes(url)
+}
+
+fn reverse_image_search(call: &ToolCall, cwd: &Path) -> Result<String, String> {
+    let url = if let Some(url) = call.args.get("url").and_then(|v| v.as_str()) {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(format!("Refusing non-http(s) image URL: {}", url));
         }
-        resp.bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| format!("Read body failed: {}", e))
-    })
+        url.to_string()
+    } else if let Some(path) = call.args.get("path").and_then(|v| v.as_str()) {
+        let path = resolve_path(path, cwd);
+        if !path.is_file() {
+            return Err(format!("Image file not found: {}", path.display()));
+        }
+        let bytes =
+            fs::read(&path).map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
+        let mime = match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            _ => "application/octet-stream",
+        };
+        return google_lens_upload(
+            bytes,
+            mime,
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("image"),
+        );
+    } else {
+        return Err("Pass exactly one of 'url' or 'path' for reverse_image".into());
+    };
+
+    let lens = format!(
+        "https://lens.google.com/uploadbyurl?url={}",
+        urlencode(&url)
+    );
+    google_lens_get(&lens)
+}
+
+fn google_lens_upload(bytes: Vec<u8>, mime: &str, filename: &str) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36")
+        .timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+    let part = reqwest::blocking::multipart::Part::bytes(bytes)
+        .file_name(filename.to_string())
+        .mime_str(mime)
+        .map_err(|e| format!("Invalid image MIME type: {}", e))?;
+    let resp = client
+        .post("https://lens.google.com/v3/upload?stcs=1")
+        .multipart(reqwest::blocking::multipart::Form::new().part("encoded_image", part))
+        .send()
+        .map_err(|e| format!("Reverse-image upload failed: {}", e))?;
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let status = resp.status();
+    let body = resp
+        .text()
+        .map_err(|e| format!("Read response failed: {}", e))?;
+    if let Some(location) = location {
+        let result_url = reqwest::Url::parse("https://lens.google.com")
+            .and_then(|base| base.join(&location))
+            .map_err(|e| format!("Google Lens returned an invalid result URL: {}", e))?;
+        let result = client
+            .get(result_url.clone())
+            .send()
+            .map_err(|e| format!("Could not open uploaded Google Lens result: {}", e))?;
+        let result_status = result.status();
+        let result_body = result
+            .text()
+            .map_err(|e| format!("Read Google Lens result failed: {}", e))?;
+        if !result_status.is_success() {
+            return Err(format!(
+                "Google Lens result returned HTTP {}: {}",
+                result_status,
+                truncate(strip_html(&result_body), 500)
+            ));
+        }
+        return format_lens_results("Google Lens", &result_body, result_url.as_str());
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "Google Lens returned HTTP {}: {}",
+            status,
+            truncate(strip_html(&body), 500)
+        ));
+    }
+    format_lens_results("Google Lens", &body, "https://lens.google.com")
+}
+
+fn google_lens_get(url: &str) -> Result<String, String> {
+    let body = http_get_text(url)?;
+    format_lens_results("Google Lens", &body, url)
+}
+
+fn format_lens_results(provider: &str, html: &str, result_url: &str) -> Result<String, String> {
+    let links = extract_http_links(html);
+    let mut out = vec![format!(
+        "{} reverse-image results: {}",
+        provider, result_url
+    )];
+    for (i, link) in links.iter().take(12).enumerate() {
+        out.push(format!("{}. {}", i + 1, link));
+    }
+    let text = truncate(strip_html(html), 1200);
+    if links.is_empty() && text.trim().is_empty() {
+        return Err(
+            "Google Lens returned no readable matches; open the result URL in a browser.".into(),
+        );
+    }
+    if !text.trim().is_empty() {
+        out.push(format!("\n{}", text));
+    }
+    Ok(truncate(out.join("\n"), 8192))
+}
+
+fn extract_http_links(html: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    let mut rest = html;
+    while let Some(idx) = rest.find("href=") {
+        rest = &rest[idx + 5..];
+        let quote = rest.chars().next().unwrap_or(' ');
+        if quote != '\"' && quote != '\'' {
+            continue;
+        }
+        rest = &rest[quote.len_utf8()..];
+        let Some(end) = rest.find(quote) else { break };
+        let link = html_unescape(&rest[..end]);
+        rest = &rest[end + quote.len_utf8()..];
+        if (link.starts_with("https://") || link.starts_with("http://"))
+            && !link.contains("google.com")
+            && !links.contains(&link)
+        {
+            links.push(link);
+        }
+    }
+    links
+}
+
+fn web_image_search(query: &str) -> Result<String, String> {
+    let url = format!(
+        "https://commons.wikimedia.org/w/api.php?action=query&format=json&formatversion=2&generator=search&gsrnamespace=6&gsrlimit=10&gsrsearch={}&prop=imageinfo&iiprop=url%7Cextmetadata&iiurlwidth=800",
+        urlencode(query)
+    );
+    let body = http_get_text(&url)?;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Invalid Wikimedia response: {}", e))?;
+    format_wikimedia_image_results(query, &json)
+}
+
+fn format_wikimedia_image_results(query: &str, json: &serde_json::Value) -> Result<String, String> {
+    let pages = json
+        .pointer("/query/pages")
+        .and_then(|value| value.as_array())
+        .ok_or("Wikimedia Commons returned no image results")?;
+
+    let metadata = |info: &serde_json::Value, key: &str| {
+        info.pointer(&format!("/extmetadata/{}/value", key))
+            .and_then(|value| value.as_str())
+            .map(|value| strip_html(&format!("<div>{}</div>", value)))
+            .unwrap_or_default()
+    };
+    let mut results = Vec::new();
+    for page in pages {
+        let Some(info) = page.pointer("/imageinfo/0") else {
+            continue;
+        };
+        let title = page
+            .get("title")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Untitled image")
+            .trim_start_matches("File:");
+        let preview = info
+            .get("thumburl")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let original = info
+            .get("url")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let source = info
+            .get("descriptionurl")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if original.is_empty() || source.is_empty() {
+            continue;
+        }
+        let description = metadata(info, "ImageDescription");
+        let creator = metadata(info, "Artist");
+        let license = metadata(info, "LicenseShortName");
+        let index = results.len() + 1;
+        results.push(format!(
+            "{}. {}\n   Preview: {}\n   Original: {}\n   Source: {}\n   Description: {}\n   Creator: {}\n   License: {}",
+            index,
+            title,
+            if preview.is_empty() { original } else { preview },
+            original,
+            source,
+            if description.is_empty() { "Not provided" } else { &description },
+            if creator.is_empty() { "Not provided" } else { &creator },
+            if license.is_empty() { "See source page" } else { &license },
+        ));
+    }
+
+    if results.is_empty() {
+        return Ok(format!(
+            "No downloadable Wikimedia Commons images found for '{}'. Try a more specific architectural style, feature, building, or location.",
+            query
+        ));
+    }
+    Ok(format!(
+        "Wikimedia Commons image results for '{}' (review each source page and license before reuse):\n\n{}",
+        query,
+        results.join("\n\n")
+    ))
 }
 
 /// Web search. SearxNG is the default provider because it is open-source and
@@ -612,25 +1144,25 @@ fn web_search(query: &str) -> Result<String, String> {
     ))
 }
 
-fn search_duckduckgo(query: &str) -> Result<Vec<(String, String, String)>, String> {
+type SearchResult = (String, String, String);
+type SearchResults = Vec<SearchResult>;
+
+fn search_duckduckgo(query: &str) -> Result<SearchResults, String> {
     let html = fetch_search_html("https://html.duckduckgo.com/html/", query)?;
     Ok(parse_ddg_results(&html))
 }
 
-fn search_bing(query: &str) -> Result<Vec<(String, String, String)>, String> {
+fn search_bing(query: &str) -> Result<SearchResults, String> {
     let html = fetch_search_html("https://www.bing.com/search", query)?;
     Ok(parse_bing_results(&html))
 }
 
-fn search_google(query: &str) -> Result<Vec<(String, String, String)>, String> {
+fn search_google(query: &str) -> Result<SearchResults, String> {
     let html = fetch_search_html("https://www.google.com/search", query)?;
     Ok(parse_google_results(&html))
 }
 
-fn search_searxng(
-    query: &str,
-    configured_url: &str,
-) -> Result<(String, Vec<(String, String, String)>), String> {
+fn search_searxng(query: &str, configured_url: &str) -> Result<(String, SearchResults), String> {
     let mut diagnostics = Vec::new();
     for base in searxng_bases(configured_url) {
         match fetch_searxng_json(&base, query) {
@@ -695,39 +1227,16 @@ fn fetch_search_html(base_url: &str, query: &str) -> Result<String, String> {
     )
 }
 
-fn fetch_url_text(url: &str, accept: &str, allow_202: bool) -> Result<String, String> {
-    let client = http_client()?;
-    let url = url.to_string();
-    block_on(async move {
-        let resp = client
-            .get(&url)
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64; rv:123.0) Gecko/20100101 Firefox/123.0",
-            )
-            .header("Accept", accept)
-            .header("Accept-Language", "en-US,en;q=0.9")
-            .send()
-            .await
-            .map_err(|e| format!("Search request failed: {}", e))?;
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| format!("Read body failed: {}", e))?;
-        if !(status.is_success() || (allow_202 && status.as_u16() == 202)) {
-            return Err(format!("HTTP {}: {}", status, truncate(text, 300)));
-        }
-        if text.to_lowercase().contains("making sure you")
-            && text.to_lowercase().contains("not a bot")
-        {
-            return Err("bot-check page returned".to_string());
-        }
-        Ok(text)
-    })
+fn fetch_url_text(url: &str, accept: &str, _allow_202: bool) -> Result<String, String> {
+    let text = command_http_get_text(url, Some(accept))?;
+    if text.to_lowercase().contains("making sure you") && text.to_lowercase().contains("not a bot")
+    {
+        return Err("bot-check page returned".to_string());
+    }
+    Ok(text)
 }
 
-fn parse_searxng_json_results(json: &str) -> Vec<(String, String, String)> {
+fn parse_searxng_json_results(json: &str) -> SearchResults {
     let Ok(root) = serde_json::from_str::<serde_json::Value>(json) else {
         return Vec::new();
     };
@@ -763,11 +1272,7 @@ fn parse_searxng_json_results(json: &str) -> Vec<(String, String, String)> {
     out
 }
 
-fn format_search_results(
-    query: &str,
-    provider: &str,
-    results: &[(String, String, String)],
-) -> String {
+fn format_search_results(query: &str, provider: &str, results: &[SearchResult]) -> String {
     let mut out = vec![format!("Search results for '{}' ({}):", query, provider)];
     for (i, (title, link, snippet)) in results.iter().take(8).enumerate() {
         if snippet.is_empty() {
@@ -782,7 +1287,7 @@ fn format_search_results(
 /// Parse DuckDuckGo HTML search results into `(title, url, snippet)` tuples.
 /// Result links carry class `result__a` (href is a `/l/?uddg=` redirect we
 /// decode); snippets carry class `result__snippet`.
-fn parse_ddg_results(html: &str) -> Vec<(String, String, String)> {
+fn parse_ddg_results(html: &str) -> SearchResults {
     let mut out = Vec::new();
     let mut pos = 0;
     while let Some(rel) = html[pos..].find("result__a") {
@@ -828,7 +1333,7 @@ fn parse_ddg_results(html: &str) -> Vec<(String, String, String)> {
 /// Parse Bing HTML results. Bing marks organic results as `<li class="b_algo">`
 /// with the main title in the first `<h2><a ...>` and the snippet in
 /// `<div class="b_caption"><p>...`.
-fn parse_bing_results(html: &str) -> Vec<(String, String, String)> {
+fn parse_bing_results(html: &str) -> SearchResults {
     let mut out = Vec::new();
     let mut pos = 0;
     while let Some(rel) = html[pos..].find("b_algo") {
@@ -887,7 +1392,7 @@ fn parse_bing_results(html: &str) -> Vec<(String, String, String)> {
 
 /// Parse Google HTML results. Google changes markup often; keep this parser
 /// conservative: find organic-looking anchors under `/url?q=` that contain an h3.
-fn parse_google_results(html: &str) -> Vec<(String, String, String)> {
+fn parse_google_results(html: &str) -> SearchResults {
     let mut out = Vec::new();
     let mut pos = 0;
     while let Some(rel) = html[pos..].find("/url?q=") {
@@ -1061,57 +1566,123 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+fn starts_with_ascii_case_insensitive(bytes: &[u8], pattern: &[u8]) -> bool {
+    bytes
+        .get(..pattern.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(pattern))
+}
+
+fn tag_name_is(bytes: &[u8], start: usize, name: &[u8], closing: bool) -> bool {
+    let mut name_start = start + 1;
+    if closing {
+        if bytes.get(name_start) != Some(&b'/') {
+            return false;
+        }
+        name_start += 1;
+    }
+    let Some(candidate) = bytes.get(name_start..name_start + name.len()) else {
+        return false;
+    };
+    if !candidate.eq_ignore_ascii_case(name) {
+        return false;
+    }
+    matches!(
+        bytes.get(name_start + name.len()),
+        Some(b'>') | Some(b'/') | Some(b' ' | b'\t' | b'\n' | b'\r' | 0x0C)
+    )
+}
+
+fn tag_end(html: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, c) in html[start + 1..].char_indices() {
+        match (quote, c) {
+            (Some(expected), c) if c == expected => quote = None,
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '>') => return Some(start + 1 + offset + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn looks_like_tag_start(bytes: &[u8], start: usize) -> bool {
+    matches!(
+        bytes.get(start + 1),
+        Some(b'a'..=b'z' | b'A'..=b'Z' | b'/' | b'!' | b'?')
+    )
+}
+
 /// Very small HTML→text reduction: drop script/style, strip tags, collapse
 /// whitespace. Good enough to feed a page's readable text back to the model.
 fn strip_html(html: &str) -> String {
     // TODO(audit): switch to a real HTML readability/parser pipeline; this reducer
     // loses links/headings and can return boilerplate-heavy text for complex pages.
-    let lower = html.to_lowercase();
-    // If it doesn't look like HTML, return as-is.
-    if !lower.contains("<html")
-        && !lower.contains("<body")
-        && !lower.contains("<div")
-        && !lower.contains("<p")
-    {
+    let bytes = html.as_bytes();
+    let looks_like_html = [b"<html".as_slice(), b"<body", b"<div", b"<p"]
+        .iter()
+        .any(|tag| {
+            bytes
+                .windows(tag.len())
+                .any(|window| window.eq_ignore_ascii_case(tag))
+        });
+    if !looks_like_html {
         return html.to_string();
     }
+
     let mut out = String::with_capacity(html.len() / 2);
-    let bytes = html.as_bytes();
     let mut i = 0;
-    let mut in_tag = false;
-    let mut skip_until: Option<&str> = None;
+    let mut skip_until: Option<&[u8]> = None;
     while i < bytes.len() {
-        if let Some(close) = skip_until {
-            if lower[i..].starts_with(close) {
-                i += close.len();
-                skip_until = None;
-            } else {
-                i += 1;
+        if let Some(name) = skip_until {
+            if bytes[i] == b'<' && tag_name_is(bytes, i, name, true) {
+                if let Some(end) = tag_end(html, i) {
+                    i = end;
+                    skip_until = None;
+                    out.push(' ');
+                    continue;
+                }
             }
+            let c = html[i..].chars().next().expect("valid UTF-8 boundary");
+            i += c.len_utf8();
             continue;
         }
-        if lower[i..].starts_with("<script") {
-            skip_until = Some("</script>");
-            i += 7;
-            continue;
-        }
-        if lower[i..].starts_with("<style") {
-            skip_until = Some("</style>");
-            i += 6;
-            continue;
-        }
-        let c = bytes[i] as char;
-        if c == '<' {
-            in_tag = true;
-        } else if c == '>' {
-            in_tag = false;
+
+        if starts_with_ascii_case_insensitive(&bytes[i..], b"<!--") {
+            if let Some(offset) = html[i + 4..].find("-->") {
+                i += 4 + offset + 3;
+            } else {
+                break;
+            }
             out.push(' ');
-        } else if !in_tag {
-            out.push(c);
+            continue;
         }
-        i += 1;
+
+        if bytes[i] == b'<' {
+            if tag_name_is(bytes, i, b"script", false) {
+                if let Some(end) = tag_end(html, i) {
+                    i = end;
+                    skip_until = Some(b"script");
+                    continue;
+                }
+            } else if tag_name_is(bytes, i, b"style", false) {
+                if let Some(end) = tag_end(html, i) {
+                    i = end;
+                    skip_until = Some(b"style");
+                    continue;
+                }
+            } else if looks_like_tag_start(bytes, i) {
+                if let Some(end) = tag_end(html, i) {
+                    i = end;
+                    out.push(' ');
+                    continue;
+                }
+            }
+        }
+
+        let c = html[i..].chars().next().expect("valid UTF-8 boundary");
+        out.push(c);
+        i += c.len_utf8();
     }
-    // Collapse runs of whitespace.
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -1199,10 +1770,10 @@ fn list_recursive(
             continue;
         }
         if entry.path().is_dir() {
-            dirs.push((format!("{}📁 {}/", indent, name), entry.path()));
+            dirs.push((format!("{}dir {}/", indent, name), entry.path()));
         } else {
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            files.push(format!("{}📄 {}  ({})", indent, name, fmt_size(size)));
+            files.push(format!("{}file {}  ({})", indent, name, fmt_size(size)));
         }
     }
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1241,20 +1812,28 @@ const SHELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Run a shell command with stdin closed and a wall-clock timeout. On timeout the
 /// process (and its group, best-effort) is killed and an error is returned instead
-/// of blocking indefinitely.
-fn run_shell_command(cmd: &str, cwd: &Path) -> Result<std::process::Output, String> {
+/// of blocking indefinitely. When `abort` is set, the same kill path runs and the
+/// result reads "Cancelled by user".
+fn run_shell_command(
+    cmd: &str,
+    cwd: &Path,
+    abort: &ToolAbort,
+) -> Result<std::process::Output, String> {
     // TODO(audit): replace the ad-hoc `sh -c` runner with explicit command
-    // classification/sandboxing; timeout alone is not enough isolation.
-    run_shell_with_timeout(cmd, cwd, SHELL_TIMEOUT)
+    // classification; timeout alone is not enough process isolation.
+    run_shell_with_timeout(cmd, cwd, SHELL_TIMEOUT, abort)
 }
 
 fn run_shell_with_timeout(
     cmd: &str,
     cwd: &Path,
     timeout: std::time::Duration,
+    abort: &ToolAbort,
 ) -> Result<std::process::Output, String> {
     use std::process::Stdio;
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc;
+    use std::time::Instant;
 
     // `Stdio::null()` on stdin turns a blocking read (e.g. bare `cat`, a REPL)
     // into an immediate EOF rather than an infinite wait. `process_group(0)` puts
@@ -1279,29 +1858,42 @@ fn run_shell_with_timeout(
         .map_err(|e| format!("Cannot run command: {}", e))?;
 
     // Capture the pid before moving the child into the waiter thread, so the
-    // watchdog can still kill it on timeout.
+    // watchdog can still kill it on timeout or abort.
     let pid = child.id();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
     });
 
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result.map_err(|e| format!("Command failed: {}", e)),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            // Kill the whole process group first (covers children the shell spawned),
-            // then the shell itself; ignore failures (it may have just exited).
-            let _ = Command::new("kill")
-                .arg("-9")
-                .arg(format!("-{}", pid))
-                .output();
-            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
-            Err(format!(
-                "Command timed out after {}s and was killed",
-                timeout.as_secs()
-            ))
+    let kill = || {
+        // Kill the whole process group first (covers children the shell spawned),
+        // then the shell itself; ignore failures (it may have just exited).
+        let _ = Command::new("kill")
+            .arg("-9")
+            .arg(format!("-{}", pid))
+            .output();
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        if abort.load(Ordering::Relaxed) {
+            kill();
+            return Err("Cancelled by user".into());
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err("Command runner thread died".to_string()),
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(result) => return result.map_err(|e| format!("Command failed: {}", e)),
+            Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
+                kill();
+                return Err(format!(
+                    "Command timed out after {}s and was killed",
+                    timeout.as_secs()
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Command runner thread died".to_string())
+            }
+        }
     }
 }
 
@@ -1334,11 +1926,24 @@ mod tests {
     }
 
     #[test]
+    fn executor_turns_panics_into_failed_tool_results() {
+        let call = make_call(
+            "web",
+            serde_json::json!({"action": "search", "query": "dodo"}),
+        );
+        let result = execute_with(call, |_| panic!("simulated provider panic"));
+        assert!(!result.is_ok());
+        assert!(result
+            .text()
+            .contains("Tool failed unexpectedly: simulated provider panic"));
+    }
+
+    #[test]
     fn truncate_does_not_panic_on_multibyte_boundary() {
         // A cap landing inside a multi-byte char used to panic. Build a string where
         // byte `max` falls mid-emoji and confirm it truncates cleanly.
-        let s = format!("{}🚀🚀🚀", "a".repeat(9));
-        // "🚀" is 4 bytes; max=10 lands inside the first emoji.
+        let s = format!("{}日本語日本語日本語", "a".repeat(9));
+        // Multi-byte characters are 3 bytes; max=10 lands inside the first one.
         let out = truncate(s, 10);
         assert!(out.starts_with(&"a".repeat(9)));
         assert!(out.contains("truncated"));
@@ -1467,15 +2072,95 @@ mod tests {
         assert_eq!(snippet, "");
     }
 
+    #[test]
+    fn format_wikimedia_images_includes_direct_urls_and_metadata() {
+        let json = serde_json::json!({
+            "query": {"pages": [{
+                "title": "File:Victorian house.jpg",
+                "imageinfo": [{
+                    "url": "https://upload.wikimedia.org/house.jpg",
+                    "thumburl": "https://upload.wikimedia.org/house-800px.jpg",
+                    "descriptionurl": "https://commons.wikimedia.org/wiki/File:Victorian_house.jpg",
+                    "extmetadata": {
+                        "ImageDescription": {"value": "<b>Queen Anne</b> Victorian house"},
+                        "Artist": {"value": "Example photographer"},
+                        "LicenseShortName": {"value": "CC BY-SA 4.0"}
+                    }
+                }]
+            }]}
+        });
+        let text = format_wikimedia_image_results("Victorian house", &json).unwrap();
+        assert!(text.contains("Victorian house.jpg"));
+        assert!(text.contains("Original: https://upload.wikimedia.org/house.jpg"));
+        assert!(text.contains("Description: Queen Anne Victorian house"));
+        assert!(text.contains("Creator: Example photographer"));
+        assert!(text.contains("License: CC BY-SA 4.0"));
+    }
+
     #[tokio::test]
     #[ignore = "live network test; run manually when changing web_search providers"]
-    async fn live_web_search_returns_results() {
-        let text = tokio::task::spawn_blocking(|| web_search("Rust crossterm"))
+    async fn live_dodo_payments_integration_research_returns_results() {
+        let query = "Get information about Dodo Payments and how to implement each step into my own app to integrate payment";
+        let text = tokio::task::spawn_blocking(move || web_search(query))
             .await
             .unwrap()
             .unwrap();
         assert!(text.contains("Search results for"), "{}", text);
         assert!(!text.contains("No parseable search results"), "{}", text);
+        assert!(text.to_lowercase().contains("dodo"), "{}", text);
+    }
+
+    #[tokio::test]
+    #[ignore = "live network test; run manually when changing Wikimedia image search"]
+    async fn live_victorian_image_search_returns_downloadable_results() {
+        let text = tokio::task::spawn_blocking(|| {
+            web_image_search("Queen Anne Victorian architecture house")
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(text.contains("Wikimedia Commons image results"), "{}", text);
+        assert!(
+            text.contains("Original: https://upload.wikimedia.org/"),
+            "{}",
+            text
+        );
+        assert!(
+            text.contains("Source: https://commons.wikimedia.org/"),
+            "{}",
+            text
+        );
+        assert!(text.contains("License:"), "{}", text);
+    }
+
+    #[tokio::test]
+    #[ignore = "live network test; downloads one Wikimedia image into a temp directory"]
+    async fn live_victorian_image_result_downloads_as_image() {
+        tokio::task::spawn_blocking(|| {
+            let text = web_image_search("Queen Anne Victorian architecture house").unwrap();
+            let url = text
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("Original: "))
+                .expect("image search should return an original URL");
+            let dir = tmp_dir();
+            let path = dir.join("victorian-reference");
+            let call = ToolCall {
+                name: "web".into(),
+                args: serde_json::json!({
+                    "action": "download",
+                    "url": url,
+                    "path": path.to_string_lossy()
+                }),
+                id: None,
+            };
+            let result = execute(call, &dir);
+            assert!(result.is_ok(), "{}", result.text());
+            assert!(result.text().contains("image/"), "{}", result.text());
+            assert!(fs::metadata(&path).unwrap().len() > 1_000);
+            let _ = fs::remove_dir_all(dir);
+        })
+        .await
+        .unwrap();
     }
 
     fn tmp_dir() -> PathBuf {
@@ -1553,7 +2238,7 @@ mod tests {
         let dir = tmp_dir();
         let call = make_call(
             "read_file",
-            serde_json::json!({"path": "/nonexistent/path.txt"}),
+            serde_json::json!({"path": "missing/inside.txt"}),
         );
         let result = execute(call, &dir);
         assert!(!result.is_ok());
@@ -1659,6 +2344,24 @@ mod tests {
     }
 
     #[test]
+    fn edit_result_keeps_actual_source_start_line_for_rendering() {
+        let dir = tmp_dir();
+        let path = dir.join("line_number.rs");
+        fs::write(&path, "fn one() {}\n\nfn target() {\n    false\n}\n").unwrap();
+        let call = make_call(
+            "edit_file",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "fn target() {\n    false\n}",
+                "new_string": "fn target() {\n    true\n}"
+            }),
+        );
+        let result = execute(call, &dir);
+        assert!(result.is_ok());
+        assert_eq!(result.call.args["__display_start_line"], 3);
+    }
+
+    #[test]
     fn edit_file_rejects_duplicate_old_string() {
         let dir = tmp_dir();
         let path = dir.join("edit_dupe.txt");
@@ -1674,6 +2377,9 @@ mod tests {
         let result = execute(call, &dir);
         assert!(!result.is_ok());
         assert!(result.text().contains("matched 2 occurrences"));
+        assert!(result.text().contains("Matching locations"));
+        assert!(result.text().contains("near line 1"));
+        assert!(result.text().contains("near line 3"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "same\nkeep\nsame");
     }
 
@@ -1693,23 +2399,6 @@ mod tests {
         let result = execute(call, &dir);
         assert!(!result.is_ok());
         assert!(result.text().contains("old_string not found"));
-    }
-
-    #[test]
-    fn append_file_adds_content() {
-        let dir = tmp_dir();
-        let path = dir.join("append.txt");
-        fs::write(&path, "base").unwrap();
-        let call = make_call(
-            "append_file",
-            serde_json::json!({
-                "path": path.to_str().unwrap(),
-                "content": "+more"
-            }),
-        );
-        let result = execute(call, &dir);
-        assert!(result.is_ok());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "base+more");
     }
 
     #[test]
@@ -1752,7 +2441,10 @@ mod tests {
     #[test]
     fn make_dir_creates_nested() {
         let dir = tmp_dir();
-        let call = make_call("make_dir", serde_json::json!({"path": "a/b/c"}));
+        let call = make_call(
+            "file_management",
+            serde_json::json!({"action": "mkdir", "path": "a/b/c"}),
+        );
         let result = execute(call, &dir);
         assert!(result.is_ok(), "{}", result.text());
         assert!(dir.join("a/b/c").is_dir());
@@ -1822,6 +2514,31 @@ mod tests {
     }
 
     #[test]
+    fn strip_html_handles_multibyte_text() {
+        let html = "<html><body><p>Résumé — 日本語 😊</p></body></html>";
+        assert_eq!(strip_html(html), "Résumé — 日本語 😊");
+    }
+
+    #[test]
+    fn strip_html_only_skips_actual_script_and_style_tags() {
+        let html =
+            "<HTML><body><scripture>keep</scripture><STYLE>隠す</STYLE><p>after</p></body></HTML>";
+        assert_eq!(strip_html(html), "keep after");
+    }
+
+    #[test]
+    fn strip_html_ignores_tag_markers_in_comments_and_attributes() {
+        let html = r#"<html><!-- <script>fake</script> --><body><div title="<script marker>">Visible</div></body></html>"#;
+        assert_eq!(strip_html(html), "Visible");
+    }
+
+    #[test]
+    fn strip_html_handles_quoted_gt_and_literal_comparisons() {
+        let html = r#"<html><body><div title="1 > 0">x > 0 and 1 < 2</div></body></html>"#;
+        assert_eq!(strip_html(html), "x > 0 and 1 < 2");
+    }
+
+    #[test]
     fn strip_html_extracts_text() {
         let html = "<html><body><script>var x=1;</script><p>Hello <b>world</b></p></body></html>";
         let text = strip_html(html);
@@ -1864,14 +2581,16 @@ mod tests {
         // `cat` with no args reads stdin; with stdin redirected to /dev/null it must
         // hit EOF immediately and exit rather than blocking the test forever.
         let dir = tmp_dir();
-        let out = run_shell_command("cat", &dir).expect("cat should finish on EOF");
+        let abort = super::ToolAbort::default();
+        let out = run_shell_command("cat", &dir, &abort).expect("cat should finish on EOF");
         assert!(out.status.success());
     }
 
     #[test]
     fn shell_captures_stdout_and_exit() {
         let dir = tmp_dir();
-        let out = run_shell_command("printf done; exit 3", &dir).unwrap();
+        let abort = super::ToolAbort::default();
+        let out = run_shell_command("printf done; exit 3", &dir, &abort).unwrap();
         assert_eq!(out.status.code(), Some(3));
         assert_eq!(String::from_utf8_lossy(&out.stdout), "done");
     }
@@ -1880,11 +2599,107 @@ mod tests {
     fn shell_kills_command_that_exceeds_timeout() {
         let dir = tmp_dir();
         let start = std::time::Instant::now();
-        let err = run_shell_with_timeout("sleep 30", &dir, std::time::Duration::from_millis(300))
-            .unwrap_err();
+        let abort = super::ToolAbort::default();
+        let err = run_shell_with_timeout(
+            "sleep 30",
+            &dir,
+            std::time::Duration::from_millis(300),
+            &abort,
+        )
+        .unwrap_err();
         // Must return promptly (well under the 30s sleep) with a timeout message.
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
         assert!(err.contains("timed out"), "got: {err}");
+    }
+
+    #[test]
+    fn shell_kills_command_when_abort_is_set() {
+        let dir = tmp_dir();
+        let abort = super::ToolAbort::default();
+        let killer = abort.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            killer.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let start = std::time::Instant::now();
+        let err = run_shell_command("sleep 30", &dir, &abort).unwrap_err();
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(err, "Cancelled by user");
+    }
+
+    #[test]
+    fn aborted_execute_returns_cancelled_before_running() {
+        let dir = tmp_dir();
+        let abort = super::ToolAbort::default();
+        abort.store(true, std::sync::atomic::Ordering::Relaxed);
+        let call = make_call(
+            "run_shell",
+            serde_json::json!({ "command": "echo should_not_run" }),
+        );
+        let result = super::execute_abortable(call, &dir, &abort);
+        assert_eq!(result.text(), "Cancelled by user");
+    }
+
+    #[test]
+    fn absolute_paths_outside_cwd_are_accessible() {
+        let dir = tmp_dir();
+        let outside =
+            std::env::temp_dir().join(format!("aitui_outside_absolute_{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let path = outside.join("agent-access.txt");
+        std::fs::write(&path, "outside cwd").unwrap();
+
+        let read = make_call(
+            "read_file",
+            serde_json::json!({"path": path.to_string_lossy()}),
+        );
+        let result = super::execute(read, &dir);
+        assert!(result.is_ok(), "{}", result.text());
+        assert_eq!(result.text(), "outside cwd");
+
+        let written = outside.join("agent-written.txt");
+        let write = make_call(
+            "write",
+            serde_json::json!({"path": written.to_string_lossy(), "content": "written outside"}),
+        );
+        let result = super::execute(write, &dir);
+        assert!(result.is_ok(), "{}", result.text());
+        assert_eq!(std::fs::read_to_string(written).unwrap(), "written outside");
+    }
+
+    #[test]
+    fn parent_relative_paths_outside_cwd_are_accessible() {
+        let parent =
+            std::env::temp_dir().join(format!("aitui_parent_access_{}", std::process::id()));
+        let dir = parent.join("workspace");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(parent.join("sibling.txt"), "sibling").unwrap();
+
+        let call = make_call("read_file", serde_json::json!({"path": "../sibling.txt"}));
+        let result = super::execute(call, &dir);
+        assert!(result.is_ok(), "{}", result.text());
+        assert_eq!(result.text(), "sibling");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_paths_outside_cwd_are_accessible() {
+        let dir = tmp_dir();
+        let outside =
+            std::env::temp_dir().join(format!("aitui_outside_symlink_{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        let link = dir.join("outside_link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let call = make_call(
+            "read_file",
+            serde_json::json!({"path": "outside_link/secret.txt"}),
+        );
+        let result = super::execute(call, &dir);
+        assert!(result.is_ok(), "{}", result.text());
+        assert_eq!(result.text(), "secret");
     }
 
     #[test]

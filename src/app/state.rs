@@ -16,10 +16,51 @@ use crate::input::vim::VimMode;
 use crate::render::chat::ChatState;
 use crate::render::theme::Theme;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionTabHitbox {
+    pub session_idx: usize,
+    pub area: ratatui::layout::Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccessHitbox {
+    /// Index into the access entries list (`access_entries` ordering).
+    pub index: usize,
+    pub area: ratatui::layout::Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptHitbox {
+    pub area: ratatui::layout::Rect,
+    pub msg: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubtaskHitbox {
+    pub task_id: u64,
+    pub area: ratatui::layout::Rect,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct PanelLayout {
     /// The transcript rect, cached so the reducer can compute page heights.
     pub chat: ratatui::layout::Rect,
+    /// Click targets produced by the top-bar renderer for direct session switching.
+    pub session_tabs: Vec<SessionTabHitbox>,
+    /// Click target for opening the complete access manager.
+    pub access: Option<AccessHitbox>,
+    /// Visible viewport for the scrollable sidebar task list.
+    pub sidebar_tasks: Option<ratatui::layout::Rect>,
+    /// Click targets for individual access rules in the sidebar.
+    pub access_rows: Vec<AccessHitbox>,
+    /// Click targets for child-agent rows in the sidebar.
+    pub sidebar_agents: Vec<SubtaskHitbox>,
+    /// Click targets for child-agent rows in the sticky panel below the chat.
+    pub panel_agents: Vec<SubtaskHitbox>,
+    /// Click target for expanding/collapsing the latest prompt preview.
+    pub prompt: Option<PromptHitbox>,
+    /// Click target to scroll the transcript to the prompt.
+    pub prompt_goto: Option<PromptHitbox>,
 }
 
 /// Loading status of the model list from `/v1/models`.
@@ -51,21 +92,33 @@ impl TodoStatus {
             _ => TodoStatus::Pending,
         }
     }
-    /// Status glyph for the panel.
-    pub fn glyph(&self) -> &'static str {
+    /// Canonical wire name for prompts and JSON output.
+    pub fn name(&self) -> &'static str {
         match self {
-            TodoStatus::Pending => "○",
-            TodoStatus::InProgress => "◐",
-            TodoStatus::Done => "●",
+            TodoStatus::Pending => "pending",
+            TodoStatus::InProgress => "in_progress",
+            TodoStatus::Done => "done",
         }
     }
 }
 
-/// One item in the agent's task breakdown, shown in the sticky panel above input.
+/// One item in the agent's task breakdown, maintained by the parallel task
+/// tracker and shown in the sidebar.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
     pub text: String,
     pub status: TodoStatus,
+    /// Tracker-estimated per-task progress (0–100), when known.
+    #[serde(default)]
+    pub percent: Option<u8>,
+}
+
+/// Combined output of the parallel task-tracker agent: the full checklist plus
+/// the overall progress estimate.
+#[derive(Debug, Clone, Default)]
+pub struct TodoUpdate {
+    pub items: Vec<TodoItem>,
+    pub overall_percent: Option<u8>,
 }
 
 /// A tool-call batch awaiting a judgment from the access-policy judge model. Held
@@ -73,6 +126,152 @@ pub struct TodoItem {
 pub struct JudgeBatch {
     pub session_id: usize,
     pub calls: Vec<ToolCall>,
+    /// Rule assembled in the permission overlay, remembered only when the review
+    /// model confirms at least one matching verdict.
+    pub reviewed_rule: Option<crate::agent::PermissionRuleDraft>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtaskStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubtaskToolStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubtaskLogEntry {
+    Phase {
+        text: String,
+    },
+    Checklist {
+        done: usize,
+        running: usize,
+        pending: usize,
+    },
+    Tool {
+        name: String,
+        summary: String,
+        status: SubtaskToolStatus,
+        duration_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call: Option<ToolCall>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum SubtaskProgress {
+    Phase(String),
+    Checklist {
+        done: usize,
+        running: usize,
+        pending: usize,
+    },
+    ToolStarted {
+        name: String,
+        summary: String,
+        call: ToolCall,
+    },
+    ToolFinished {
+        name: String,
+        summary: String,
+        call: ToolCall,
+        output: String,
+        ok: bool,
+        duration_ms: u64,
+    },
+}
+
+/// One captured conversation line inside a child agent: its own prose reply, a
+/// tool call it made, or the result of that call. Rendered when the user
+/// navigates into the agent (chat area).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtaskRoundRole {
+    Assistant,
+    ToolCall,
+    ToolResult,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubtaskRound {
+    pub role: SubtaskRoundRole,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Subtask {
+    pub id: u64,
+    pub session_id: usize,
+    /// Parent child agent when this agent was spawned by another child agent;
+    /// `None` means a direct child of the root (UI-session) agent.
+    pub parent_id: Option<u64>,
+    pub call: ToolCall,
+    pub description: String,
+    /// One-based main checklist subtask delegated to this child agent, when declared.
+    pub todo_index: Option<usize>,
+    pub prompt: String,
+    pub cwd: PathBuf,
+    pub status: SubtaskStatus,
+    pub activity: Option<String>,
+    pub log: Vec<SubtaskLogEntry>,
+    /// Captured conversation inside this agent (its replies, tool calls, and
+    /// tool results), shown when the user navigates into the agent.
+    pub transcript: Vec<SubtaskRound>,
+    pub output: Option<String>,
+    /// Parent transcript message updated in place as this child agent progresses.
+    pub message_index: usize,
+    pub started_at: std::time::Instant,
+    pub duration_ms: Option<u64>,
+    /// Aborts the child model loop when the parent round is cancelled.
+    pub abort: Option<tokio::task::AbortHandle>,
+    /// Resolved named-agent from `[agents]` config, when the call referenced one.
+    pub agent: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum SubtaskEvent {
+    /// A nested child agent registered itself after being spawned inside another
+    /// child agent; the app creates its tree node on receipt.
+    Registered {
+        id: u64,
+        parent_id: u64,
+        call: ToolCall,
+        description: String,
+        prompt: String,
+        agent: Option<String>,
+        cwd: PathBuf,
+    },
+    Progress {
+        id: u64,
+        progress: SubtaskProgress,
+    },
+    /// One captured conversation line from inside the agent.
+    Round {
+        id: u64,
+        role: SubtaskRoundRole,
+        content: String,
+    },
+    Finished {
+        id: u64,
+        output: Result<String, String>,
+        duration_ms: u64,
+    },
+}
+
+#[derive(Debug)]
+pub struct TaskBarrier {
+    pub session_id: usize,
+    pub task_ids: Vec<u64>,
 }
 
 /// A model stream tagged with the session it belongs to, so several sessions can
@@ -98,6 +297,9 @@ pub enum PendingExternal {
     /// contents back (the file is written before this is set). Used to edit a
     /// pending permission batch; the contents return via `AgentPermissionEdited`.
     EditReadback(PathBuf),
+    /// Open an already-written temp file in `$EDITOR`, then read its edited
+    /// contents back into the selected ask option.
+    DecisionReadback(PathBuf),
     /// Open an already-written temp file in `$EDITOR`, then read it back as the new
     /// session access policy (contents return via `SetAccessPolicy`).
     PolicyReadback(PathBuf),
@@ -151,7 +353,15 @@ pub struct App {
     /// Whether the terminal reports AiTUI as focused; desktop notifications are
     /// suppressed while true so permission prompts do not double-notify onscreen.
     pub focused: bool,
+    pub notification_tx: std::sync::mpsc::Sender<crate::app::notify::DesktopResponse>,
+    pub notification_rx: std::sync::mpsc::Receiver<crate::app::notify::DesktopResponse>,
+    pub notification_generation: u64,
     pub show_help: bool,
+    pub help_detail: Option<usize>,
+    pub help_selected: usize,
+    pub help_scroll: usize,
+    /// First rendered row in the sidebar task list.
+    pub sidebar_task_scroll: usize,
     pub should_quit: bool,
     pub yank: Option<String>,
     /// The character just typed in insert mode (for the `jk`-style escape chord).
@@ -159,7 +369,10 @@ pub struct App {
     pub last_insert: Option<char>,
     /// Show the full output of executed tools (off by default; toggled at runtime).
     pub show_output: bool,
-    /// Path to a recently generated image to display in-terminal via Kitty protocol.
+    /// Expand the latest user prompt preview below the header. It remains a
+    /// clickable single-line preview when collapsed.
+    pub show_last_prompt: bool,
+    /// Path to a completed generated image awaiting Kitty/Sixel display.
     pub pending_image: Option<PathBuf>,
     /// Text queued for the system clipboard, flushed once (via OSC 52) by the
     /// renderer — mirrors `pending_image`, keeping raw stdout writes in the UI layer.
@@ -171,17 +384,21 @@ pub struct App {
     /// restores. Used to open files/the conversation in `$EDITOR` or a shell.
     pub pending_external: Option<PendingExternal>,
 
-    /// Token usage from the most recent completed response, shown top-right.
-    /// `None` until the endpoint reports usage (some servers never do).
-    pub usage: Option<crate::api::Usage>,
+    /// Session ids currently running in another live AiTUI process, refreshed from
+    /// per-process heartbeat files alongside session synchronization.
+    pub remote_running_sessions: std::collections::HashSet<usize>,
+    /// Most recent token usage reported for each session, keyed by stable session id.
+    /// Endpoints may omit usage; top bar keeps an explicit pending state in that case.
+    pub session_usage: std::collections::HashMap<usize, crate::api::Usage>,
 
     /// Toggleable instruction snippets loaded from `~/.config/aitui/skills/`.
     /// Active skills are injected as system messages on each request.
     pub skills: Vec<crate::skills::Skill>,
 
-    /// Current reasoning effort ("low"/"medium"/"high"), or None to omit it.
-    /// Cycled with `:effort`; sent to reasoning-capable models.
+    /// Current free-form reasoning effort, or None to omit it.
     pub reasoning_effort: Option<String>,
+    /// Current free-form reasoning mode, or None to omit it.
+    pub reasoning_mode: Option<String>,
 
     /// Bumped whenever chat content/collapse changes, to invalidate the doc cache.
     pub content_rev: u64,
@@ -199,6 +416,9 @@ pub struct App {
     pub judging: Option<JudgeBatch>,
     /// Verdicts stream back here from the async judge task, tagged with the session.
     pub judge_rx: Option<mpsc::Receiver<(usize, Vec<AccessVerdict>)>>,
+    /// Abort handle for the live review-model request, allowing review to be
+    /// disabled without waiting for the network request to finish.
+    pub judge_task: Option<tokio::task::JoinHandle<()>>,
     pub agent_iterations: usize,
     /// Which session the in-progress agent tool round belongs to (rounds are
     /// serialized; a background session that finishes needing tools waits its turn).
@@ -211,6 +431,24 @@ pub struct App {
     /// background session keeps generating while you work in another (parallel).
     pub streams: Vec<StreamHandle>,
     pub agent_tool_rx: Option<mpsc::Receiver<ToolResult>>,
+    pub agent_tool_batch_rx: Option<mpsc::Receiver<Vec<ToolResult>>>,
+    /// Shared abort flag for the in-flight tool round; set by `AgentCancel` so a
+    /// running tool (notably a shell) stops side effects instead of only having
+    /// its result dropped. Replaced by a fresh flag per round.
+    pub agent_abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Parallel child-agent runs for the active parent tool round.
+    pub subtasks: Vec<Subtask>,
+    /// Highlighted child agent in the activity-row tab strip.
+    pub selected_subtask: Option<u64>,
+    /// Child agent the user is currently viewing inside (chat + sidebar show
+    /// that agent's own content); `None` shows the root (UI-session) chat.
+    pub view_node: Option<u64>,
+    /// Unique child-agent id allocator shared between the app (top-level
+    /// children) and nested children spawned inside child agents.
+    pub subtask_id_alloc: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub task_barrier: Option<TaskBarrier>,
+    pub subtask_tx: mpsc::Sender<SubtaskEvent>,
+    pub subtask_rx: mpsc::Receiver<SubtaskEvent>,
     /// The tool currently executing, for the transcript header animation.
     pub active_tool: Option<(String, std::time::Instant)>,
     /// The tool call the model is currently assembling natively, shown inline
@@ -218,6 +456,31 @@ pub struct App {
     pub preparing_tool: Option<(usize, String, std::time::Instant)>,
     pub models_rx: Option<oneshot::Receiver<anyhow::Result<Vec<String>>>>,
     pub title_rx: Option<mpsc::Receiver<(usize, String)>>,
+    /// Shared result channel for optional per-session response suggestions.
+    pub suggestion_tx: mpsc::Sender<(usize, u64, Vec<String>)>,
+    pub suggestion_rx: mpsc::Receiver<(usize, u64, Vec<String>)>,
+    /// Turn signatures already being suggested, preventing duplicate requests when
+    /// a stream emits both Done and channel-disconnect completion signals.
+    pub suggestion_inflight: std::collections::HashSet<(usize, u64)>,
+    /// Shared result channel for the parallel task-tracker agent, which updates
+    /// the checklist after each completed response.
+    pub todo_tx: mpsc::Sender<(usize, u64, Result<crate::app::state::TodoUpdate, String>)>,
+    pub todo_rx: mpsc::Receiver<(usize, u64, Result<crate::app::state::TodoUpdate, String>)>,
+    /// Signatures already being tracked, preventing duplicate tracker calls when
+    /// a stream emits both Done and channel-disconnect completion signals.
+    pub todo_inflight: std::collections::HashMap<(usize, u64), u64>,
+    pub memory_tx: mpsc::Sender<(
+        usize,
+        u64,
+        Result<Vec<crate::app::memory::MemoryOperation>, String>,
+    )>,
+    pub memory_rx: mpsc::Receiver<(
+        usize,
+        u64,
+        Result<Vec<crate::app::memory::MemoryOperation>, String>,
+    )>,
+    pub memory_inflight: std::collections::HashSet<usize>,
+    pub memory_pending: std::collections::HashSet<usize>,
 
     /// Speculative tool execution: while an agent-mode reply streams, complete
     /// read-only tool blocks are pre-run in the background so their results are
@@ -228,6 +491,10 @@ pub struct App {
     /// Bumped every turn (`begin_stream_for`); tags each speculative task so a
     /// result that lands after the turn moved on is dropped instead of served stale.
     pub spec_epoch: u64,
+    /// Limits concurrent speculative tool executions. Atomic counter: speculative
+    /// tasks increment on spawn and decrement on completion. When at cap, new
+    /// speculative work is skipped until existing tasks finish.
+    pub spec_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Set when an agent-mode stream is cut early (a complete tool call appeared
     /// mid-generation). The main loop drains it *after* the batch so the tool round
     /// starts on a clean pass — no leftover tokens land in the next stream.
@@ -241,15 +508,54 @@ pub struct App {
     /// typing `@` doesn't walk the filesystem on every keystroke.
     pub mention_files: Vec<String>,
     pub mention_files_at: Option<std::time::Instant>,
+    pub mention_files_root: Option<PathBuf>,
+
+    /// Mouse-driven text selection state. None when idle; Some when the user is
+    /// dragging to select transcript text.
+    pub mouse_select: Option<MouseSelection>,
 
     pub layout: PanelLayout,
     pub(crate) api: Option<ApiClient>,
+}
+
+/// Active mouse selection in the transcript (drag-to-select).
+#[derive(Debug, Clone, Copy)]
+pub struct MouseSelection {
+    pub anchor_row: u16,
+    pub drag_row: u16,
+    pub active: bool,
 }
 
 /// Runaway loop guard. Effectively unlimited: the assistant is free to take as
 /// many tool rounds as it needs. Kept at the ceiling only so a truly pathological
 /// infinite loop still can't overflow the counter (Ctrl-C cancels a round anyway).
 pub const MAX_AGENT_ITERATIONS: usize = usize::MAX;
+
+fn optional_reasoning_value(value: &str) -> Option<String> {
+    match value.trim() {
+        "" => None,
+        value if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") => None,
+        value => Some(value.to_string()),
+    }
+}
+
+fn relative_prompt_time(timestamp: Option<u64>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "never".to_string();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(timestamp);
+    let elapsed = now.saturating_sub(timestamp);
+    match elapsed {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{}m ago", elapsed / 60),
+        3_600..=86_399 => format!("{}h ago", elapsed / 3_600),
+        86_400..=604_799 => format!("{}d ago", elapsed / 86_400),
+        _ => format!("{}w ago", elapsed / 604_800),
+    }
+}
 
 impl App {
     pub fn new(config: Config) -> anyhow::Result<Self> {
@@ -285,11 +591,14 @@ impl App {
         };
 
         let keymap = Keymap::from_config(&config.keybinds);
-        let reasoning_effort = match config.api.reasoning_effort.trim() {
-            "" => None,
-            e => Some(e.to_string()),
-        };
+        let reasoning_effort = optional_reasoning_value(&config.api.reasoning_effort);
+        let reasoning_mode = optional_reasoning_value(&config.api.reasoning_mode);
         let (spec_tx, spec_rx) = mpsc::channel(64);
+        let (suggestion_tx, suggestion_rx) = mpsc::channel(32);
+        let (todo_tx, todo_rx) = mpsc::channel(32);
+        let (memory_tx, memory_rx) = mpsc::channel(32);
+        let (subtask_tx, subtask_rx) = mpsc::channel(64);
+        let (notification_tx, notification_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             config,
             keymap,
@@ -319,18 +628,28 @@ impl App {
                 "Loading models…".into()
             }),
             focused: true,
+            notification_tx,
+            notification_rx,
+            notification_generation: 0,
             show_help: false,
+            help_detail: None,
+            help_selected: 0,
+            help_scroll: 0,
+            sidebar_task_scroll: 0,
             should_quit: false,
             yank: None,
             last_insert: None,
             show_output: false,
+            show_last_prompt: false,
             pending_image: None,
             pending_clipboard: None,
             edited_files: Vec::new(),
             pending_external: None,
-            usage: None,
+            remote_running_sessions: std::collections::HashSet::new(),
+            session_usage: std::collections::HashMap::new(),
             skills: crate::skills::load(),
             reasoning_effort,
+            reasoning_mode,
             content_rev: 0,
             session_permissions: std::collections::HashMap::new(),
             permissions: PermissionMemory::default(),
@@ -338,32 +657,52 @@ impl App {
             approved: VecDeque::new(),
             judging: None,
             judge_rx: None,
+            judge_task: None,
             agent_iterations: 0,
             streams: Vec::new(),
             agent_session: None,
             agent_queue: std::collections::VecDeque::new(),
             agent_tool_rx: None,
+            agent_abort: None,
+            agent_tool_batch_rx: None,
+            subtasks: Vec::new(),
+            selected_subtask: None,
+            view_node: None,
+            subtask_id_alloc: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            task_barrier: None,
+            subtask_tx,
+            subtask_rx,
             active_tool: None,
             preparing_tool: None,
             models_rx: Some(models_rx),
             title_rx: None,
+            suggestion_tx,
+            suggestion_rx,
+            suggestion_inflight: std::collections::HashSet::new(),
+            todo_tx,
+            todo_rx,
+            todo_inflight: std::collections::HashMap::new(),
+            memory_tx,
+            memory_rx,
+            memory_inflight: std::collections::HashSet::new(),
+            memory_pending: std::collections::HashSet::new(),
             spec_results: std::collections::HashMap::new(),
             spec_dispatched: std::collections::HashSet::new(),
             spec_epoch: 0,
+            spec_inflight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             cut_stream: None,
             spec_tx,
             spec_rx,
             mention_files: Vec::new(),
             mention_files_at: None,
+            mention_files_root: None,
+            mouse_select: None,
             layout: PanelLayout::default(),
             api: Some(api),
         };
 
-        if app.config.ui.agent_default {
-            // Apply to all sessions, not just the active one — loaded sessions
-            // default to agent-off, which would silently ignore tool calls.
-            app.sessions.set_agent_mode_all(true);
-        }
+        // Agent mode is always on. All sessions use tools.
+        app.sessions.set_agent_mode_all(true);
         sync_auto_approvals(&mut app.permissions, app.config.ui.auto_approve_reads);
 
         // Show the launch screen when there is any non-empty session to resume,
@@ -404,7 +743,11 @@ impl App {
         if hidden == 0 {
             return None;
         }
-        let label = format!(" ↓ {} below · {} ", hidden, self.keymap.scroll_bottom.label());
+        let label = format!(
+            " ↓ {} below · {} ",
+            hidden,
+            self.keymap.scroll_bottom.label()
+        );
         let w = (label.chars().count() as u16).min(chat.width);
         if w == 0 {
             return None;
@@ -427,21 +770,38 @@ impl App {
 
     pub fn session_items(&self) -> Vec<String> {
         let cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
+            .map(|path| crate::render::path::display_path(&path))
             .unwrap_or_else(|_| "—".to_string());
+        let local_running: std::collections::HashSet<usize> =
+            self.running_session_ids().into_iter().collect();
         let mut items = Vec::with_capacity(self.sessions.all().len() + 1);
-        items.push(format!("＋  Start a new session   {}", cwd));
-        for sess in self.sessions.all() {
-            let dir = sess
+        items.push(format!("＋  New session  ·  cwd {}", cwd));
+        for (index, session) in self.sessions.all().iter().enumerate() {
+            let cwd = session
                 .cwd
                 .as_ref()
-                .map(|p| p.display().to_string())
+                .map(|path| crate::render::path::display_path(path))
                 .unwrap_or_else(|| "—".to_string());
+            let state = if local_running.contains(&session.id) {
+                "RUNNING here"
+            } else if self.remote_running_sessions.contains(&session.id) {
+                "RUNNING elsewhere"
+            } else {
+                "idle"
+            };
+            let marker = if index == self.sessions.active_idx() {
+                "●"
+            } else {
+                "○"
+            };
             items.push(format!(
-                "≡  {}   {} · {} msg",
-                sess.name,
-                dir,
-                sess.messages.len()
+                "{}  {}  ·  {}  ·  last {}  ·  cwd {}  ·  {} msg",
+                marker,
+                session.name,
+                state,
+                relative_prompt_time(session.last_prompt_at),
+                cwd,
+                session.messages.len()
             ));
         }
         items
@@ -453,6 +813,30 @@ impl App {
         self.current_model() == MOCK_MODEL
     }
 
+    pub fn running_session_ids(&self) -> Vec<usize> {
+        let mut ids: std::collections::HashSet<usize> = self
+            .streams
+            .iter()
+            .map(|stream| stream.session_id)
+            .collect();
+        if let Some(id) = self.agent_session {
+            ids.insert(id);
+        }
+        if let Some(judge) = &self.judging {
+            ids.insert(judge.session_id);
+        }
+        for task in self
+            .subtasks
+            .iter()
+            .filter(|task| task.status == SubtaskStatus::Running)
+        {
+            ids.insert(task.session_id);
+        }
+        let mut ids: Vec<usize> = ids.into_iter().collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Whether the **active** session is mid-turn: streaming a reply, running its
     /// agent tool round, or waiting on a permission prompt. Blocks a second send
     /// *in that session* — but other sessions can stream in parallel, and the input
@@ -461,7 +845,14 @@ impl App {
         let active = self.sessions.active_id();
         self.sessions.active().is_streaming()
             || self.streams.iter().any(|s| s.session_id == active)
-            || self.judging.as_ref().is_some_and(|j| j.session_id == active)
+            || self
+                .judging
+                .as_ref()
+                .is_some_and(|j| j.session_id == active)
+            || self
+                .task_barrier
+                .as_ref()
+                .is_some_and(|barrier| barrier.session_id == active)
             || (self.agent_session == Some(active)
                 && (self.agent_tool_rx.is_some()
                     || !self.pending_tools.is_empty()
@@ -470,11 +861,6 @@ impl App {
                 self.overlay,
                 Overlay::Permission(_) | Overlay::Decision(_) | Overlay::Plan(_)
             )
-    }
-
-    /// Whether *any* session is currently generating (used for the busy spinner).
-    pub fn any_busy(&self) -> bool {
-        !self.streams.is_empty() || self.agent_tool_rx.is_some() || !self.pending_tools.is_empty()
     }
 
     /// Invalidate the chat document cache (content or collapse changed).
@@ -488,7 +874,8 @@ impl App {
 
     pub fn stash_active_permissions(&mut self) {
         let sid = self.sessions.active_id();
-        self.session_permissions.insert(sid, self.permissions.clone());
+        self.session_permissions
+            .insert(sid, self.permissions.clone());
     }
 
     pub fn load_active_permissions(&mut self) {
@@ -569,13 +956,24 @@ impl App {
     /// `@`-mention completion filters an in-memory list instead of walking the
     /// filesystem on every keystroke.
     fn ensure_mention_files(&mut self) {
-        let stale = self
-            .mention_files_at
-            .map(|t| t.elapsed() > std::time::Duration::from_secs(5))
-            .unwrap_or(true);
+        let root = self
+            .sessions
+            .active()
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok());
+        let stale = self.mention_files_root != root
+            || self
+                .mention_files_at
+                .map(|t| t.elapsed() > std::time::Duration::from_secs(5))
+                .unwrap_or(true);
         if stale {
-            self.mention_files = find_project_files(4000);
+            self.mention_files = root
+                .as_deref()
+                .map(|root| find_project_files(root, 4000))
+                .unwrap_or_default();
             self.mention_files_at = Some(std::time::Instant::now());
+            self.mention_files_root = root;
         }
     }
 
@@ -614,8 +1012,9 @@ impl App {
 /// list as the fallback when no real models exist or the endpoint is unreachable.
 pub const MOCK_MODEL: &str = "mock";
 
-/// Expand `@path` mentions in `text` into inline file-context blocks.
-pub fn expand_mentions(text: &str) -> String {
+/// Expand `@path` mentions in `text` into inline file-context blocks resolved
+/// relative to the active session's project root.
+pub fn expand_mentions(text: &str, root: &std::path::Path) -> String {
     let mut paths: Vec<String> = Vec::new();
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
@@ -638,15 +1037,22 @@ pub fn expand_mentions(text: &str) -> String {
     }
     let mut blocks = Vec::new();
     for p in paths {
-        let path = std::path::Path::new(&p);
-        if path.is_file() {
-            if let Ok(content) = crate::files::read_text(path) {
+        if let Some(path) = resolve_mention_path(root, &p) {
+            if let Ok(content) = crate::files::read_text(&path) {
                 let capped: String = content.chars().take(100_000).collect();
                 blocks.push(format!("File: {}\n```\n{}\n```", p, capped));
             }
         }
     }
     blocks.join("\n\n")
+}
+
+fn resolve_mention_path(root: &std::path::Path, token: &str) -> Option<PathBuf> {
+    let root = std::fs::canonicalize(root).ok()?;
+    let path = std::fs::canonicalize(root.join(token)).ok()?;
+    path.is_file()
+        .then_some(path)
+        .filter(|path| path.starts_with(root))
 }
 
 /// Subsequence fuzzy score (lower = better); None if not a subsequence.
@@ -676,11 +1082,16 @@ pub fn fuzzy_score(text: &str, query: &str) -> Option<usize> {
     }
 }
 
-/// Recursively list project files (relative paths) for `@`-mention completion.
-pub fn find_project_files(max: usize) -> Vec<String> {
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+/// Recursively list project files relative to `root` for `@` completion.
+pub fn find_project_files(root: &std::path::Path, max: usize) -> Vec<String> {
+    if max == 0 || !root.is_dir() {
+        return Vec::new();
+    }
+    let root = root.to_path_buf();
     let mut out: Vec<String> = Vec::new();
     let mut stack = vec![root.clone()];
+    let mut visited = 0usize;
+    let visit_limit = max.saturating_mul(16).max(max);
     let skip = [
         ".git",
         "target",
@@ -702,6 +1113,11 @@ pub fn find_project_files(max: usize) -> Vec<String> {
             Err(_) => continue,
         };
         for entry in entries.flatten() {
+            visited += 1;
+            if visited > visit_limit {
+                stack.clear();
+                break;
+            }
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
             if path.is_dir() {
@@ -751,7 +1167,31 @@ mod tests {
     }
 
     #[test]
+    fn mention_discovery_and_expansion_use_the_explicit_project_root() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("aitui_mentions_{}_{}", std::process::id(), unique));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+
+        assert_eq!(find_project_files(&root, 10), vec!["src/main.rs"]);
+        assert!(expand_mentions("see @src/main.rs", &root).contains("fn main() {}"));
+        assert_eq!(expand_mentions("see @../outside.txt", &root), "");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn expand_mentions_ignores_missing_files() {
-        assert_eq!(expand_mentions("see @does_not_exist_xyz.txt here"), "");
+        assert_eq!(
+            expand_mentions(
+                "see @does_not_exist_xyz.txt here",
+                std::path::Path::new(".")
+            ),
+            ""
+        );
     }
 }

@@ -4,7 +4,10 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 /// Represents a tool the agent can call. Lean, single-purpose catalogue (Unix
 /// philosophy): each variant does exactly one thing. Legacy names map onto these
@@ -16,16 +19,22 @@ pub enum ToolKind {
     Edit,
     List,
     Search,
+    MakeDir,
     Shell,
     Move,
     Copy,
     Delete,
     WebSearch,
+    WebImages,
+    ReverseImage,
     WebFetch,
     Download,
     Todo,
     Ask,
     Plan,
+    ProposeStep,
+    /// Launch a focused parallel child agent for independent work.
+    Task,
     /// Autonomous-loop control: the model calls this to signal the loop's stop
     /// criteria are met (or that it's blocked), ending the loop.
     Finish,
@@ -39,16 +48,21 @@ impl ToolKind {
             ToolKind::Edit => "edit",
             ToolKind::List => "list",
             ToolKind::Search => "search",
+            ToolKind::MakeDir => "mkdir",
             ToolKind::Shell => "shell",
             ToolKind::Move => "move",
             ToolKind::Copy => "copy",
             ToolKind::Delete => "delete",
             ToolKind::WebSearch => "web_search",
+            ToolKind::WebImages => "web_images",
+            ToolKind::ReverseImage => "reverse_image",
             ToolKind::WebFetch => "web_fetch",
             ToolKind::Download => "download",
             ToolKind::Todo => "todo",
             ToolKind::Ask => "ask",
             ToolKind::Plan => "plan",
+            ToolKind::ProposeStep => "propose_step",
+            ToolKind::Task => "agent",
             ToolKind::Finish => "finish",
         }
     }
@@ -60,38 +74,50 @@ impl ToolKind {
             ToolKind::Edit => "Replace an exact, unique snippet in a file",
             ToolKind::List => "List a directory (optionally as a tree)",
             ToolKind::Search => "Search file contents for a regex pattern",
+            ToolKind::MakeDir => "Create a directory, including missing parents",
             ToolKind::Shell => "Run a shell command (build/test/run)",
             ToolKind::Move => "Move or rename a file or directory",
             ToolKind::Copy => "Copy a file or directory (recursive)",
             ToolKind::Delete => "Delete a file or directory tree permanently",
             ToolKind::WebSearch => "Search the web; returns titled results with links",
+            ToolKind::WebImages => "Search Wikimedia Commons for reusable images and metadata",
+            ToolKind::ReverseImage => {
+                "Find visually similar images and source pages from an image URL or local file"
+            }
             ToolKind::WebFetch => "Fetch the readable text of a web page",
             ToolKind::Download => "Download a URL to a local file",
             ToolKind::Todo => "Set the task breakdown shown in the sticky todo panel",
-            ToolKind::Ask => "Ask the user to choose from options",
+            ToolKind::Ask => "Ask the user for missing information or a decision",
             ToolKind::Plan => "Write a plan file for user review and approval",
+            ToolKind::ProposeStep => "Present one workflow step with genuine alternative paths",
+            ToolKind::Task => "Launch a focused parallel child agent for independent work",
             ToolKind::Finish => "End the autonomous loop: stop criteria met (or blocked)",
         }
     }
 
     pub fn icon(&self) -> &'static str {
         match self {
-            ToolKind::Read => "📖",
-            ToolKind::Write => "✎",
+            ToolKind::Read => "◈",
+            ToolKind::Write => "⤒",
             ToolKind::Edit => "✎",
-            ToolKind::List => "📁",
-            ToolKind::Search => "🔍",
-            ToolKind::Shell => "⚡",
-            ToolKind::Move => "🚚",
+            ToolKind::List => "☰",
+            ToolKind::Search => "⌕",
+            ToolKind::MakeDir => "▣",
+            ToolKind::Shell => "$",
+            ToolKind::Move => "⇄",
             ToolKind::Copy => "⧉",
-            ToolKind::Delete => "🗑",
-            ToolKind::WebSearch => "🌐",
-            ToolKind::WebFetch => "🔗",
-            ToolKind::Download => "⬇",
+            ToolKind::Delete => "✗",
+            ToolKind::WebSearch => "⇗",
+            ToolKind::WebImages => "▦",
+            ToolKind::ReverseImage => "↺",
+            ToolKind::WebFetch => "⤓",
+            ToolKind::Download => "⇩",
             ToolKind::Todo => "☑",
             ToolKind::Ask => "?",
-            ToolKind::Plan => "📝",
-            ToolKind::Finish => "🏁",
+            ToolKind::Plan => "◫",
+            ToolKind::ProposeStep => "⇉",
+            ToolKind::Task => "⚙",
+            ToolKind::Finish => "✓",
         }
     }
 
@@ -102,7 +128,10 @@ impl ToolKind {
             ToolKind::List => ToolRisk::Low,
             ToolKind::Search => ToolRisk::Low,
             ToolKind::WebSearch => ToolRisk::Low,
+            ToolKind::WebImages => ToolRisk::Low,
+            ToolKind::ReverseImage => ToolRisk::Low,
             ToolKind::WebFetch => ToolRisk::Low,
+            ToolKind::MakeDir => ToolRisk::Medium,
             ToolKind::Write => ToolRisk::Medium,
             ToolKind::Edit => ToolRisk::Medium,
             ToolKind::Move => ToolRisk::Medium,
@@ -111,6 +140,8 @@ impl ToolKind {
             ToolKind::Todo => ToolRisk::Low,
             ToolKind::Ask => ToolRisk::Low,
             ToolKind::Plan => ToolRisk::Low,
+            ToolKind::ProposeStep => ToolRisk::Low,
+            ToolKind::Task => ToolRisk::Low,
             ToolKind::Finish => ToolRisk::Low,
             ToolKind::Delete => ToolRisk::High,
             ToolKind::Shell => ToolRisk::High,
@@ -122,20 +153,25 @@ impl ToolKind {
         // aliases currently make schema/prompt/executor behavior harder to reason about.
         match name {
             "read" | "read_file" => Some(ToolKind::Read),
-            "write" | "write_file" | "append_file" => Some(ToolKind::Write),
+            "write" | "write_file" => Some(ToolKind::Write),
             "edit" | "edit_file" => Some(ToolKind::Edit),
             "list" | "list_dir" => Some(ToolKind::List),
             "search" | "search_files" => Some(ToolKind::Search),
+            "mkdir" | "make_dir" => Some(ToolKind::MakeDir),
             "shell" | "run_shell" => Some(ToolKind::Shell),
             "move" | "move_path" => Some(ToolKind::Move),
             "copy" | "copy_path" => Some(ToolKind::Copy),
             "delete" | "delete_file" | "delete_dir" => Some(ToolKind::Delete),
             "web_search" => Some(ToolKind::WebSearch),
+            "web_images" | "image_search" => Some(ToolKind::WebImages),
+            "reverse_image" | "reverse_image_search" => Some(ToolKind::ReverseImage),
             "web_fetch" => Some(ToolKind::WebFetch),
             "download" | "download_file" => Some(ToolKind::Download),
             "todo" | "todos" | "todo_write" => Some(ToolKind::Todo),
             "ask" | "decide" => Some(ToolKind::Ask),
             "plan" => Some(ToolKind::Plan),
+            "propose_step" => Some(ToolKind::ProposeStep),
+            "agent" | "task" | "subagent" | "sub_agent" => Some(ToolKind::Task),
             "finish" | "done" | "complete" | "stop_loop" => Some(ToolKind::Finish),
             _ => None,
         }
@@ -147,12 +183,15 @@ impl ToolKind {
             ToolKind::Read,
             ToolKind::List,
             ToolKind::Search,
+            ToolKind::MakeDir,
             ToolKind::Edit,
             ToolKind::Write,
             ToolKind::Move,
             ToolKind::Copy,
             ToolKind::Shell,
             ToolKind::WebSearch,
+            ToolKind::WebImages,
+            ToolKind::ReverseImage,
             ToolKind::WebFetch,
             ToolKind::Download,
             ToolKind::Delete,
@@ -190,31 +229,120 @@ pub struct ToolCall {
 
 impl ToolCall {
     pub fn kind(&self) -> Option<ToolKind> {
-        ToolKind::from_name(&self.name)
+        match self.name.as_str() {
+            "file_management" => self.category_action().and_then(|action| match action {
+                "read" => Some(ToolKind::Read),
+                "write" => Some(ToolKind::Write),
+                "edit" => Some(ToolKind::Edit),
+                "list" => Some(ToolKind::List),
+                "search" => Some(ToolKind::Search),
+                "mkdir" => Some(ToolKind::MakeDir),
+                "move" => Some(ToolKind::Move),
+                "copy" => Some(ToolKind::Copy),
+                "delete" => Some(ToolKind::Delete),
+                _ => None,
+            }),
+            "web" => self.category_action().and_then(|action| match action {
+                "search" => Some(ToolKind::WebSearch),
+                "images" | "image_search" => Some(ToolKind::WebImages),
+                "reverse_image" | "reverse" => Some(ToolKind::ReverseImage),
+                "fetch" => Some(ToolKind::WebFetch),
+                "download" => Some(ToolKind::Download),
+                _ => None,
+            }),
+            "interaction" => self.category_action().and_then(|action| match action {
+                "ask" => Some(ToolKind::Ask),
+                "propose" => Some(ToolKind::ProposeStep),
+                "plan" => Some(ToolKind::Plan),
+                _ => None,
+            }),
+            "workflow" => self.category_action().and_then(|action| match action {
+                "todo" => Some(ToolKind::Todo),
+                "agent" | "task" => Some(ToolKind::Task),
+                "propose" => Some(ToolKind::ProposeStep),
+                "finish" => Some(ToolKind::Finish),
+                _ => None,
+            }),
+            _ => ToolKind::from_name(&self.name),
+        }
     }
 
-    /// Directory a call primarily operates in, for directory-scoped permission rules.
-    pub fn permission_directory(&self, cwd: &Path) -> Option<PathBuf> {
-        let raw = match self.kind() {
-            Some(ToolKind::Shell) => Some("."),
-            Some(ToolKind::Move) | Some(ToolKind::Copy) => self
-                .args
-                .get("from")
-                .or_else(|| self.args.get("source"))
-                .and_then(|v| v.as_str()),
-            Some(ToolKind::WebSearch) | Some(ToolKind::WebFetch) | Some(ToolKind::Download) => None,
-            _ => self.args.get("path").and_then(|v| v.as_str()),
-        }?;
-        let p = PathBuf::from(raw);
-        let p = if p.is_absolute() { p } else { cwd.join(p) };
-        let dir = if p.is_dir() {
-            p
-        } else {
-            p.parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| cwd.to_path_buf())
+    fn category_action(&self) -> Option<&str> {
+        self.args.get("action").and_then(|v| v.as_str())
+    }
+
+    /// Directories a call operates in for permission matching. Multi-path and
+    /// batch operations must keep every endpoint inside a scoped rule.
+    pub fn permission_directories(&self, cwd: &Path) -> Vec<PathBuf> {
+        let mut raw_paths: Vec<String> = Vec::new();
+        let mut collect = |args: &serde_json::Value| match self.kind() {
+            Some(ToolKind::Shell) => raw_paths.push(".".into()),
+            Some(ToolKind::Move) | Some(ToolKind::Copy) => {
+                raw_paths.extend(
+                    ["from", "to"]
+                        .into_iter()
+                        .filter_map(|key| args.get(key).and_then(|value| value.as_str()))
+                        .map(str::to_string),
+                );
+            }
+            Some(ToolKind::Download) => raw_paths.extend(
+                args.get("path")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                    .into_iter(),
+            ),
+            Some(ToolKind::WebSearch)
+            | Some(ToolKind::WebImages)
+            | Some(ToolKind::ReverseImage)
+            | Some(ToolKind::WebFetch) => {}
+            _ => {
+                raw_paths.extend(
+                    args.get("path")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                        .into_iter(),
+                );
+                raw_paths.extend(
+                    args.get("paths")
+                        .and_then(|value| value.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|value| value.as_str())
+                        .map(str::to_string),
+                );
+            }
         };
-        Some(std::fs::canonicalize(&dir).unwrap_or(dir))
+        if let Some(batch) = self.args.get("batch").and_then(|value| value.as_array()) {
+            for args in batch {
+                collect(args);
+            }
+        } else {
+            collect(&self.args);
+        }
+        raw_paths
+            .into_iter()
+            .map(|raw| {
+                let path = PathBuf::from(raw);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    cwd.join(path)
+                };
+                let directory = if path.is_dir() {
+                    path
+                } else {
+                    path.parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| cwd.to_path_buf())
+                };
+                normalize_lexical(&directory)
+            })
+            .collect()
+    }
+
+    /// Primary directory shown in the access editor.
+    pub fn permission_directory(&self, cwd: &Path) -> Option<PathBuf> {
+        self.permission_directories(cwd).into_iter().next()
     }
 
     /// Whether this call's `path` argument resolves *outside* the project tree
@@ -225,23 +353,26 @@ impl ToolCall {
     /// so it flags an escape even for a path that doesn't exist yet, and can't be
     /// fooled into a slow/undefined canonicalize on a bogus path.
     pub fn reads_outside_cwd(&self, cwd: &std::path::Path) -> bool {
-        let Some(raw) = self.args.get("path").and_then(|v| v.as_str()) else {
-            return false;
-        };
-        let raw_path = std::path::Path::new(raw);
-        let joined = if raw_path.is_absolute() {
-            raw_path.to_path_buf()
-        } else {
-            cwd.join(raw_path)
-        };
-        let target = normalize_lexical(&joined);
         let base = normalize_lexical(cwd);
-        !target.starts_with(&base)
+        self.permission_directories(cwd)
+            .into_iter()
+            .any(|directory| !directory.starts_with(&base))
     }
 
     /// Human-readable summary of what this call will do, rendered function-call
     /// style: `name(primary args)`. Reused as the transcript header for the call.
     pub fn summary(&self) -> String {
+        let batch_len = self
+            .args
+            .get("batch")
+            .or_else(|| self.args.get("paths"))
+            .or_else(|| self.args.get("commands"))
+            .and_then(|value| value.as_array())
+            .map(Vec::len);
+        if let Some(count) = batch_len {
+            let name = self.kind().map(|kind| kind.name()).unwrap_or(&self.name);
+            return format!("{}({} operations)", name, count);
+        }
         let s = |k: &str| self.args.get(k).and_then(|v| v.as_str());
         let path = || s("path").unwrap_or("?");
         match self.kind() {
@@ -257,6 +388,7 @@ impl ToolCall {
                 let pat = s("pattern").or_else(|| s("query")).unwrap_or("?");
                 format!("search(\"{}\")", pat)
             }
+            Some(ToolKind::MakeDir) => format!("mkdir({})", path()),
             Some(ToolKind::Delete) => format!("delete({})", path()),
             Some(ToolKind::Move) => {
                 format!(
@@ -276,6 +408,14 @@ impl ToolCall {
                 let q = s("query").or_else(|| s("q")).unwrap_or("?");
                 format!("web_search(\"{}\")", q)
             }
+            Some(ToolKind::WebImages) => {
+                let q = s("query").or_else(|| s("q")).unwrap_or("?");
+                format!("web_images(\"{}\")", q)
+            }
+            Some(ToolKind::ReverseImage) => format!(
+                "reverse_image({})",
+                s("url").or_else(|| s("path")).unwrap_or("?")
+            ),
             Some(ToolKind::WebFetch) => format!("web_fetch({})", s("url").unwrap_or("?")),
             Some(ToolKind::Download) => {
                 format!("download({} → {})", s("url").unwrap_or("?"), path())
@@ -303,6 +443,34 @@ impl ToolCall {
                 let lines = s("body").map(|c| c.lines().count()).unwrap_or(0);
                 format!("plan({} · {} lines)", path(), lines)
             }
+            Some(ToolKind::ProposeStep) => {
+                let title = s("title").unwrap_or("?");
+                let n = self
+                    .args
+                    .get("alternatives")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                format!("propose_step(\"{}\" · {} paths)", title, n)
+            }
+            Some(ToolKind::Task) => {
+                let desc = s("description").or_else(|| s("prompt")).unwrap_or("?");
+                let index = self
+                    .args
+                    .get("agent_index")
+                    .and_then(|value| value.as_u64());
+                let task_index = self.args.get("task_index").and_then(|value| value.as_u64());
+                match (index, task_index) {
+                    (Some(index), Some(task_index)) => {
+                        format!("agent {} → task {} (\"{}\")", index, task_index, desc)
+                    }
+                    (Some(index), None) => format!("agent {} (\"{}\")", index, desc),
+                    (None, Some(task_index)) => {
+                        format!("agent → task {} (\"{}\")", task_index, desc)
+                    }
+                    (None, None) => format!("agent(\"{}\")", desc),
+                }
+            }
             Some(ToolKind::Finish) => {
                 let why = s("summary").or_else(|| s("reason")).unwrap_or("done");
                 format!("finish(\"{}\")", why)
@@ -319,12 +487,16 @@ impl ToolCall {
     pub fn editable_arg_keys(&self) -> &'static [&'static str] {
         match self.kind() {
             Some(ToolKind::Shell) => &["command"],
-            Some(ToolKind::Read) | Some(ToolKind::List) | Some(ToolKind::Delete) => &["path"],
+            Some(ToolKind::Read)
+            | Some(ToolKind::List)
+            | Some(ToolKind::MakeDir)
+            | Some(ToolKind::Delete) => &["path"],
             Some(ToolKind::Write) => &["path", "content"],
             Some(ToolKind::Edit) => &["path", "old", "new"],
             Some(ToolKind::Search) => &["pattern"],
             Some(ToolKind::Move) | Some(ToolKind::Copy) => &["from", "to"],
-            Some(ToolKind::WebSearch) => &["query"],
+            Some(ToolKind::WebSearch) | Some(ToolKind::WebImages) => &["query"],
+            Some(ToolKind::ReverseImage) => &["url", "path"],
             Some(ToolKind::WebFetch) => &["url"],
             Some(ToolKind::Download) => &["url", "path"],
             _ => &[],
@@ -366,7 +538,7 @@ pub(crate) fn path_escapes_cwd(raw: &str, cwd: &Path) -> bool {
 /// `/proj/../etc` becomes `/etc`. Symlinks are not resolved — this is a
 /// conservative containment check, and treating a symlink target as "inside" only
 /// happens if its lexical path is inside, which is the safe direction.
-fn normalize_lexical(p: &std::path::Path) -> PathBuf {
+pub fn normalize_lexical(p: &std::path::Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
     for c in p.components() {
@@ -414,7 +586,6 @@ impl ToolResult {
     }
 }
 
-/// Permission choice made from the tool approval prompt.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Permission {
     Allow,
@@ -425,12 +596,49 @@ pub enum Permission {
     DenyKind,
     DenyDirectory,
     DenyTimed,
+    Custom(PermissionRuleDraft),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionDecision {
     Allow,
     Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionLifetime {
+    Once,
+    Session,
+    Indefinite,
+    Minutes(u64),
+    MatchingRequests(u32),
+    GeneralRequests(u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionRuleDraft {
+    pub decision: PermissionDecision,
+    pub kind: Option<ToolKind>,
+    pub directory: Option<PathBuf>,
+    pub include_children: bool,
+    pub lifetime: PermissionLifetime,
+}
+
+impl PermissionRuleDraft {
+    pub fn matches(&self, call: &ToolCall, cwd: &Path) -> bool {
+        let kind_matches = self
+            .kind
+            .is_none_or(|expected| call.kind() == Some(expected));
+        let directory_matches = self.directory.as_ref().is_none_or(|expected| {
+            let actual = call.permission_directories(cwd);
+            !actual.is_empty()
+                && actual.iter().all(|directory| {
+                    directory == expected
+                        || (self.include_children && directory.starts_with(expected))
+                })
+        });
+        kind_matches && directory_matches
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -444,8 +652,14 @@ pub enum PermissionScope {
 pub struct PermissionRule {
     pub decision: PermissionDecision,
     pub scope: PermissionScope,
+    /// Optional extra filters used by fully customized rules.
+    pub kind: Option<ToolKind>,
+    pub directory: Option<PathBuf>,
+    pub include_children: bool,
     /// Unix timestamp in seconds. `None` means it lasts until the app exits.
     pub expires_at: Option<u64>,
+    pub remaining_matching: Option<u32>,
+    pub remaining_general: Option<u32>,
 }
 
 /// Per-session permission memory. Rules are in-memory only and last for this app
@@ -466,33 +680,60 @@ pub struct PermissionMemory {
 impl PermissionMemory {
     pub const TIMED_SECS: u64 = 10 * 60;
 
-    pub fn check(&mut self, call: &ToolCall, cwd: &PathBuf) -> Option<PermissionDecision> {
+    pub fn check(&mut self, call: &ToolCall, cwd: &Path) -> Option<PermissionDecision> {
         self.prune_expired();
         let kind = call.kind()?;
-        let dir = call.permission_directory(cwd);
+        let directories = call.permission_directories(cwd);
 
-        // Deny rules win over allow rules.
-        if self.always_deny.contains(&kind)
-            || self.rules.iter().any(|r| {
-                r.decision == PermissionDecision::Deny && rule_matches(r, &kind, dir.as_ref())
-            })
-        {
+        let deny = self.rules.iter().position(|rule| {
+            rule.decision == PermissionDecision::Deny && rule_matches(rule, &kind, &directories)
+        });
+        let allow = self.rules.iter().position(|rule| {
+            rule.decision == PermissionDecision::Allow && rule_matches(rule, &kind, &directories)
+        });
+        let rule_decision = deny.or(allow).map(|index| self.rules[index].decision);
+
+        if self.always_deny.contains(&kind) || rule_decision == Some(PermissionDecision::Deny) {
             return Some(PermissionDecision::Deny);
         }
-        // The blanket auto-approve for read-family tools (`always_allow`) is confined
-        // to the project tree: a read whose target escapes cwd is NOT covered by it,
-        // so it still prompts. Explicit scoped grants (a Directory/Timed rule the user
-        // chose) below still apply, and Deny above still wins.
         let kind_auto = self.always_allow.contains(&kind)
             && !(is_read_family(kind) && call.reads_outside_cwd(cwd));
-        if kind_auto
-            || self.rules.iter().any(|r| {
-                r.decision == PermissionDecision::Allow && rule_matches(r, &kind, dir.as_ref())
-            })
-        {
+        if kind_auto || rule_decision == Some(PermissionDecision::Allow) {
             return Some(PermissionDecision::Allow);
         }
         None
+    }
+
+    pub fn consume(&mut self, call: &ToolCall, cwd: &Path) -> Option<PermissionDecision> {
+        let decision = self.check(call, cwd);
+        let Some(kind) = call.kind() else {
+            return decision;
+        };
+        let directories = call.permission_directories(cwd);
+        let matched = self
+            .rules
+            .iter()
+            .position(|rule| {
+                rule.decision == PermissionDecision::Deny && rule_matches(rule, &kind, &directories)
+            })
+            .or_else(|| {
+                self.rules.iter().position(|rule| {
+                    rule.decision == PermissionDecision::Allow
+                        && rule_matches(rule, &kind, &directories)
+                })
+            });
+        for (index, rule) in self.rules.iter_mut().enumerate() {
+            if let Some(remaining) = rule.remaining_general.as_mut() {
+                *remaining = remaining.saturating_sub(1);
+            }
+            if Some(index) == matched {
+                if let Some(remaining) = rule.remaining_matching.as_mut() {
+                    *remaining = remaining.saturating_sub(1);
+                }
+            }
+        }
+        self.prune_expired();
+        decision
     }
 
     /// Set (or clear, when blank) the natural-language session access policy.
@@ -529,22 +770,83 @@ impl PermissionMemory {
         self.rules.push(PermissionRule {
             decision,
             scope,
+            kind: None,
+            directory: None,
+            include_children: false,
             expires_at,
+            remaining_matching: None,
+            remaining_general: None,
+        });
+    }
+
+    pub fn remember_custom_rule(&mut self, draft: PermissionRuleDraft) {
+        let PermissionRuleDraft {
+            decision,
+            kind,
+            directory,
+            include_children,
+            lifetime,
+        } = draft;
+        if lifetime == PermissionLifetime::Once {
+            return;
+        }
+        let scope = match (&kind, &directory) {
+            (Some(kind), _) => PermissionScope::Kind(*kind),
+            (None, Some(directory)) => PermissionScope::Directory(directory.clone()),
+            (None, None) => PermissionScope::Timed,
+        };
+        let expires_at = match lifetime {
+            PermissionLifetime::Minutes(minutes) => Some(now_secs() + minutes.saturating_mul(60)),
+            _ => None,
+        };
+        let remaining_matching = match lifetime {
+            PermissionLifetime::MatchingRequests(count) => Some(count),
+            _ => None,
+        };
+        let remaining_general = match lifetime {
+            PermissionLifetime::GeneralRequests(count) => Some(count),
+            _ => None,
+        };
+        self.rules.push(PermissionRule {
+            decision,
+            scope,
+            kind,
+            directory,
+            include_children,
+            expires_at,
+            remaining_matching,
+            remaining_general,
         });
     }
 
     fn prune_expired(&mut self) {
         let now = now_secs();
-        self.rules.retain(|r| r.expires_at.is_none_or(|t| t > now));
+        self.rules.retain(|r| {
+            r.expires_at.is_none_or(|t| t > now)
+                && r.remaining_matching.is_none_or(|n| n > 0)
+                && r.remaining_general.is_none_or(|n| n > 0)
+        });
     }
 }
 
-fn rule_matches(rule: &PermissionRule, kind: &ToolKind, dir: Option<&PathBuf>) -> bool {
-    match &rule.scope {
+fn rule_matches(rule: &PermissionRule, kind: &ToolKind, directories: &[PathBuf]) -> bool {
+    let directory_matches = |expected: &PathBuf| {
+        let expected_norm = normalize_lexical(expected);
+        !directories.is_empty()
+            && directories.iter().all(|actual| {
+                let actual_norm = normalize_lexical(actual);
+                actual_norm == expected_norm
+                    || (rule.include_children && actual_norm.starts_with(&expected_norm))
+            })
+    };
+    let legacy_scope = match &rule.scope {
         PermissionScope::Kind(k) => k == kind,
-        PermissionScope::Directory(d) => dir.is_some_and(|actual| actual == d),
+        PermissionScope::Directory(d) => directory_matches(d),
         PermissionScope::Timed => true,
-    }
+    };
+    legacy_scope
+        && rule.kind.is_none_or(|expected| expected == *kind)
+        && rule.directory.as_ref().is_none_or(directory_matches)
 }
 
 fn now_secs() -> u64 {
@@ -555,203 +857,79 @@ fn now_secs() -> u64 {
 }
 
 /// Build the system prompt for agent mode.
-pub fn agent_system_prompt(cwd: &Path) -> String {
-    format!(
-        r#"You are an agentic coding assistant running INSIDE a terminal app that
-executes your tool calls directly on this machine. You have REAL, working access
-to the local filesystem and shell through the tools below. This is not a sandbox
-and not a chat-only session.
+/// Tools are defined in attached JSON schemas — this prompt provides identity,
+/// safety rules, and workflow guidance only (no per-tool descriptions).
+/// Cached: regenerated only when cwd or the named-agent registry changes.
+pub fn agent_system_prompt(
+    cwd: &Path,
+    agents: &BTreeMap<String, crate::config::types::AgentDef>,
+) -> String {
+    static CACHE: Mutex<Option<(PathBuf, String, String)>> = Mutex::new(None);
+    let agents_block = if agents.is_empty() {
+        String::new()
+    } else {
+        let mut block =
+            String::from("\nConfigured child agents (use `workflow(agent)` with these names):\n");
+        for (name, def) in agents {
+            let desc = if def.description.is_empty() {
+                "no description".to_string()
+            } else {
+                def.description.clone()
+            };
+            let mut line = format!("- {name}: {desc}");
+            if let Some(model) = def.model.as_deref() {
+                line.push_str(&format!(" (model: {model})"));
+            }
+            block.push_str(&line);
+            block.push('\n');
+        }
+        block
+    };
+    let mut cache = CACHE.lock().unwrap();
+    if let Some((cached_cwd, cached_agents, cached_prompt)) = &*cache {
+        if cached_cwd == cwd && cached_agents == &agents_block {
+            return cached_prompt.clone();
+        }
+    }
+    let prompt = format!(
+        r#"You are an agentic coding assistant with filesystem + shell + web access.
+CWD: {}
 
-Current working directory: {}
+Use the attached tool schemas (5 categories: file_management, shell, web, interaction, workflow).
+Call them natively; results return directly.
 
-## How to use a tool
-Call a tool the way you call a function — one name, a few arguments. If your
-runtime supports native function-calling, just emit the call and the app runs it.
-Otherwise, emit a fenced ```tool block with the call as JSON — EXACTLY this shape:
-```tool
-{{"name": "list", "args": {{"path": "."}}}}
-```
-The app runs it and feeds the result back as a new message; then you continue. You
-may emit several calls in ONE turn (they run as a batch, one round-trip — see "Batch
-tool calls" below) and keep calling across turns until the task is done. The user sees a clean
-rendering of each call (a diff, a removed-file line, search hits, cited links) —
-never the raw arguments — so let the tools do the work and don't paste their guts
-into prose. Because that rendering is compact (and sometimes hidden), always follow
-tool work with a short plain-text summary for the user only after every visible todo
-item is complete or honestly blocked. Do not summarize-and-stop while any todo is
-still pending or in_progress unless you are explicitly waiting on the user.
-- You ARE in this terminal with working tools. When the user asks you to inspect,
-  organize, move, edit, or delete files, DO IT with the tools — never hand back a
-  shell script or PowerShell for the user to run, and never ask them to "enable" or
-  "send" tools. The tools below are already active.
-- Do NOT say you "don't have access" to files, the shell, or the internet. You do.
-- Do NOT ask the user to paste file contents, directory listings, or command
-  output — call read / list / shell yourself and wait for the result.
-- Do NOT invent tools that aren't listed, or extra arguments. Use only these,
-  exactly.
+Safety: destructive actions (delete, force-push, rm -rf, reset --hard) require user approval.
+Run `git status` before discarding uncommitted work.
 
-## Tools — signatures and how to use each
-Filesystem:
-- read(path[, offset, limit]) — Read a file. Omit offset/limit for the whole file;
-  large files return the first page plus an exact next read(...) call. offset is a
-  1-based line number and limit is a line count for paging.
-- write(path, content) — Create or OVERWRITE a whole file. Prefer edit for changes
-  to an existing file; write is for new files or a full rewrite.
-- edit(path, old, new) — REQUIRED: always pass `path`, `old`, and `new`. Never call
-  edit with an empty argument object, and never omit `path`; if you do not know
-  the file, search/list/read first. `old` must match verbatim and be UNIQUE in
-  the file — include enough surrounding context. The user sees the change as a diff.
-- list(path[, depth]) — List a directory. "." = cwd; depth>1 descends as a tree.
-- search(pattern[, path, glob, offset, limit]) — Regex search across files. Results come back as
-  `file:line: match`; optional glob narrows files. Use offset/limit to page through
-  broad searches instead of shell scripts for inspection.
-- move(from, to) / copy(from, to) — Move/rename or copy a path (copy is recursive).
-- delete(path) — Delete a file OR a directory tree. Irreversible: only for paths
-  you created this session or the user explicitly asked to remove.
+Workflow: a separate task tracker maintains the visible checklist — its current state is
+shown in a read-only system message; never edit it yourself, just work one step at a time.
+Delegate only independent parallel work via `workflow(agent)` — never sequential. Info needed
+AFTER your current step? Schedule a child now; it gathers it in parallel. Hand off to the user
+only after all children complete. `workflow(finish)` ends the autonomous loop when stop
+criteria are met.
 
-Shell:
-- shell(command) — Run a command for BUILD / TEST / RUN only (e.g. "cargo test",
-  "git status"). NEVER use it to read or edit files — use read/edit/write, which
-  are safer and render as previews. Prefer bash/POSIX shell commands over Python
-  snippets for shell actions; use Python only when the project command itself is
-  Python, when an existing script requires it, or when bash would be unsafe or
-  impractically brittle.
+Plan first, then batch: before your first tool call, state a one-line plan naming every file you
+expect to read or write this step. If the plan names multiple reads (for example A, B, and C),
+read all of them in ONE tool call using `paths` or `batch`; do not emit separate sequential read
+calls. The same rule applies to writes, edits, lists, searches, commands, downloads, and every
+other operation that supports independent batching. Prefer one batch call over many calls: results
+are returned together in item order and rendered like the equivalent individual operations. Only
+split calls when a later operation genuinely depends on an earlier result. Files already read this
+session are served from cache; do not re-read them unless a write or edit changed them.
 
-Web (always cite what you use):
-- web_search(query) — Search the web; returns titled results with URLs. Use it for
-  anything that may have changed since training. When a result informs your answer,
-  cite it to the user as a markdown link `[title](url)` — never state a web fact
-  without its source link.
-- web_fetch(url) — Fetch a page's readable text. Cite the page as a link when used.
-- download(url, path) — Save a URL (e.g. an image) to a local file.
-
-User requests:
-- ask(question, options[], multi) — Ask the user to choose option label(s). Use
-  this only when the user must decide; tool result is the chosen label(s).
-- plan(path, body) — Write a plan markdown file and ask the user to edit/approve
-  it. Tool result is `APPROVED\n<contents>` or `DENIED`.
-
-## Communicating with the user
-Your text output is what the user reads between tool calls; they can't see your
-thinking or the raw tool results. Before your first tool call, say in one sentence
-what you're about to do. While working, give brief updates only when you find
-something load-bearing or change direction — brief is good, silent is not, and one
-sentence per update is almost always enough. Don't narrate internal deliberation.
-
-Lead with the outcome. Your first sentence after finishing should answer "what
-happened" — the thing the user would ask for if they said "just give me the TLDR."
-Supporting detail comes after. Readable beats terse: write complete sentences with
-technical terms spelled out, not fragments or arrow chains. Match the response to
-the task — a simple question gets a direct answer, not headers and sections. The
-end-of-turn summary is one or two sentences: what changed and what's next.
-
-When referencing specific functions or code, use the pattern file_path:line_number
-so the user can navigate straight to the source.
-
-## Doing tasks
-The user primarily requests software-engineering tasks: fixing bugs, adding
-functionality, refactoring, explaining code. Interpret an unclear instruction in
-that context and in the current working directory — if asked to rename a method,
-find it in the code and change the code, don't just print the new name.
-- Before editing or explaining a directory, look for local docs in that directory
-  and relevant parents/children: `AGENTS.md`, `CLAUDE.md`, `README.md`,
-  `CONTRIBUTING.md`, design docs, or other `.md` files that explain project or
-  folder intent. Read them when present and let them guide the work.
-- Don't add features, refactor, or introduce abstractions beyond what the task
-  requires. A bug fix doesn't need surrounding cleanup; three similar lines beat a
-  premature abstraction. No half-finished implementations.
-- Don't add error handling, fallbacks, or validation for scenarios that can't
-  happen. Trust internal code and framework guarantees; validate only at system
-  boundaries (user input, external APIs).
-- Delete unused code completely rather than leaving compatibility shims, `// removed`
-  comments, or renamed `_unused` vars.
-- Write code that reads like the surrounding code — match its comment density,
-  naming, and idiom. Default to no comments; only note a constraint the code can't
-  show, never what the next line does or why the change is correct.
-
-## Executing actions with care
-Consider the reversibility and blast radius of each action. Local, reversible
-actions (editing files, running tests) you can take freely. For actions that are
-hard to reverse, affect shared state, or could be destructive — deleting files or
-branches, `rm -rf`, force-pushing, `git reset --hard`, dropping tables, pushing
-code, sending messages, posting to external services — confirm with the user
-first, unless they have durably authorized it or told you to operate autonomously.
-Approval of an action once does not extend it to every later context. Don't reach
-for a destructive shortcut to clear an obstacle: find the root cause instead of
-bypassing safety checks (no `--no-verify`). In a git repo, run `git status` before
-any command that could discard uncommitted work, and stash or commit first. If you
-find unexpected files or state, investigate before deleting or overwriting — it may
-be the user's in-progress work.
-
-## Tool usage policy
-Act, don't ask for things a tool can get: to CHANGE a file, read first, then edit
-(surgical) or write (full rewrite) — never shell out to sed/echo/cat. To learn the
-project, use list + read and search to locate things. After each tool result,
-reflect briefly, then take the next action or finish. Report outcomes faithfully:
-if a build or test fails, say so with the output; state verified work plainly.
-
-## Plan first, then gather in one batch
-Before a non-trivial task, break it into concrete steps. Front-load everything you
-need so you're efficient: gather the questions you must ask the user, the data you
-must read (files, search, shell), and the access/permissions you'll need — then get
-them together rather than stopping the user once per step. If several genuine
-decisions are the user's to make, ask them together, up front, not one at a time.
-Distinguish what a tool can answer (just call it) from what only the user can decide
-(ask). Don't begin editing until the shape of the work is clear.
-
-## Batch tool calls — one turn, many calls
-Every tool call pauses you: the app runs it and feeds the result back before you can
-continue. So MINIMIZE round-trips. In a single turn, emit ALL the calls whose inputs
-you already know — the app runs the whole batch and returns every result together in
-the next turn, instead of one stop-and-go per call. Predict what you'll need and
-request it at once.
-- Independent reads/searches → one batch. To understand a module, `read` all the
-  relevant files and `search` for the symbols in the SAME turn, not one, wait, next.
-- Only go sequential when a call's arguments genuinely depend on an earlier call's
-  result — e.g. `search` to find a file's path, THEN `read` that path; `read` a file,
-  THEN `edit` it with verbatim text you just saw. That dependency is the ONLY reason
-  to split a turn. When in doubt whether two calls are independent, assume they are
-  and batch them.
-- Don't batch destructive or hard-to-reverse calls speculatively (delete, move,
-  write over an existing file, shell that mutates) — those still follow the care
-  rules above. Batching is for cheap, reversible information-gathering and edits.
-
-## Task tracking — the todo panel
-- todo(items) — Set the task breakdown shown in a sticky panel above the user's
-  input. `items` is the FULL ordered list; each item is {{text, status}} with status
-  one of "pending" | "in_progress" | "done".
-For any multi-part or long request, call `todo` FIRST with one item per section, so
-the user can see the plan at a glance. As you work, call `todo` again with the same
-list and updated statuses — mark exactly one item "in_progress" at a time and flip
-each item to "done" immediately when that specific item finishes, before starting
-another item and before running more unrelated tools. Always send the whole list
-(it replaces the old one). Skip the panel for trivial one-step tasks. The todo call
-itself is silent in the transcript — only the panel updates.
-
-Todo discipline is mandatory:
-- Treat the todo list as the source of truth for whether the turn is finished.
-- Update `todo` at every task boundary: after finishing an item, before switching
-  to another item, and before any user-visible progress summary about that item.
-- Never batch several completed items into one late todo update when they finished
-  at different times; stale todos defeat the panel's purpose.
-- Before any final/user-facing summary, check the todo list. If any item is still
-  pending or in_progress, continue working or ask the user for the specific blocker.
-- Do not end your side of the response with a summary while work remains actionable.
-- Keep exactly one item in_progress while actively working; update immediately when
-  switching focus or completing an item.
-
-Use an ASCII diagram when a picture communicates better than prose — data flow, a
-tree, state transitions, box-and-arrow architecture. Put it in a fenced code block
-so it renders monospaced.
+Report: lead with outcome; cite path:line_number. Keep updates brief.{}
 "#,
-        cwd.display()
-    )
+        cwd.display(),
+        agents_block
+    );
+    *cache = Some((cwd.to_path_buf(), agents_block, prompt.clone()));
+    prompt
 }
 
 /// The JSON schema descriptions for tool calls (OpenAI function-calling format).
 /// Lean, single-purpose set (12 tools). Descriptions carry the output-structure
 /// expectations so the model formats results consistently (mirrored in the prompt).
-pub fn tool_schemas() -> serde_json::Value {
+fn operation_schemas() -> serde_json::Value {
     // TODO(audit): generate schemas from a typed argument model shared with
     // `editable_arg_keys` and executor parsing to prevent argument drift.
     // One entry: name, description, and (property, is-required, prop-description) rows.
@@ -777,8 +955,8 @@ pub fn tool_schemas() -> serde_json::Value {
         })
     }
 
-    serde_json::json!([
-        f("read", "Read a file's contents. Omit offset/limit for the whole file; large files return the first page plus an exact next read(...) call. Pass offset/limit to read a specific line window.", &[
+    let mut schemas = serde_json::json!([
+        f("read", "Read one or many files. When multiple files are planned, use paths or batch in this ONE call rather than separate read calls. Omit offset/limit for whole files; large files return paging guidance.", &[
             ("path", true, "File path, relative to cwd or absolute"),
             ("offset", false, "1-based first line to read (optional)"),
             ("limit", false, "Number of lines from offset (optional)"),
@@ -787,9 +965,9 @@ pub fn tool_schemas() -> serde_json::Value {
             ("path", true, "File path"),
             ("content", true, "Full file contents to write"),
         ]),
-        f("edit", "Replace an exact, unique snippet in a file. REQUIRED: always pass path, old, and new; never call edit with an empty args object or without path. `old` must match verbatim and be unique — include enough surrounding context. Read the file first.", &[
+        f("edit", "Replace an exact, unique snippet in a file. REQUIRED: always pass path, old, and new; never call edit with an empty args object or without path. `old` must match verbatim and be unique. Include surrounding lines/indentation so it identifies one occurrence; avoid tiny repeated snippets. If edit reports multiple matches, read the file and retry with a larger unique block. Read the file first.", &[
             ("path", true, "File path"),
-            ("old", true, "Exact existing text to replace (unique in the file)"),
+            ("old", true, "Exact existing text to replace; must be verbatim and unique in the file, including enough surrounding context to disambiguate"),
             ("new", true, "Replacement text"),
         ]),
         f("list", "List a directory. depth>1 descends as an indented tree (skips .hidden, target, node_modules).", &[
@@ -803,8 +981,11 @@ pub fn tool_schemas() -> serde_json::Value {
             ("offset", false, "1-based first result to show (optional)"),
             ("limit", false, "Number of results to show from offset (optional, default 200, max 1000)"),
         ]),
-        f("shell", "Run a shell command for BUILD/TEST/RUN only (e.g. cargo test). Never use it to read or edit files — use read/edit/write. Prefer bash/POSIX commands over Python snippets unless Python is the project command or safer fit.", &[
-            ("command", true, "Shell command to execute in cwd"),
+        f("mkdir", "Create a directory and any missing parent directories.", &[
+            ("path", true, "Directory path to create"),
+        ]),
+        f("shell", "Run one or many BUILD/TEST/RUN commands. Use commands or batch for independent commands in one call. Never use shell to read or edit files — use file operations.", &[
+            ("command", false, "One shell command; omit when using commands or batch"),
         ]),
         f("move", "Move or rename a file or directory.", &[
             ("from", true, "Source path"),
@@ -820,6 +1001,13 @@ pub fn tool_schemas() -> serde_json::Value {
         f("web_search", "Search the web; returns titled results with URLs. When you use a result, cite it to the user as a markdown link [title](url).", &[
             ("query", true, "Search query in plain words"),
         ]),
+        f("web_images", "Search Wikimedia Commons for reusable images. Returns preview and original image URLs plus source-page, description, creator, and license metadata. Review the source and license before downloading or reusing an image.", &[
+            ("query", true, "Visual subject, style, feature, building, or location to find"),
+        ]),
+        f("reverse_image", "Reverse-search an image URL or local file through Google Lens. Returns visually similar images and matching source-page links. Pass exactly one of url or path.", &[
+            ("url", false, "Public http(s) image URL"),
+            ("path", false, "Local image file path, relative to cwd or absolute"),
+        ]),
         f("web_fetch", "Fetch the readable text of a page. Cite the page as a markdown link when you use its content.", &[
             ("url", true, "https URL to fetch"),
         ]),
@@ -832,7 +1020,7 @@ pub fn tool_schemas() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "todo",
-                "description": "Set/replace the task breakdown shown in the sticky panel above the input. For a multi-part or long task, call this first with every section as an item, then call again to update statuses as you go. Always send the FULL list each time (it replaces the old one).",
+                "description": "Set/replace the task breakdown shown in the sticky panel above the input. For a multi-part or long task, call this first with every section as an item, then call again at every task boundary. Mark each individual item done immediately when it finishes, before unrelated work and before starting/finishing another item. Always send the FULL list each time (it replaces the old one).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -857,19 +1045,19 @@ pub fn tool_schemas() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "ask",
-                "description": "Ask the user to choose from explicit options. Use only when the user must decide; the tool result contains the chosen label(s).",
+                "description": "Ask the user for required information, clarification, or a decision. If options are omitted or empty, the user types a free-form answer. If options are provided, the user chooses one or more labels; set multi true to allow multiple choices. Use when requirements are ambiguous, missing data blocks progress, or the user must decide.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "question": { "type": "string", "description": "Question shown to the user" },
                         "options": {
                             "type": "array",
-                            "description": "Option labels to choose from",
+                            "description": "Optional labels to choose from; omit or leave empty for free-form text input",
                             "items": { "type": "string" }
                         },
-                        "multi": { "type": "boolean", "description": "Whether multiple options may be selected" }
+                        "multi": { "type": "boolean", "description": "Whether multiple options may be selected when options are provided" }
                     },
-                    "required": ["question", "options"]
+                    "required": ["question"]
                 }
             }
         }),
@@ -891,8 +1079,81 @@ pub fn tool_schemas() -> serde_json::Value {
         serde_json::json!({
             "type": "function",
             "function": {
+                "name": "propose_step",
+                "description": "Present one workflow step only when it has multiple viable paths requiring user preference. Skip this tool when one path is obvious. Each option should include enough explanation for an informed choice; user may edit it or enter a custom response.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "Short step title" },
+                        "description": { "type": "string", "description": "What this step achieves and why it is next" },
+                        "alternatives": {
+                            "type": "array",
+                            "description": "Two or more paths for this step",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": { "type": "string", "description": "Short option label" },
+                                    "description": { "type": "string", "description": "Full path details" },
+                                    "feasibility": { "type": "string", "enum": ["possible", "limited", "impossible"] },
+                                    "actions": {
+                                        "type": "array",
+                                        "description": "Optional concise action summaries planned for this path",
+                                        "items": { "type": "string" }
+                                    },
+                                    "tool_kinds": {
+                                        "type": "array",
+                                        "description": "Operational tool names this path may require",
+                                        "items": { "type": "string" }
+                                    }
+                                },
+                                "required": ["label", "description", "feasibility"]
+                            }
+                        }
+                    },
+                    "required": ["title", "description", "alternatives"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "agent",
+                "description": "Delegate an independent branch to a parallel child agent. Consecutive agent calls launch concurrently; the app waits for the whole batch. Never delegate sequential work — do that yourself. Info needed AFTER your current task? Schedule it now to gather in parallel. Give complete scope, constraints, evidence expectations, and final report shape. Children may launch their own bounded agents.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "description": { "type": "string", "description": "Short user-visible label for this child agent" },
+                        "agent": { "type": "string", "description": "Optional name of a configured agent (from the [agents] config): use it when the configured description fits the task, so the child gets its role, model, and tool policy. Otherwise omit and describe the role inline in the prompt." },
+                        "prompt": { "type": "string", "description": "Detailed instructions for the child agent, including scope, constraints, and expected final report" },
+                        "task_index": { "type": "integer", "minimum": 1, "description": "Optional one-based index of the main checklist subtask this child agent owns" },
+                        "checks": {
+                            "type": "array",
+                            "description": "Important explicit success criteria. When provided, AiTUI runs isolated replicas and reconciles evidence before returning the report.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string", "description": "Stable short identifier used for voting" },
+                                    "question": { "type": "string", "description": "Concrete fact or success criterion to verify" }
+                                },
+                                "required": ["id", "question"]
+                            }
+                        },
+                        "verification": {
+                            "type": "string",
+                            "enum": ["none", "replicate"],
+                            "description": "Verification policy. replicate runs two isolated agents and escalates disagreement to a third replica and independent verifier only when needed."
+                        },
+                        "cwd": { "type": "string", "description": "Optional working directory for this child agent, relative to current cwd or absolute" }
+                    },
+                    "required": ["description", "prompt"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
                 "name": "finish",
-                "description": "ONLY in autonomous loop mode: call this to END the loop when the stated STOP CRITERIA are fully and verifiably met (or when you are truly blocked and cannot proceed). Do not call it prematurely or in normal chat.",
+                "description": "Autonomous loop only: END the loop when stop criteria are verifiably met, or when blocked. Never call prematurely or in normal chat.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -902,7 +1163,215 @@ pub fn tool_schemas() -> serde_json::Value {
                 }
             }
         }),
-    ])
+    ]);
+
+    if let Some(operations) = schemas.as_array_mut() {
+        for operation in operations {
+            let Some(name) = operation["function"]["name"].as_str().map(str::to_string) else {
+                continue;
+            };
+            if !matches!(
+                name.as_str(),
+                "read"
+                    | "write"
+                    | "edit"
+                    | "list"
+                    | "search"
+                    | "mkdir"
+                    | "shell"
+                    | "move"
+                    | "copy"
+                    | "delete"
+                    | "web_search"
+                    | "web_images"
+                    | "reverse_image"
+                    | "web_fetch"
+                    | "download"
+            ) {
+                continue;
+            }
+            let Some(properties) =
+                operation["function"]["parameters"]["properties"].as_object_mut()
+            else {
+                continue;
+            };
+            properties.insert(
+                "batch".into(),
+                serde_json::json!({
+                    "type": "array",
+                    "description": "Multiple independent invocations of this operation, executed in order in this single tool call. Each item is an object containing that invocation's normal arguments. Prefer this whenever the plan names multiple operations.",
+                    "items": { "type": "object", "additionalProperties": true }
+                }),
+            );
+            if matches!(name.as_str(), "read" | "list" | "mkdir" | "delete") {
+                properties.insert(
+                    "paths".into(),
+                    serde_json::json!({
+                        "type": "array",
+                        "description": "Convenience batch of paths using the shared top-level options. For multiple reads, pass every planned file here in one call.",
+                        "items": { "type": "string" }
+                    }),
+                );
+            }
+            if name == "shell" {
+                properties.insert(
+                    "commands".into(),
+                    serde_json::json!({
+                        "type": "array",
+                        "description": "Independent BUILD/TEST/RUN commands to execute in order in this one tool call.",
+                        "items": { "type": "string" }
+                    }),
+                );
+            }
+        }
+    }
+    schemas
+}
+
+/// Five model-visible category tools. Each category carries an `action` enum and
+/// the union of its action arguments; `ToolCall::kind` resolves the selected action
+/// back to the operation-level type used by permissions, execution, and rendering.
+pub fn tool_schemas() -> serde_json::Value {
+    static CACHE: OnceLock<serde_json::Value> = OnceLock::new();
+    CACHE.get_or_init(|| build_tool_schemas(false)).clone()
+}
+
+/// Model-visible schemas for a main-agent turn. `finish` is only selectable
+/// while that session is actively running an autonomous loop.
+pub fn tool_schemas_for_loop(loop_active: bool) -> serde_json::Value {
+    if !loop_active {
+        return tool_schemas();
+    }
+    build_tool_schemas(true)
+}
+
+fn build_tool_schemas(loop_active: bool) -> serde_json::Value {
+    fn category(
+        operations: &[serde_json::Value],
+        name: &str,
+        description: &str,
+        actions: &[(&str, &str)],
+    ) -> serde_json::Value {
+        let mut properties = serde_json::Map::new();
+        let action_names: Vec<&str> = actions.iter().map(|(action, _)| *action).collect();
+        properties.insert(
+            "action".into(),
+            serde_json::json!({
+                "type": "string",
+                "enum": action_names,
+                "description": "Operation to perform within this category"
+            }),
+        );
+        for (_, operation_name) in actions {
+            let Some(schema) = operations
+                .iter()
+                .find(|schema| schema["function"]["name"].as_str() == Some(operation_name))
+            else {
+                continue;
+            };
+            let Some(operation_properties) =
+                schema["function"]["parameters"]["properties"].as_object()
+            else {
+                continue;
+            };
+            for (key, value) in operation_properties {
+                properties
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": ["action"]
+                }
+            }
+        })
+    }
+
+    let operations = operation_schemas();
+    let operations = operations.as_array().cloned().unwrap_or_default();
+    let mut shell = operations
+        .iter()
+        .find(|schema| schema["function"]["name"].as_str() == Some("shell"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    shell["function"]["description"] = serde_json::json!(
+        "Run BUILD/TEST/RUN commands only. Batch independent commands in ONE call using commands or batch; results return together in command order. Never use shell to read or edit files."
+    );
+
+    let mut schemas = serde_json::json!([
+        category(
+            &operations,
+            "file_management",
+            "Local file and directory operations. Choose action first. Batch independent work in ONE call: use paths for multiple reads/lists where applicable, or batch for multiple reads, writes, edits, searches, mkdirs, moves, copies, or deletes. Prefer batching every file named together in the plan; results return together in item order. Use edit for surgical changes and write for new files or intentional whole-file replacement.",
+            &[
+                ("read", "read"),
+                ("write", "write"),
+                ("edit", "edit"),
+                ("list", "list"),
+                ("search", "search"),
+                ("mkdir", "mkdir"),
+                ("move", "move"),
+                ("copy", "copy"),
+                ("delete", "delete"),
+            ],
+        ),
+        shell,
+        category(
+            &operations,
+            "web",
+            "Web research and downloads. Choose action first: search finds current text sources, images finds reusable Wikimedia Commons assets and metadata, reverse_image finds visually similar images and source links from an image URL or local image, fetch reads one page, and download saves a direct asset URL. Cite sources used in the answer.",
+            &[
+                ("search", "web_search"),
+                ("images", "web_images"),
+                ("reverse_image", "reverse_image"),
+                ("fetch", "web_fetch"),
+                ("download", "download"),
+            ],
+        ),
+        category(
+            &operations,
+            "interaction",
+            "User interaction that requires structured UI. Choose ask for missing information, propose only for genuine alternative paths, or plan for a reviewable markdown plan.",
+            &[("ask", "ask"), ("propose", "propose_step"), ("plan", "plan")],
+        ),
+        category(
+            &operations,
+            "workflow",
+            "Task-state controls. The visible task checklist is maintained by a separate tracker and shown to you read-only — never edit it yourself. Choose agent to launch a focused parallel child agent, or finish only to end an autonomous loop whose stop criteria are met or blocked.",
+            &[("todo", "todo"), ("agent", "agent"), ("finish", "finish")],
+        ),
+    ]);
+    // The `todo` operation stays in the schema properties (child agents still
+    // track their own local progress with it), but the main agent's task
+    // checklist is maintained by a separate tracker — the active agent only
+    // sees it and must not edit it.
+    if let Some(schemas) = schemas.as_array_mut() {
+        if let Some(workflow) = schemas
+            .iter_mut()
+            .find(|schema| schema["function"]["name"].as_str() == Some("workflow"))
+        {
+            if let Some(properties) =
+                workflow["function"]["parameters"]["properties"]["action"].as_object_mut()
+            {
+                properties.insert(
+                    "enum".into(),
+                    serde_json::json!(if loop_active {
+                        vec!["agent", "finish"]
+                    } else {
+                        vec!["agent"]
+                    }),
+                );
+            }
+        }
+    }
+    schemas
 }
 
 #[cfg(test)]
@@ -918,14 +1387,75 @@ mod tests {
     }
 
     #[test]
-    fn legacy_names_alias_onto_canonical_kinds() {
+    fn legacy_names_alias_onto_operation_kinds() {
         assert_eq!(ToolKind::from_name("read_file"), Some(ToolKind::Read));
-        assert_eq!(ToolKind::from_name("read"), Some(ToolKind::Read));
         assert_eq!(ToolKind::from_name("run_shell"), Some(ToolKind::Shell));
         assert_eq!(ToolKind::from_name("delete_file"), Some(ToolKind::Delete));
         assert_eq!(ToolKind::from_name("delete_dir"), Some(ToolKind::Delete));
-        assert_eq!(ToolKind::from_name("append_file"), Some(ToolKind::Write));
+        assert_eq!(ToolKind::from_name("make_dir"), Some(ToolKind::MakeDir));
+        assert_eq!(ToolKind::from_name("append_file"), None);
+        assert_eq!(ToolKind::from_name("complete_step"), None);
         assert_eq!(ToolKind::from_name("bogus"), None);
+    }
+
+    #[test]
+    fn categorized_calls_resolve_to_operation_kinds() {
+        assert_eq!(
+            call(
+                "file_management",
+                serde_json::json!({"action": "edit", "path": "a.rs"})
+            )
+            .kind(),
+            Some(ToolKind::Edit)
+        );
+        assert_eq!(
+            call("web", serde_json::json!({"action": "fetch"})).kind(),
+            Some(ToolKind::WebFetch)
+        );
+        assert_eq!(
+            call(
+                "web",
+                serde_json::json!({"action": "images", "query": "Victorian house"})
+            )
+            .kind(),
+            Some(ToolKind::WebImages)
+        );
+        assert_eq!(
+            call(
+                "web",
+                serde_json::json!({"action": "reverse_image", "url": "https://example.com/a.jpg"})
+            )
+            .kind(),
+            Some(ToolKind::ReverseImage)
+        );
+        assert_eq!(
+            call("interaction", serde_json::json!({"action": "propose"})).kind(),
+            Some(ToolKind::ProposeStep)
+        );
+        assert_eq!(
+            call("workflow", serde_json::json!({"action": "propose"})).kind(),
+            Some(ToolKind::ProposeStep)
+        );
+        assert_eq!(
+            call("workflow", serde_json::json!({"action": "todo"})).kind(),
+            Some(ToolKind::Todo)
+        );
+        assert_eq!(
+            call(
+                "workflow",
+                serde_json::json!({"action": "agent", "description": "scan", "prompt": "look"})
+            )
+            .kind(),
+            Some(ToolKind::Task)
+        );
+        assert_eq!(
+            call("workflow", serde_json::json!({"action": "task"})).kind(),
+            Some(ToolKind::Task)
+        );
+        assert_eq!(
+            call("file_management", serde_json::json!({"action": "append"})).kind(),
+            None
+        );
     }
 
     #[test]
@@ -950,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn schemas_cover_the_tools() {
+    fn schemas_expose_five_categories() {
         let schemas = tool_schemas();
         let names: Vec<&str> = schemas
             .as_array()
@@ -958,27 +1488,245 @@ mod tests {
             .iter()
             .map(|s| s["function"]["name"].as_str().unwrap())
             .collect();
-        for expected in [
-            "read",
-            "write",
-            "edit",
-            "list",
-            "search",
-            "shell",
-            "move",
-            "copy",
-            "delete",
-            "web_search",
-            "web_fetch",
-            "download",
-            "todo",
-            "ask",
-            "plan",
-            "finish",
-        ] {
-            assert!(names.contains(&expected), "missing schema for {expected}");
+        assert_eq!(
+            names,
+            ["file_management", "shell", "web", "interaction", "workflow"]
+        );
+
+        let file = &schemas[0]["function"]["parameters"]["properties"]["action"]["enum"];
+        assert_eq!(
+            file,
+            &serde_json::json!([
+                "read", "write", "edit", "list", "search", "mkdir", "move", "copy", "delete"
+            ])
+        );
+        let web = &schemas[2]["function"]["parameters"]["properties"]["action"]["enum"];
+        assert_eq!(
+            web,
+            &serde_json::json!(["search", "images", "reverse_image", "fetch", "download"])
+        );
+        let workflow = &schemas[4]["function"]["parameters"]["properties"]["action"]["enum"];
+        assert_eq!(workflow, &serde_json::json!(["agent"]));
+        let loop_schemas = tool_schemas_for_loop(true);
+        let loop_workflow =
+            &loop_schemas[4]["function"]["parameters"]["properties"]["action"]["enum"];
+        assert_eq!(loop_workflow, &serde_json::json!(["agent", "finish"]));
+        assert!(
+            schemas[4].to_string().contains("\"items\""),
+            "todo args stay in the schema for child agents"
+        );
+        assert!(!schemas.to_string().contains("complete_step"));
+        assert!(!schemas.to_string().contains("append_file"));
+    }
+
+    #[test]
+    fn agent_prompt_describes_adaptive_steps_and_editable_choices() {
+        let prompt = agent_system_prompt(Path::new("/tmp/project"), &Default::default());
+        assert!(prompt.contains("CWD: /tmp/project"));
+        assert!(prompt.contains("5 categories"));
+        assert!(prompt.contains("Safety"));
+        assert!(prompt.contains("Workflow"));
+        assert!(prompt.contains("Report"));
+        assert!(prompt.contains("destructive"));
+        assert!(prompt.contains("parallel"));
+        assert!(prompt.contains("sequential"));
+        assert!(prompt.contains("AFTER your current step"));
+        assert!(prompt.contains("destructive"));
+        assert!(!prompt.contains("Configured child agents"));
+    }
+
+    #[test]
+    fn agent_prompt_lists_configured_agents_with_descriptions_and_models() {
+        use std::collections::BTreeMap;
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "reviewer".to_string(),
+            crate::config::types::AgentDef {
+                description: "Peer-review code for correctness".to_string(),
+                model: Some("fast-model".to_string()),
+                role: "a meticulous reviewer".to_string(),
+                tools: vec!["read".to_string(), "search".to_string()],
+                deny: vec![],
+            },
+        );
+        agents.insert(
+            "tester".to_string(),
+            crate::config::types::AgentDef {
+                description: "Run the test suite".to_string(),
+                model: None,
+                role: String::new(),
+                tools: vec![],
+                deny: vec!["write".to_string()],
+            },
+        );
+        let prompt = agent_system_prompt(Path::new("/tmp/project"), &agents);
+        assert!(prompt.contains("Configured child agents"));
+        assert!(prompt.contains("- reviewer: Peer-review code for correctness (model: fast-model)"));
+        assert!(prompt.contains("- tester: Run the test suite"));
+        let empty = agent_system_prompt(Path::new("/tmp/project"), &Default::default());
+        assert!(!empty.contains("Configured child agents"));
+    }
+
+    #[test]
+    fn schemas_reinforce_edit_uniqueness_and_todo_boundaries() {
+        let schemas = tool_schemas();
+        let file = &schemas[0];
+        let file_desc = file["function"]["description"].as_str().unwrap();
+        assert!(file_desc.contains("surgical changes"));
+        let old_desc = file["function"]["parameters"]["properties"]["old"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(old_desc.contains("disambiguate"));
+
+        let interaction = &schemas[3];
+        let interaction_desc = interaction["function"]["description"].as_str().unwrap();
+        assert!(interaction_desc.contains("genuine alternative paths"));
+
+        let workflow = &schemas[4];
+        let workflow_desc = workflow["function"]["description"].as_str().unwrap();
+        assert!(workflow_desc.contains("tracker"));
+        assert!(workflow_desc.contains("parallel child agent"));
+        assert!(workflow_desc.contains("stop criteria"));
+    }
+
+    #[test]
+    fn custom_rule_tool_and_directory_filters_form_an_and_condition() {
+        let cwd = std::env::temp_dir().join("aitui_permission_filter_matrix");
+        let src = cwd.join("src");
+        let nested = src.join("nested");
+        let other = cwd.join("other");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let src = std::fs::canonicalize(src).unwrap();
+
+        for decision in [PermissionDecision::Allow, PermissionDecision::Deny] {
+            for include_children in [false, true] {
+                let draft = PermissionRuleDraft {
+                    decision,
+                    kind: Some(ToolKind::Read),
+                    directory: Some(src.clone()),
+                    include_children,
+                    lifetime: PermissionLifetime::Session,
+                };
+                let direct = call("read", serde_json::json!({"path": "src/a.rs"}));
+                let child = call("read", serde_json::json!({"path": "src/nested/a.rs"}));
+                let wrong_kind = call(
+                    "write",
+                    serde_json::json!({"path": "src/a.rs", "content": "x"}),
+                );
+                let wrong_directory = call("read", serde_json::json!({"path": "other/a.rs"}));
+
+                assert!(draft.matches(&direct, &cwd));
+                assert_eq!(draft.matches(&child, &cwd), include_children);
+                assert!(!draft.matches(&wrong_kind, &cwd));
+                assert!(!draft.matches(&wrong_directory, &cwd));
+            }
         }
-        assert_eq!(names.len(), 16);
+    }
+
+    #[test]
+    fn directory_rules_cover_every_move_copy_endpoint_and_download_target() {
+        let cwd = std::env::temp_dir().join("aitui_permission_multi_path");
+        let allowed = cwd.join("allowed");
+        let nested = allowed.join("nested");
+        let outside = cwd.join("outside");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let allowed = std::fs::canonicalize(allowed).unwrap();
+        let draft = |kind| PermissionRuleDraft {
+            decision: PermissionDecision::Allow,
+            kind: Some(kind),
+            directory: Some(allowed.clone()),
+            include_children: true,
+            lifetime: PermissionLifetime::Session,
+        };
+
+        for kind in [ToolKind::Move, ToolKind::Copy] {
+            let name = kind.name();
+            let inside = call(
+                name,
+                serde_json::json!({"from": "allowed/a.txt", "to": "allowed/nested/b.txt"}),
+            );
+            let escaping = call(
+                name,
+                serde_json::json!({"from": "allowed/a.txt", "to": "outside/b.txt"}),
+            );
+            assert!(draft(kind).matches(&inside, &cwd));
+            assert!(!draft(kind).matches(&escaping, &cwd));
+        }
+
+        let download = draft(ToolKind::Download);
+        assert!(download.matches(
+            &call(
+                "download",
+                serde_json::json!({"url": "https://example.com/a", "path": "allowed/a.bin"}),
+            ),
+            &cwd,
+        ));
+        assert!(!download.matches(
+            &call(
+                "download",
+                serde_json::json!({"url": "https://example.com/a", "path": "outside/a.bin"}),
+            ),
+            &cwd,
+        ));
+    }
+
+    #[test]
+    fn once_rules_are_not_remembered_and_session_rules_do_not_expire() {
+        let mut mem = PermissionMemory::default();
+        let once = PermissionRuleDraft {
+            decision: PermissionDecision::Allow,
+            kind: Some(ToolKind::Read),
+            directory: None,
+            include_children: false,
+            lifetime: PermissionLifetime::Once,
+        };
+        mem.remember_custom_rule(once);
+        assert!(mem.rules.is_empty());
+
+        mem.remember_custom_rule(PermissionRuleDraft {
+            lifetime: PermissionLifetime::Session,
+            ..PermissionRuleDraft {
+                decision: PermissionDecision::Allow,
+                kind: Some(ToolKind::Read),
+                directory: None,
+                include_children: false,
+                lifetime: PermissionLifetime::Once,
+            }
+        });
+        assert_eq!(mem.rules.len(), 1);
+        assert!(mem.rules[0].expires_at.is_none());
+        assert!(mem.rules[0].remaining_matching.is_none());
+        assert!(mem.rules[0].remaining_general.is_none());
+    }
+
+    #[test]
+    fn allow_and_deny_precedence_is_stable_across_legacy_and_custom_rules() {
+        let cwd = PathBuf::from("/tmp/project");
+        let shell = call("shell", serde_json::json!({"command": "cargo test"}));
+
+        let mut mem = PermissionMemory::default();
+        mem.remember_allow(ToolKind::Shell);
+        mem.remember_custom_rule(PermissionRuleDraft {
+            decision: PermissionDecision::Deny,
+            kind: Some(ToolKind::Shell),
+            directory: None,
+            include_children: false,
+            lifetime: PermissionLifetime::Session,
+        });
+        assert_eq!(mem.check(&shell, &cwd), Some(PermissionDecision::Deny));
+
+        let mut mem = PermissionMemory::default();
+        mem.remember_deny(ToolKind::Shell);
+        mem.remember_custom_rule(PermissionRuleDraft {
+            decision: PermissionDecision::Allow,
+            kind: Some(ToolKind::Shell),
+            directory: None,
+            include_children: false,
+            lifetime: PermissionLifetime::Session,
+        });
+        assert_eq!(mem.check(&shell, &cwd), Some(PermissionDecision::Deny));
     }
 
     #[test]
@@ -1092,10 +1840,48 @@ mod tests {
     }
 
     #[test]
+    fn matching_request_limit_is_consumed_only_by_matching_calls() {
+        let cwd = PathBuf::from("/tmp/project");
+        let mut mem = PermissionMemory::default();
+        mem.remember_custom_rule(PermissionRuleDraft {
+            decision: PermissionDecision::Allow,
+            kind: Some(ToolKind::Shell),
+            directory: None,
+            include_children: false,
+            lifetime: PermissionLifetime::MatchingRequests(2),
+        });
+        let read = call("read_file", serde_json::json!({"path": "a.txt"}));
+        let shell = call("run_shell", serde_json::json!({"command": "cargo test"}));
+        assert_eq!(mem.consume(&read, &cwd), None);
+        assert_eq!(mem.consume(&shell, &cwd), Some(PermissionDecision::Allow));
+        assert_eq!(mem.consume(&shell, &cwd), Some(PermissionDecision::Allow));
+        assert_eq!(mem.consume(&shell, &cwd), None);
+    }
+
+    #[test]
+    fn general_request_limit_counts_unrelated_access_checks() {
+        let cwd = PathBuf::from("/tmp/project");
+        let mut mem = PermissionMemory::default();
+        mem.remember_custom_rule(PermissionRuleDraft {
+            decision: PermissionDecision::Allow,
+            kind: Some(ToolKind::Shell),
+            directory: None,
+            include_children: false,
+            lifetime: PermissionLifetime::GeneralRequests(2),
+        });
+        let read = call("read_file", serde_json::json!({"path": "a.txt"}));
+        let shell = call("run_shell", serde_json::json!({"command": "cargo test"}));
+        assert_eq!(mem.consume(&read, &cwd), None);
+        assert_eq!(mem.consume(&shell, &cwd), Some(PermissionDecision::Allow));
+        assert_eq!(mem.consume(&shell, &cwd), None);
+    }
+
+    #[test]
     fn directory_rule_scopes_to_that_dir() {
         let base = std::env::temp_dir().join(format!("aitui_perm_{}", std::process::id()));
-        let other = base.join("other");
-        let _ = std::fs::create_dir_all(&base);
+        let nested = base.join("nested");
+        let other = std::env::temp_dir().join(format!("aitui_perm_other_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&nested);
         let _ = std::fs::create_dir_all(&other);
         let mut mem = PermissionMemory::default();
         let dir = std::fs::canonicalize(&base).unwrap();
@@ -1105,11 +1891,29 @@ mod tests {
             false,
         );
 
-        // A file directly in `base` → allowed.
         let inside = call("read_file", serde_json::json!({"path": "f.txt"}));
         assert_eq!(mem.check(&inside, &base), Some(PermissionDecision::Allow));
-        // A file in a different directory → still asks.
+        assert_eq!(mem.check(&inside, &nested), None);
         let outside = call("read_file", serde_json::json!({"path": "f.txt"}));
         assert_eq!(mem.check(&outside, &other), None);
+    }
+
+    #[test]
+    fn custom_directory_rule_can_include_children() {
+        let base = std::env::temp_dir().join(format!("aitui_perm_children_{}", std::process::id()));
+        let nested = base.join("nested");
+        let _ = std::fs::create_dir_all(&nested);
+        let mut mem = PermissionMemory::default();
+        let dir = std::fs::canonicalize(&base).unwrap();
+        mem.remember_custom_rule(PermissionRuleDraft {
+            decision: PermissionDecision::Allow,
+            kind: Some(ToolKind::Read),
+            directory: Some(dir),
+            include_children: true,
+            lifetime: PermissionLifetime::Session,
+        });
+
+        let inside = call("read_file", serde_json::json!({"path": "f.txt"}));
+        assert_eq!(mem.check(&inside, &nested), Some(PermissionDecision::Allow));
     }
 }

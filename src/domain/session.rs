@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -53,6 +54,29 @@ impl LoopState {
     pub const DEFAULT_MAX: usize = 25;
 }
 
+/// Durable information extracted from a completed conversation turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryRecord {
+    pub id: u64,
+    pub content: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub source_turn: u64,
+}
+
+impl MemoryRecord {
+    pub const MAX_CONTENT_CHARS: usize = 500;
+
+    pub fn is_valid(&self) -> bool {
+        self.id > 0
+            && !self.content.trim().is_empty()
+            && self.content.chars().count() <= Self::MAX_CONTENT_CHARS
+            && self.created_at > 0
+            && self.updated_at >= self.created_at
+            && self.source_turn > 0
+    }
+}
+
 /// A single named conversation session.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -75,14 +99,27 @@ pub struct Session {
     /// Agent-declared task breakdown for this session, shown in the sticky panel
     /// above the input while the session is active.
     pub todos: Vec<crate::app::state::TodoItem>,
+    /// Overall progress (0–100) estimated by the parallel task-tracker agent.
+    pub todo_overall_percent: Option<u8>,
+    /// Optional model-generated user replies for the latest completed turn.
+    /// Ephemeral by design: never persisted and cleared when a new turn starts.
+    pub response_suggestions: Vec<String>,
     /// Agent mode: when true the session uses tool-calling prompts.
     pub agent_mode: bool,
     /// The working directory this session belongs to. Resuming a session `cd`s
     /// back here so file tools and `@`-mentions resolve against the same project.
     pub cwd: Option<PathBuf>,
+    /// Unix timestamp of the most recent user prompt, used by session navigation.
+    pub last_prompt_at: Option<u64>,
     /// Unsent composer text, stashed when leaving the session and restored on
     /// return. Persisted to disk so a draft survives a restart.
     pub draft: String,
+    /// Durable, session-scoped facts and decisions extracted from completed turns.
+    pub memories: Vec<MemoryRecord>,
+    /// Monotonic local id allocator for memory records.
+    pub next_memory_id: u64,
+    /// Latest completed user turn submitted to memory extraction.
+    pub memory_source_turn: u64,
     /// Active autonomous loop, if any. `Some` means the agent keeps working toward
     /// the goal on its own until `finish`/`max`/cancel. Persisted so a loop survives
     /// a restart.
@@ -102,15 +139,22 @@ impl Session {
             pending_first_at: None,
             pending_mock: false,
             todos: Vec::new(),
+            todo_overall_percent: None,
+            response_suggestions: Vec::new(),
             agent_mode: false,
             cwd: std::env::current_dir().ok(),
+            last_prompt_at: None,
             draft: String::new(),
+            memories: Vec::new(),
+            next_memory_id: 1,
+            memory_source_turn: 0,
             loop_state: None,
         }
     }
 
     /// Start a streaming assistant message.
     pub fn begin_assistant_stream(&mut self) {
+        self.response_suggestions.clear();
         self.pending_assistant_text = Some(String::new());
         self.pending_reasoning = None;
         self.pending_started_at = Some(std::time::Instant::now());
@@ -175,6 +219,7 @@ impl Session {
 
     /// Time-to-first-result so far (ms), fixed once the first token has arrived.
     /// None while still waiting on the very first byte.
+    #[cfg(test)]
     pub fn pending_first_ms(&self) -> Option<u64> {
         let (start, first) = (self.pending_started_at?, self.pending_first_at?);
         Some(first.saturating_duration_since(start).as_millis() as u64)
@@ -224,12 +269,32 @@ impl Session {
 
     /// Push a pre-built message into history.
     pub fn push_message(&mut self, msg: ChatMessage) {
+        if msg.role == "user" {
+            self.last_prompt_at = unix_timestamp();
+        }
         self.messages.push(msg);
     }
 
     /// Index of the most recent `user` message, if any.
     fn last_user_index(&self) -> Option<usize> {
         self.messages.iter().rposition(|m| m.role == "user")
+    }
+
+    /// Plain text of the most recent `user` message.
+    pub fn last_user_text(&self) -> Option<String> {
+        self.last_user_index().map(|i| msg_text(&self.messages[i]))
+    }
+
+    /// Plain text of the nearest `user` message at or before `message_index`.
+    /// Synthetic live transcript rows use `messages.len()` and therefore resolve
+    /// to the latest stored user turn.
+    pub fn user_text_at_or_before(&self, message_index: usize) -> Option<String> {
+        let end = message_index.min(self.messages.len().saturating_sub(1));
+        self.messages
+            .get(..=end)?
+            .iter()
+            .rposition(|message| message.role == "user")
+            .map(|index| msg_text(&self.messages[index]))
     }
 
     /// Plain text of the most recent `assistant` message.
@@ -268,28 +333,41 @@ impl Session {
     /// - In agent mode the tool-calling system prompt is prepended so the model
     ///   knows which tools exist and how to call them.
     /// - A user-defined system prompt (if any) is added after it.
-    /// - When `native` is on, a stored assistant turn's fenced ```` ```tool ````
+    /// - When `native` is on, a stored assistant turn's `<tool>…</tool>`
     ///   calls become structured `tool_calls`, and the following "tool" results
     ///   become native `role:"tool"` messages with matching `tool_call_id`.
     /// - Otherwise (fenced fallback) "tool" messages are re-mapped to "user" so
     ///   plain OpenAI-compatible endpoints accept them as context.
     #[cfg(test)]
     pub fn api_messages(&self, native: bool) -> Vec<ChatMessage> {
-        self.api_messages_windowed(native, None)
+        self.api_messages_windowed(native, None, &Default::default())
     }
 
     /// Like [`api_messages`], but drops the oldest turns so the tail fits within
     /// `char_budget` characters (a proactive sliding window that keeps the request
     /// under the model's context limit). `None` sends the whole history.
+    /// `agents` is the named-agent registry whose descriptions the system prompt
+    /// advertises so the model can choose a configured child agent.
     pub fn api_messages_windowed(
         &self,
         native: bool,
         char_budget: Option<usize>,
+        agents: &BTreeMap<String, crate::config::types::AgentDef>,
     ) -> Vec<ChatMessage> {
         let mut out = Vec::with_capacity(self.messages.len() + 2);
         if self.agent_mode {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            out.push(ChatMessage::system(crate::agent::agent_system_prompt(&cwd)));
+            out.push(ChatMessage::system(crate::agent::agent_system_prompt(
+                &cwd, agents,
+            )));
+            // Read-only task state maintained by the parallel tracker: the agent
+            // must never edit the checklist itself, only observe its progress.
+            if !self.todos.is_empty() {
+                out.push(ChatMessage::system(task_state_block(
+                    &self.todos,
+                    self.todo_overall_percent,
+                )));
+            }
         }
         if let Some(ref prompt) = self.system_prompt {
             out.push(ChatMessage::system(prompt.clone()));
@@ -309,7 +387,9 @@ impl Session {
             // by exactly that many "tool" results, is sent as structured tool_calls.
             if native && m.role == "assistant" {
                 let text = msg_text(m);
-                let calls = crate::agent::parser::extract_tool_calls(&text);
+                // Must match what actually ran (`tool_calls_in`), or the calls
+                // reconstructed here won't line up with their stored results.
+                let calls = crate::agent::parser::committed_tool_calls(&text);
                 if !calls.is_empty() {
                     // Gather the run of tool results answering this turn.
                     let mut n = 0;
@@ -342,7 +422,9 @@ impl Session {
                             duration_ms: None,
                             first_ms: None,
                             tool_calls: Some(api_calls.clone()),
+                            created_at: 0,
                             tool_call_id: None,
+                            local_tool_call: None,
                         });
                         for (k, api_call) in api_calls.iter().enumerate() {
                             let result = &msgs[i + 1 + k];
@@ -353,7 +435,9 @@ impl Session {
                                 duration_ms: None,
                                 first_ms: None,
                                 tool_calls: None,
+                                created_at: 0,
                                 tool_call_id: Some(api_call.id.clone()),
+                                local_tool_call: None,
                             });
                         }
                         i += 1 + n;
@@ -372,7 +456,9 @@ impl Session {
                     duration_ms: None,
                     first_ms: None,
                     tool_calls: None,
+                    created_at: 0,
                     tool_call_id: None,
+                    local_tool_call: None,
                 });
             } else {
                 out.push(m.clone());
@@ -439,6 +525,21 @@ impl Session {
         self.pending_assistant_text.is_some()
     }
 
+    /// Latest completed user→assistant exchange, excluding tool messages between
+    /// them. Used for optional follow-up suggestions and stale-result validation.
+    pub fn latest_completed_turn(&self) -> Option<(String, String)> {
+        let assistant_idx = self.messages.iter().rposition(|m| m.role == "assistant")?;
+        let user_idx = self.messages[..assistant_idx]
+            .iter()
+            .rposition(|m| m.role == "user")?;
+        let user = msg_text(&self.messages[user_idx]);
+        let assistant = msg_text(&self.messages[assistant_idx]);
+        if user.trim().is_empty() || assistant.trim().is_empty() {
+            return None;
+        }
+        Some((user, assistant))
+    }
+
     /// First user message preview for the sidebar (up to `max_chars` chars).
     pub fn first_message_preview(&self, max_chars: usize) -> Option<String> {
         self.messages.iter().find(|m| m.role == "user").map(|m| {
@@ -462,9 +563,68 @@ impl Session {
     }
 }
 
-// ── Serializable snapshot for disk persistence ────────────────────────────────
+fn unix_timestamp() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
 
-#[derive(Serialize, Deserialize)]
+/// Read-only task state injected as a system message in agent mode, so the
+/// active agent can see its checklist (and what is done) without editing it.
+fn task_state_block(todos: &[crate::app::state::TodoItem], overall_percent: Option<u8>) -> String {
+    use crate::app::state::TodoStatus;
+    let mut out = String::from(
+        "CURRENT TASK STATE (read-only, maintained by a separate tracker; do not edit tasks yourself):\n",
+    );
+    for (index, todo) in todos.iter().enumerate() {
+        let marker = match todo.status {
+            TodoStatus::Done => "[done]",
+            TodoStatus::InProgress => "[in_progress]",
+            TodoStatus::Pending => "[pending]",
+        };
+        let percent = todo.percent.map(|p| format!(" {}%", p)).unwrap_or_default();
+        out.push_str(&format!(
+            "{}. {} {}{}\n",
+            index + 1,
+            marker,
+            todo.text,
+            percent
+        ));
+    }
+    if let Some(overall) = overall_percent {
+        out.push_str(&format!("Overall progress: {}%\n", overall));
+    }
+    out
+}
+
+fn default_next_memory_id() -> u64 {
+    1
+}
+
+fn deserialize_memories<'de, D>(deserializer: D) -> Result<Vec<MemoryRecord>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    let mut memories = Vec::new();
+    for value in values {
+        let Ok(memory) = serde_json::from_value::<MemoryRecord>(value) else {
+            continue;
+        };
+        if memory.is_valid()
+            && !memories
+                .iter()
+                .any(|existing: &MemoryRecord| existing.id == memory.id)
+        {
+            memories.push(memory);
+        }
+    }
+    Ok(memories)
+}
+
+// ── Serializable snapshot for disk persistence ────────────────────────────────
+#[derive(Clone, Serialize, Deserialize)]
 struct SavedSession {
     id: usize,
     name: String,
@@ -473,18 +633,30 @@ struct SavedSession {
     #[serde(default)]
     todos: Vec<crate::app::state::TodoItem>,
     #[serde(default)]
+    todo_overall_percent: Option<u8>,
+    #[serde(default)]
     cwd: Option<PathBuf>,
     #[serde(default)]
+    last_prompt_at: Option<u64>,
+    #[serde(default)]
     draft: String,
+    #[serde(default, deserialize_with = "deserialize_memories")]
+    memories: Vec<MemoryRecord>,
+    #[serde(default = "default_next_memory_id")]
+    next_memory_id: u64,
+    #[serde(default)]
+    memory_source_turn: u64,
     #[serde(default)]
     loop_state: Option<LoopState>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SavedState {
     sessions: Vec<SavedSession>,
     active_idx: usize,
     next_id: usize,
+    #[serde(default)]
+    deleted_ids: Vec<usize>,
 }
 
 impl From<&Session> for SavedSession {
@@ -495,8 +667,13 @@ impl From<&Session> for SavedSession {
             messages: s.messages.clone(),
             system_prompt: s.system_prompt.clone(),
             todos: s.todos.clone(),
+            todo_overall_percent: s.todo_overall_percent,
             cwd: s.cwd.clone(),
+            last_prompt_at: s.last_prompt_at,
             draft: s.draft.clone(),
+            memories: s.memories.clone(),
+            next_memory_id: s.next_memory_id,
+            memory_source_turn: s.memory_source_turn,
             loop_state: s.loop_state.clone(),
         }
     }
@@ -504,6 +681,14 @@ impl From<&Session> for SavedSession {
 
 impl From<SavedSession> for Session {
     fn from(s: SavedSession) -> Self {
+        let next_memory_id = s
+            .memories
+            .iter()
+            .map(|memory| memory.id.saturating_add(1))
+            .max()
+            .unwrap_or(1)
+            .max(s.next_memory_id)
+            .max(1);
         Session {
             id: s.id,
             name: s.name,
@@ -515,21 +700,43 @@ impl From<SavedSession> for Session {
             pending_first_at: None,
             pending_mock: false,
             todos: s.todos,
+            todo_overall_percent: s.todo_overall_percent,
+            response_suggestions: Vec::new(),
             agent_mode: false,
             cwd: s.cwd,
+            last_prompt_at: s.last_prompt_at,
             draft: s.draft,
+            memories: s.memories,
+            next_memory_id,
+            memory_source_turn: s.memory_source_turn,
             loop_state: s.loop_state,
         }
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct ClientPresence {
+    updated_at_ms: u128,
+    running_sessions: Vec<usize>,
+}
+
+const PRESENCE_STALE_AFTER_MS: u128 = 2_000;
+
 // ── SessionManager ────────────────────────────────────────────────────────────
+
+/// Minimum interval between full session file writes. Saves called more
+/// frequently are silently coalesced — trade durability batching for I/O.
+const SAVE_DEBOUNCE_MS: u128 = 500;
 
 #[derive(Debug)]
 pub struct SessionManager {
     sessions: Vec<Session>,
     active_idx: usize,
     next_id: usize,
+    deleted_ids: Vec<usize>,
+    /// Monotonic timestamp (ms) of the last actual disk write; saves within
+    /// `SAVE_DEBOUNCE_MS` are skipped.
+    last_save_ms: u128,
 }
 
 impl SessionManager {
@@ -539,6 +746,8 @@ impl SessionManager {
             sessions: vec![first],
             active_idx: 0,
             next_id: 2,
+            deleted_ids: Vec::new(),
+            last_save_ms: 0,
         }
     }
 
@@ -563,22 +772,41 @@ impl SessionManager {
         }
         let active_idx = saved.active_idx.min(saved.sessions.len() - 1);
         let next_id = saved.next_id;
+        let deleted_ids = saved.deleted_ids;
         let sessions = saved.sessions.into_iter().map(Session::from).collect();
         Self {
             sessions,
             active_idx,
             next_id,
+            deleted_ids,
+            last_save_ms: 0,
         }
     }
 
-    /// Persist all sessions to disk (silently ignores errors). Serialization and
-    /// the blocking `fs::write` are moved off the UI thread via `spawn_blocking`
-    /// when a tokio runtime is available (the app), so finishing a turn doesn't
+    /// Persist all sessions to disk. Failures are reported to stderr but never
+    /// interrupt a conversation turn. Serialization and the blocking write move
+    /// off the UI thread when a tokio runtime is available (the app), so finishing a turn doesn't
     /// hitch the render loop; falls back to a synchronous write otherwise (tests).
-    pub fn save(&self) {
+    /// Saves within `SAVE_DEBOUNCE_MS` of the last write are silently coalesced.
+    pub fn save(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        if now > 0 && now.saturating_sub(self.last_save_ms) < SAVE_DEBOUNCE_MS {
+            return;
+        }
+        self.last_save_ms = now;
         let path = sessions_path();
         if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+            if let Err(error) = fs::create_dir_all(parent) {
+                eprintln!(
+                    "Failed to create session storage directory {}: {}",
+                    parent.display(),
+                    error
+                );
+                return;
+            }
         }
         // Build the owned snapshot on the caller's thread (cheap clones), then hand
         // the expensive serialize + write to a blocking task.
@@ -586,11 +814,60 @@ impl SessionManager {
             sessions: self.sessions.iter().map(SavedSession::from).collect(),
             active_idx: self.active_idx,
             next_id: self.next_id,
+            deleted_ids: self.deleted_ids.clone(),
         };
         let write = move || {
-            if let Ok(json) = serde_json::to_string_pretty(&state) {
-                let _ = atomic_write(&path, json.as_bytes());
+            let lock = match SessionFileLock::acquire(&path) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    eprintln!(
+                        "Failed to acquire session storage lock {}: {}",
+                        path.display(),
+                        error
+                    );
+                    return;
+                }
+            };
+            let mut merged = fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<SavedState>(&raw).ok())
+                .unwrap_or_else(|| state.clone());
+            for id in &state.deleted_ids {
+                if !merged.deleted_ids.contains(id) {
+                    merged.deleted_ids.push(*id);
+                }
             }
+            merged
+                .sessions
+                .retain(|session| !merged.deleted_ids.contains(&session.id));
+            for local in state.sessions.iter().cloned() {
+                if merged.deleted_ids.contains(&local.id) {
+                    continue;
+                }
+                if let Some(existing) = merged.sessions.iter_mut().find(|s| s.id == local.id) {
+                    *existing = local;
+                } else {
+                    merged.sessions.push(local);
+                }
+            }
+            merged.sessions.sort_by_key(|session| session.id);
+            merged.next_id = merged.next_id.max(state.next_id);
+            merged.active_idx = state
+                .active_idx
+                .min(merged.sessions.len().saturating_sub(1));
+            match serde_json::to_string_pretty(&merged) {
+                Ok(json) => {
+                    if let Err(error) = atomic_write(&path, json.as_bytes()) {
+                        eprintln!(
+                            "Failed to write session storage {}: {}",
+                            path.display(),
+                            error
+                        );
+                    }
+                }
+                Err(error) => eprintln!("Failed to serialize session storage: {}", error),
+            }
+            drop(lock);
         };
         match tokio::runtime::Handle::try_current() {
             Ok(_) => {
@@ -598,6 +875,113 @@ impl SessionManager {
             }
             Err(_) => write(),
         }
+    }
+
+    /// Reconcile sessions changed by another AiTUI process. Existing local sessions
+    /// stay authoritative while active/streaming, but remote creations are added and
+    /// tombstoned removals are applied immediately on every client.
+    pub fn sync_from_disk(&mut self) -> bool {
+        let raw = match fs::read_to_string(sessions_path()) {
+            Ok(raw) => raw,
+            Err(_) => return false,
+        };
+        let saved: SavedState = match serde_json::from_str(&raw) {
+            Ok(saved) => saved,
+            Err(_) => return false,
+        };
+        let active_id = self.active_id();
+        let before: Vec<usize> = self.sessions.iter().map(|session| session.id).collect();
+
+        for id in saved.deleted_ids {
+            if !self.deleted_ids.contains(&id) {
+                self.deleted_ids.push(id);
+            }
+        }
+        self.sessions
+            .retain(|session| !self.deleted_ids.contains(&session.id));
+        for remote in saved.sessions {
+            if self.deleted_ids.contains(&remote.id) {
+                continue;
+            }
+            if let Some(index) = self.sessions.iter().position(|local| local.id == remote.id) {
+                let local = &mut self.sessions[index];
+                local.last_prompt_at = local.last_prompt_at.max(remote.last_prompt_at);
+                if index != self.active_idx && !local.is_streaming() {
+                    let agent_mode = local.agent_mode;
+                    *local = Session::from(remote);
+                    local.agent_mode = agent_mode;
+                }
+            } else {
+                self.sessions.push(Session::from(remote));
+            }
+        }
+        self.sessions.sort_by_key(|session| session.id);
+        self.next_id = self.next_id.max(saved.next_id);
+        if self.sessions.is_empty() {
+            let mut session = Session::new(self.next_id.max(1));
+            self.next_id = session.id + 1;
+            session.name = format!("Session {}", session.id);
+            self.sessions.push(session);
+        }
+        self.active_idx = self
+            .sessions
+            .iter()
+            .position(|session| session.id == active_id)
+            .unwrap_or_else(|| self.active_idx.min(self.sessions.len() - 1));
+
+        before
+            != self
+                .sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>()
+    }
+
+    /// Publish this process's running sessions for other AiTUI clients. Each process
+    /// owns one heartbeat file, so clients never overwrite each other's live state.
+    pub fn publish_presence(&self, running_sessions: &[usize]) {
+        let dir = presence_dir();
+        if fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let presence = ClientPresence {
+            updated_at_ms: unix_timestamp_ms(),
+            running_sessions: running_sessions.to_vec(),
+        };
+        if let Ok(json) = serde_json::to_vec(&presence) {
+            let _ = atomic_write(&presence_path(std::process::id()), &json);
+        }
+    }
+
+    /// Session ids currently reported as running by another live AiTUI process.
+    pub fn remote_running_sessions(&self) -> std::collections::HashSet<usize> {
+        let mut running = std::collections::HashSet::new();
+        let now = unix_timestamp_ms();
+        let Ok(entries) = fs::read_dir(presence_dir()) else {
+            return running;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == presence_path(std::process::id()) {
+                continue;
+            }
+            let Some(presence) = fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<ClientPresence>(&raw).ok())
+            else {
+                continue;
+            };
+            if now.saturating_sub(presence.updated_at_ms) <= PRESENCE_STALE_AFTER_MS {
+                running.extend(presence.running_sessions);
+            } else {
+                let _ = fs::remove_file(path);
+            }
+        }
+        running
+    }
+
+    pub fn clear_presence(&self) {
+        let _ = fs::remove_file(presence_path(std::process::id()));
     }
 
     pub fn active(&self) -> &Session {
@@ -610,6 +994,10 @@ impl SessionManager {
 
     pub fn all(&self) -> &[Session] {
         &self.sessions
+    }
+
+    pub fn all_mut(&mut self) -> &mut [Session] {
+        &mut self.sessions
     }
 
     pub fn active_idx(&self) -> usize {
@@ -642,6 +1030,7 @@ impl SessionManager {
         // nor its autonomous loop (a fork is a manual branch to explore by hand).
         copy.pending_assistant_text = None;
         copy.pending_reasoning = None;
+        copy.response_suggestions.clear();
         copy.loop_state = None;
         self.sessions.push(copy);
         self.active_idx = self.sessions.len() - 1;
@@ -697,12 +1086,19 @@ impl SessionManager {
         }
         if self.sessions.len() <= 1 {
             self.sessions[0].messages.clear();
+            self.sessions[0].memories.clear();
+            self.sessions[0].next_memory_id = 1;
+            self.sessions[0].memory_source_turn = 0;
             self.sessions[0].name = "Session 1".to_string();
             self.sessions[0].system_prompt = None;
             self.active_idx = 0;
             return;
         }
+        let removed_id = self.sessions[idx].id;
         self.sessions.remove(idx);
+        if !self.deleted_ids.contains(&removed_id) {
+            self.deleted_ids.push(removed_id);
+        }
         if self.active_idx > idx || self.active_idx >= self.sessions.len() {
             self.active_idx = self
                 .active_idx
@@ -712,7 +1108,30 @@ impl SessionManager {
     }
 }
 
+fn unix_timestamp_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn presence_dir() -> PathBuf {
+    sessions_path()
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("clients")
+}
+
+fn presence_path(pid: u32) -> PathBuf {
+    presence_dir().join(format!("{}.json", pid))
+}
+
 fn sessions_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(base) = crate::skills::test_config_base() {
+        return base.join("aitui").join("sessions.json");
+    }
+
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -720,6 +1139,39 @@ fn sessions_path() -> PathBuf {
             PathBuf::from(home).join(".config")
         });
     base.join("aitui").join("sessions.json")
+}
+
+struct SessionFileLock {
+    path: PathBuf,
+}
+
+impl SessionFileLock {
+    fn acquire(sessions: &std::path::Path) -> std::io::Result<Self> {
+        let path = sessions.with_extension("json.lock");
+        for _ in 0..100 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "timed out waiting for session lock",
+        ))
+    }
+}
+
+impl Drop for SessionFileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 /// Write `bytes` to `path` atomically: write to a temp file in the same directory,
@@ -762,6 +1214,47 @@ mod tests {
     // ── Session ────────────────────────────────────────────────────────────────
 
     #[test]
+    fn user_messages_record_last_prompt_time() {
+        let mut session = Session::new(1);
+        assert_eq!(session.last_prompt_at, None);
+        session.push_message(ChatMessage::user("hello"));
+        assert!(session.last_prompt_at.is_some());
+    }
+
+    #[test]
+    fn user_text_at_or_before_resolves_the_owning_turn() {
+        let mut session = Session::new(1);
+        session.push_message(ChatMessage::user("first prompt"));
+        session.push_message(ChatMessage::assistant("first result"));
+        session.push_message(ChatMessage::tool("tool result"));
+        session.push_message(ChatMessage::user("second prompt"));
+        session.push_message(ChatMessage::assistant("second result"));
+
+        assert_eq!(
+            session.user_text_at_or_before(2).as_deref(),
+            Some("first prompt")
+        );
+        assert_eq!(
+            session.user_text_at_or_before(4).as_deref(),
+            Some("second prompt")
+        );
+        assert_eq!(
+            session
+                .user_text_at_or_before(session.messages.len())
+                .as_deref(),
+            Some("second prompt")
+        );
+    }
+
+    #[test]
+    fn assistant_messages_do_not_change_last_prompt_time() {
+        let mut session = Session::new(1);
+        session.last_prompt_at = Some(42);
+        session.push_message(ChatMessage::assistant("hello"));
+        assert_eq!(session.last_prompt_at, Some(42));
+    }
+
+    #[test]
     fn atomic_write_creates_and_overwrites_without_leaving_temp() {
         let dir = std::env::temp_dir().join(format!("aitui_atomic_{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
@@ -798,7 +1291,7 @@ mod tests {
             s.push_message(ChatMessage::assistant(format!("answer number  {}", n)));
         }
         // Budget large enough for only the last turn's ~34 chars.
-        let msgs = s.api_messages_windowed(false, Some(40));
+        let msgs = s.api_messages_windowed(false, Some(40), &Default::default());
         // Only the final turn survives, and the window starts on a user message.
         assert_eq!(msgs.first().map(|m| m.role.as_str()), Some("user"));
         assert!(
@@ -816,7 +1309,7 @@ mod tests {
             "a very long final question that exceeds the budget",
         ));
         // Budget smaller than the single turn — must still be sent, not dropped.
-        let msgs = s.api_messages_windowed(false, Some(1));
+        let msgs = s.api_messages_windowed(false, Some(1), &Default::default());
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
     }
@@ -1065,6 +1558,89 @@ mod tests {
     }
 
     // ── SessionManager ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn manager_save_and_load_restores_every_session_and_active_state() {
+        let base = std::env::temp_dir().join(format!(
+            "aitui_sessions_load_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+
+        let loaded = crate::skills::with_test_config_base(base.clone(), || {
+            let mut manager = SessionManager::new();
+            manager.active_mut().name = "First".into();
+            manager
+                .active_mut()
+                .push_message(ChatMessage::user("first message"));
+            manager.active_mut().draft = "first draft".into();
+            manager.new_session();
+            manager.active_mut().name = "Second".into();
+            manager
+                .active_mut()
+                .push_message(ChatMessage::assistant("second message"));
+            manager.active_mut().todos = vec![crate::app::state::TodoItem {
+                text: "Persist me".into(),
+                status: crate::app::state::TodoStatus::InProgress,
+                percent: None,
+            }];
+            manager.active_mut().loop_state = Some(LoopState {
+                goal: "finish".into(),
+                stop: "verified".into(),
+                iteration: 2,
+                max: 7,
+            });
+            manager.active_mut().memories = vec![MemoryRecord {
+                id: 1,
+                content: "User prefers focused tests.".into(),
+                created_at: 100,
+                updated_at: 120,
+                source_turn: 2,
+            }];
+            manager.active_mut().next_memory_id = 2;
+            manager.active_mut().memory_source_turn = 2;
+            manager.save();
+            SessionManager::load()
+        });
+
+        let _ = fs::remove_dir_all(&base);
+
+        assert_eq!(loaded.all().len(), 2);
+        assert_eq!(loaded.active_idx(), 1);
+        assert_eq!(loaded.all()[0].name, "First");
+        assert!(loaded.all()[0].last_prompt_at.is_some());
+        assert_eq!(loaded.all()[0].draft, "first draft");
+        assert_eq!(loaded.active().name, "Second");
+        assert_eq!(loaded.active().todos.len(), 1);
+        assert_eq!(loaded.active().loop_state.as_ref().unwrap().iteration, 2);
+        assert_eq!(loaded.active().memories.len(), 1);
+        assert_eq!(
+            loaded.active().memories[0].content,
+            "User prefers focused tests."
+        );
+        assert_eq!(loaded.active().next_memory_id, 2);
+        assert_eq!(loaded.active().memory_source_turn, 2);
+    }
+
+    #[test]
+    fn saved_session_skips_malformed_memory_entries() {
+        let raw = r#"{
+            "id": 1,
+            "name": "Remembering",
+            "messages": [],
+            "system_prompt": null,
+            "memories": [
+                {"id": 1, "content": "Valid fact", "created_at": 10, "updated_at": 10, "source_turn": 1},
+                {"id": 2, "content": "", "created_at": 10, "updated_at": 10, "source_turn": 1},
+                {"unexpected": true}
+            ]
+        }"#;
+        let saved: SavedSession = serde_json::from_str(raw).expect("session should load");
+        let session = Session::from(saved);
+        assert_eq!(session.memories.len(), 1);
+        assert_eq!(session.memories[0].content, "Valid fact");
+        assert_eq!(session.next_memory_id, 2);
+    }
 
     #[test]
     fn manager_new_creates_one_session() {

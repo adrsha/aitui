@@ -11,7 +11,9 @@ pub fn handle_event(app: &App, event: Event) -> Vec<Action> {
     match event {
         // With keyboard enhancement on, terminals also report key releases —
         // act on presses (and auto-repeats) only, so keys don't fire twice.
-        Event::Key(k) if k.kind != KeyEventKind::Release => handle_key(app, k),
+        Event::Key(k) if k.kind != KeyEventKind::Release => {
+            handle_key(app, normalize_shifted_key(k))
+        }
         Event::Mouse(m) => handle_mouse(app, m),
         Event::Resize(_, _) => vec![Action::Resize],
         // A bracketed paste arrives as one blob — smart-paste decides file vs chip.
@@ -22,13 +24,45 @@ pub fn handle_event(app: &App, event: Event) -> Vec<Action> {
     }
 }
 
+fn normalize_shifted_key(mut key: KeyEvent) -> KeyEvent {
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        if let KeyCode::Char(c) = key.code {
+            key.code = KeyCode::Char(shifted_char(c));
+        }
+    }
+    key
+}
+
+fn shifted_char(c: char) -> char {
+    match c {
+        'a'..='z' => c.to_ascii_uppercase(),
+        '`' => '~',
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        _ => c,
+    }
+}
+
 fn handle_key(app: &App, key: KeyEvent) -> Vec<Action> {
     let km = &app.keymap;
-
-    // ── Launch screen is fully modal (resume/new), only Ctrl-C escapes ──
-    if let Overlay::Startup(_) = app.overlay {
-        return handle_startup(&key, km);
-    }
 
     // ── Global shortcuts (fire in any mode, configurable) ───────────────
     if km.quit.matches(&key) {
@@ -41,11 +75,21 @@ fn handle_key(app: &App, key: KeyEvent) -> Vec<Action> {
     if km.redraw.matches(&key) {
         return vec![Action::Resize];
     }
-    if km.next_session.matches(&key) {
+    if km.next_session.matches(&key)
+        && !(app.vim == VimMode::Insert
+            && key.code == KeyCode::Tab
+            && !key.modifiers.contains(KeyModifiers::SHIFT))
+    {
         return vec![Action::NextSession];
     }
     if km.prev_session.matches(&key) {
         return vec![Action::PrevSession];
+    }
+    if km.prev_subtask.matches(&key) {
+        return vec![Action::PrevSubtask];
+    }
+    if km.next_subtask.matches(&key) {
+        return vec![Action::NextSubtask];
     }
     if km.session_picker.matches(&key) {
         return vec![Action::OpenSessionPicker];
@@ -79,30 +123,66 @@ fn handle_key(app: &App, key: KeyEvent) -> Vec<Action> {
     if km.model_picker.matches(&key) {
         return vec![Action::OpenModelPicker];
     }
-    if km.toggle_agent.matches(&key) {
-        return vec![Action::ToggleAgentMode];
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        if let KeyCode::Char(c @ '1'..='3') = key.code {
+            let index = c.to_digit(10).unwrap_or(1) as usize - 1;
+            if app
+                .sessions
+                .active()
+                .response_suggestions
+                .get(index)
+                .is_some()
+            {
+                return vec![Action::AcceptResponseSuggestion(index)];
+            }
+        }
     }
 
     // ── Overlays take priority over the rest ────────────────────────────
     match &app.overlay {
-        Overlay::Startup(_) => return handle_startup(&key, km),
         Overlay::Picker(_) => return handle_picker(app, &key),
         Overlay::Browser(_) => return handle_browser(&key),
         Overlay::Palette(_) => return handle_palette(&key),
         Overlay::Settings(_) => return handle_settings(&key),
-        Overlay::Permission(_) => return handle_permission(&key),
-        Overlay::Decision(_) => return handle_decision(&key),
+        Overlay::Permission(_) => return handle_permission(app, &key),
+        Overlay::Decision(_) => return handle_decision(app, &key),
         Overlay::Plan(_) => return handle_plan(&key),
         Overlay::ToolRequest(_) => return handle_tool_request(&key),
         Overlay::ApiSetup(_) => return handle_api_setup(&key),
+        Overlay::SubtaskDetail { .. } => {
+            return match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    vec![Action::DismissNotice]
+                }
+                KeyCode::Left | KeyCode::Char('h') => vec![Action::PrevSubtask],
+                KeyCode::Right | KeyCode::Char('l') => vec![Action::NextSubtask],
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::PageUp if !ctrl_pressed(&key) => {
+                    vec![Action::SubtaskDetailUp]
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::PageDown if !ctrl_pressed(&key) => {
+                    vec![Action::SubtaskDetailDown]
+                }
+                KeyCode::Char('k') if ctrl_pressed(&key) => vec![Action::SubtaskDetailUp],
+                KeyCode::Char('j') if ctrl_pressed(&key) => vec![Action::SubtaskDetailDown],
+                _ => Vec::new(),
+            }
+        }
+        Overlay::CommandLine(cl) => return handle_command_line(cl, &key),
         // A notice is a plain "OK" dialog: any key dismisses it.
         Overlay::Notice { .. } => return vec![Action::DismissNotice],
         Overlay::None => {}
     }
 
-    // ── Tab / Shift-Tab cycle sessions ──────────────────────────────────
-    // No overlay is open here (the match above returns for all of them). Skip
-    // while the @mention popup is up, where Tab accepts the highlighted match.
+    // Esc inside an entered child agent walks back up the tree (to its parent,
+    // and eventually the root chat).
+    if app.view_node.is_some() && key.code == KeyCode::Esc {
+        return vec![Action::NavigateBack];
+    }
+
+    // ── Tab / Shift-Tab ────────────────────────────────────────────────
+    // No overlay is open here. In insert mode, plain Tab belongs to the
+    // composer: it accepts the visible ghost suggestion or inserts a tab.
+    // Shift-Tab and non-insert Tab keep session cycling available.
     if !(app.mention.active && !app.mention.matches.is_empty()) {
         if key.code == KeyCode::BackTab
             || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
@@ -110,6 +190,14 @@ fn handle_key(app: &App, key: KeyEvent) -> Vec<Action> {
             return vec![Action::PrevSession];
         }
         if key.code == KeyCode::Tab {
+            if app.vim == VimMode::Insert {
+                if app.input.text().is_empty()
+                    && !app.sessions.active().response_suggestions.is_empty()
+                {
+                    return vec![Action::AcceptResponseSuggestion(0)];
+                }
+                return vec![Action::InsertChar('\t')];
+            }
             return vec![Action::NextSession];
         }
     }
@@ -121,6 +209,9 @@ fn handle_key(app: &App, key: KeyEvent) -> Vec<Action> {
     if km.scroll_down.matches(&key) {
         return vec![Action::ChatPageDown];
     }
+    if km.scroll_bottom.matches(&key) {
+        return vec![Action::ChatBottom];
+    }
     if km.scroll_half_down.matches(&key) {
         return vec![Action::ChatHalfDown];
     }
@@ -130,11 +221,23 @@ fn handle_key(app: &App, key: KeyEvent) -> Vec<Action> {
     if km.scroll_top.matches(&key) {
         return vec![Action::ChatTop];
     }
-    if km.scroll_bottom.matches(&key) {
-        return vec![Action::ChatBottom];
-    }
     if km.toggle_output.matches(&key) {
         return vec![Action::ToggleOutput];
+    }
+
+    // ── Help overlay steals keys while open ──────────────────────────
+    if app.show_help {
+        return match key.code {
+            KeyCode::Esc => vec![Action::HelpBack],
+            KeyCode::Char('q') if !ctrl_pressed(&key) => vec![Action::HelpBack],
+            KeyCode::Char('j') | KeyCode::Down if !ctrl_pressed(&key) => vec![Action::HelpDown],
+            KeyCode::Char('k') | KeyCode::Up if !ctrl_pressed(&key) => vec![Action::HelpUp],
+            KeyCode::PageDown => vec![Action::HelpPageDown],
+            KeyCode::PageUp => vec![Action::HelpPageUp],
+            KeyCode::Enter => vec![Action::HelpSelect],
+            _ if km.help.matches(&key) => vec![Action::ToggleHelp],
+            _ => vec![],
+        };
     }
 
     // ── Vim modes for the input box ─────────────────────────────────────
@@ -150,25 +253,48 @@ fn ctrl_pressed(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-// ── Overlay handlers ──────────────────────────────────────────────────────────
-
-fn handle_startup(key: &KeyEvent, km: &crate::input::keymap::Keymap) -> Vec<Action> {
-    if km.quit.matches(key) {
-        return vec![Action::Quit];
-    }
-    match key.code {
-        KeyCode::Char('j') | KeyCode::Down => vec![Action::StartupDown],
-        KeyCode::Char('k') | KeyCode::Up => vec![Action::StartupUp],
-        KeyCode::Char('n') => vec![Action::StartupNew],
-        KeyCode::Char('l') | KeyCode::Enter | KeyCode::Right => vec![Action::StartupConfirm],
-        // Esc / q dismiss the launcher, resuming the last-active session as loaded.
-        KeyCode::Esc | KeyCode::Char('q') => vec![Action::PickerCancel],
-        _ => vec![],
-    }
+fn ctrl_char(key: &KeyEvent, ch: char) -> bool {
+    ctrl_pressed(key) && key.code == KeyCode::Char(ch)
 }
 
+// ── Overlay handlers ──────────────────────────────────────────────────────────
+
 fn handle_picker(app: &App, key: &KeyEvent) -> Vec<Action> {
+    if ctrl_char(key, 'j') {
+        return vec![Action::PickerDown];
+    }
+    if ctrl_char(key, 'k') {
+        return vec![Action::PickerUp];
+    }
     if let Overlay::Picker(p) = &app.overlay {
+        if p.kind == crate::app::overlay::PickerKind::Access {
+            match key.code {
+                KeyCode::Char('x') | KeyCode::Char('d') if !ctrl_pressed(key) => {
+                    return p
+                        .selected_index()
+                        .and_then(|index| index.checked_sub(1))
+                        .map(Action::RemoveAccessEntry)
+                        .into_iter()
+                        .collect();
+                }
+                KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right if !ctrl_pressed(key) => {
+                    return match p.selected_index() {
+                        Some(0)
+                            if app.config.api.access_review_mode
+                                != crate::config::AccessReviewMode::Off =>
+                        {
+                            vec![Action::DisableAccessReview]
+                        }
+                        Some(0) | None => Vec::new(),
+                        Some(index) => vec![Action::EditAccessEntry(index - 1)],
+                    };
+                }
+                KeyCode::Char('j') if !ctrl_pressed(key) => return vec![Action::PickerDown],
+                KeyCode::Char('k') if !ctrl_pressed(key) => return vec![Action::PickerUp],
+                _ => {}
+            }
+        }
+
         if p.kind == crate::app::overlay::PickerKind::Session {
             match key.code {
                 KeyCode::Char('a') | KeyCode::Char('n') if !ctrl_pressed(key) => {
@@ -185,7 +311,10 @@ fn handle_picker(app: &App, key: &KeyEvent) -> Vec<Action> {
                 // Rename still uses the editable command palette/line: type the new
                 // name after the inserted command and press Enter.
                 KeyCode::Char('r') if !ctrl_pressed(key) && p.selected_index().unwrap_or(0) > 0 => {
-                    return vec![Action::PickerCancel, Action::RunCommand("rename ".to_string())];
+                    return vec![
+                        Action::PickerCancel,
+                        Action::RunCommand("rename ".to_string()),
+                    ];
                 }
                 KeyCode::Char('j') if !ctrl_pressed(key) => return vec![Action::PickerDown],
                 KeyCode::Char('k') if !ctrl_pressed(key) => return vec![Action::PickerUp],
@@ -220,6 +349,12 @@ fn handle_browser(key: &KeyEvent) -> Vec<Action> {
 }
 
 fn handle_palette(key: &KeyEvent) -> Vec<Action> {
+    if ctrl_char(key, 'j') {
+        return vec![Action::PickerDown];
+    }
+    if ctrl_char(key, 'k') {
+        return vec![Action::PickerUp];
+    }
     match key.code {
         KeyCode::Esc => vec![Action::PickerCancel],
         KeyCode::Enter => vec![Action::PickerConfirm],
@@ -234,6 +369,12 @@ fn handle_palette(key: &KeyEvent) -> Vec<Action> {
 }
 
 fn handle_settings(key: &KeyEvent) -> Vec<Action> {
+    if ctrl_char(key, 'j') {
+        return vec![Action::PickerDown];
+    }
+    if ctrl_char(key, 'k') {
+        return vec![Action::PickerUp];
+    }
     match key.code {
         KeyCode::Esc => vec![Action::PickerCancel],
         KeyCode::Enter => vec![Action::PickerConfirm],
@@ -248,6 +389,12 @@ fn handle_settings(key: &KeyEvent) -> Vec<Action> {
 }
 
 fn handle_api_setup(key: &KeyEvent) -> Vec<Action> {
+    if ctrl_char(key, 'j') {
+        return vec![Action::PickerDown];
+    }
+    if ctrl_char(key, 'k') {
+        return vec![Action::PickerUp];
+    }
     match key.code {
         KeyCode::Esc => vec![Action::PickerCancel],
         KeyCode::Enter => vec![Action::PickerConfirm],
@@ -259,16 +406,96 @@ fn handle_api_setup(key: &KeyEvent) -> Vec<Action> {
     }
 }
 
-fn handle_permission(key: &KeyEvent) -> Vec<Action> {
+fn handle_permission(app: &App, key: &KeyEvent) -> Vec<Action> {
+    let selecting =
+        matches!(&app.overlay, Overlay::Permission(r) if r.selecting || r.selecting_folder());
+    if selecting {
+        let folder = matches!(&app.overlay, Overlay::Permission(r) if r.selecting_folder());
+        return match key.code {
+            KeyCode::Esc => vec![Action::AgentPermissionSelectorCancel],
+            KeyCode::Enter | KeyCode::Tab | KeyCode::Char(' ') => {
+                vec![Action::AgentPermissionSelector]
+            }
+            KeyCode::Up | KeyCode::Char('k') if !ctrl_pressed(key) => {
+                vec![Action::PickerUp]
+            }
+            KeyCode::Down | KeyCode::Char('j') if !ctrl_pressed(key) => {
+                vec![Action::PickerDown]
+            }
+            KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h')
+                if folder && !ctrl_pressed(key) =>
+            {
+                vec![Action::AgentPermissionFolderParent]
+            }
+            KeyCode::Right | KeyCode::Char('l') if folder && !ctrl_pressed(key) => {
+                vec![Action::AgentPermissionSelector]
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
+                if !ctrl_pressed(key) =>
+            {
+                if matches!(key.code, KeyCode::Left | KeyCode::Char('h')) {
+                    vec![Action::PickerUp]
+                } else {
+                    vec![Action::PickerDown]
+                }
+            }
+            _ => vec![],
+        };
+    }
+    let custom_editing = matches!(&app.overlay, Overlay::Permission(r) if r.editing_custom);
+    if custom_editing {
+        return match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Tab => vec![Action::AgentPermissionCustom],
+            KeyCode::Backspace => vec![Action::PickerBackspace],
+            KeyCode::Char(c) if !ctrl_pressed(key) => vec![Action::PickerChar(c)],
+            _ => vec![],
+        };
+    }
+    // While the deny reason box is open every printable key is text, so the menu
+    // shortcuts below (a/d/e/p, j/k) must not steal them.
+    if matches!(&app.overlay, Overlay::Permission(r) if r.writing_reason()) {
+        return match key.code {
+            KeyCode::Esc => vec![Action::AgentDenyCancel],
+            KeyCode::Enter => vec![Action::AgentResolvePermission],
+            KeyCode::Backspace => vec![Action::PickerBackspace],
+            KeyCode::Char(c) if !ctrl_pressed(key) => vec![Action::PickerChar(c)],
+            _ => vec![],
+        };
+    }
+    if ctrl_char(key, 'j') {
+        return vec![Action::PickerDown];
+    }
+    if ctrl_char(key, 'k') {
+        return vec![Action::PickerUp];
+    }
     match key.code {
         KeyCode::Esc => vec![Action::AgentCancel],
         // PageUp/PageDown scroll the (possibly long) command list.
         KeyCode::PageUp => vec![Action::AgentPermScrollUp],
         KeyCode::PageDown => vec![Action::AgentPermScrollDown],
-        KeyCode::Up | KeyCode::Char('k') if !ctrl_pressed(key) => vec![Action::PickerUp],
-        KeyCode::Down | KeyCode::Char('j') if !ctrl_pressed(key) => vec![Action::PickerDown],
-        // Enter applies whichever menu option is highlighted.
-        KeyCode::Enter => vec![Action::AgentResolvePermission],
+        KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            vec![Action::AgentPermScrollLeft]
+        }
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            vec![Action::AgentPermScrollRight]
+        }
+        KeyCode::Up | KeyCode::Left | KeyCode::Char('k') | KeyCode::Char('h')
+            if !ctrl_pressed(key) =>
+        {
+            vec![Action::PickerUp]
+        }
+        KeyCode::Down | KeyCode::Right | KeyCode::Char('j') | KeyCode::Char('l')
+            if !ctrl_pressed(key) =>
+        {
+            vec![Action::PickerDown]
+        }
+        KeyCode::Char(' ') if !ctrl_pressed(key) => vec![Action::AgentPermissionSelector],
+        KeyCode::Tab => vec![Action::AgentPermissionCustom],
+        KeyCode::Enter if matches!(&app.overlay, Overlay::Permission(r) if r.editing_access.is_some()) =>
+        {
+            vec![Action::AgentResolvePermission]
+        }
+        KeyCode::Enter => vec![Action::AgentReviewPermission],
         // Quick shortcuts for the common once-off cases, so you don't have to
         // arrow to them: 'a' allow this call, 'd' deny this call, 'e' edit in $EDITOR.
         KeyCode::Char('a') if !ctrl_pressed(key) => vec![Action::AgentQuickAllow],
@@ -281,13 +508,30 @@ fn handle_permission(key: &KeyEvent) -> Vec<Action> {
     }
 }
 
-fn handle_decision(key: &KeyEvent) -> Vec<Action> {
+fn handle_decision(app: &App, key: &KeyEvent) -> Vec<Action> {
+    let editing = matches!(&app.overlay, Overlay::Decision(r) if r.editing_answer());
+    if !editing && ctrl_char(key, 'j') {
+        return vec![Action::PickerDown];
+    }
+    if !editing && ctrl_char(key, 'k') {
+        return vec![Action::PickerUp];
+    }
     match key.code {
         KeyCode::Esc => vec![Action::AgentCancel],
-        KeyCode::Up | KeyCode::Char('k') if !ctrl_pressed(key) => vec![Action::PickerUp],
-        KeyCode::Down | KeyCode::Char('j') if !ctrl_pressed(key) => vec![Action::PickerDown],
-        KeyCode::Char(' ') if !ctrl_pressed(key) => vec![Action::AgentDecisionToggle],
+        KeyCode::Tab => vec![Action::AgentDecisionCustom],
+        KeyCode::Char('e') if !editing && !ctrl_pressed(key) => vec![Action::AgentDecisionEdit],
         KeyCode::Enter => vec![Action::AgentResolveDecision],
+        KeyCode::Backspace if editing => vec![Action::PickerBackspace],
+        KeyCode::Char(c) if editing && !ctrl_pressed(key) => vec![Action::PickerChar(c)],
+        KeyCode::Up | KeyCode::Char('k') if !editing && !ctrl_pressed(key) => {
+            vec![Action::PickerUp]
+        }
+        KeyCode::Down | KeyCode::Char('j') if !editing && !ctrl_pressed(key) => {
+            vec![Action::PickerDown]
+        }
+        KeyCode::Char(' ') if !editing && !ctrl_pressed(key) => {
+            vec![Action::AgentDecisionToggle]
+        }
         _ => vec![],
     }
 }
@@ -301,6 +545,45 @@ fn handle_plan(key: &KeyEvent) -> Vec<Action> {
     }
 }
 
+// ── Command line (vim `:`) ────────────────────────────────────────────────────
+
+fn handle_command_line(cl: &crate::app::overlay::CommandLine, key: &KeyEvent) -> Vec<Action> {
+    match key.code {
+        KeyCode::Esc => vec![Action::PickerCancel],
+        KeyCode::Enter => {
+            if cl.has_completions() {
+                return vec![Action::CommandLineAccept];
+            }
+            let cmd = cl.input.trim();
+            if cmd.is_empty() {
+                return vec![Action::PickerCancel];
+            }
+            vec![Action::PickerCancel, Action::RunCommand(cmd.to_string())]
+        }
+        KeyCode::Backspace => vec![Action::PickerBackspace],
+        KeyCode::Tab => {
+            if cl.has_completions() && cl.filtered.len() > 1 {
+                vec![Action::CommandLineNext]
+            } else if cl.filtered.len() == 1 {
+                vec![Action::CommandLineAccept]
+            } else {
+                vec![Action::PickerChar('\t')]
+            }
+        }
+        KeyCode::BackTab => {
+            if cl.has_completions() && cl.filtered.len() > 1 {
+                vec![Action::CommandLinePrev]
+            } else {
+                vec![]
+            }
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            vec![Action::PickerChar(c)]
+        }
+        _ => vec![],
+    }
+}
+
 // ── Vim mode handlers (input box only) ─────────────────────────────────────────
 
 fn handle_normal(app: &App, key: &KeyEvent) -> Vec<Action> {
@@ -309,9 +592,9 @@ fn handle_normal(app: &App, key: &KeyEvent) -> Vec<Action> {
     if km.insert.matches(key) {
         return vec![Action::EnterInsert];
     }
-    // `:` and `/` both open the command palette overlay (no separate command mode).
+    // `:` and `/` are normal-mode commands only.
     if km.command.matches(key) {
-        return vec![Action::OpenCommandPalette];
+        return vec![Action::OpenCommandLine];
     }
     if km.palette.matches(key) {
         return vec![Action::OpenCommandPalette];
@@ -331,11 +614,13 @@ fn handle_normal(app: &App, key: &KeyEvent) -> Vec<Action> {
         KeyCode::Esc => vec![],
         KeyCode::Char('V') => vec![Action::EnterVisualLine],
         KeyCode::Char('I') => vec![Action::LineStart, Action::EnterInsert],
-        KeyCode::Char('a') => vec![Action::Move(Dir::Right), Action::EnterInsert],
+        // EnterInsert must precede Move(Right): in normal mode Move clamps the
+        // cursor to a character, which would block appending at end of line.
+        KeyCode::Char('a') => vec![Action::EnterInsert, Action::Move(Dir::Right)],
         KeyCode::Char('A') => vec![
             Action::LineEnd,
-            Action::Move(Dir::Right),
             Action::EnterInsert,
+            Action::Move(Dir::Right),
         ],
         KeyCode::Char('o') => vec![Action::OpenLineBelow],
         KeyCode::Char('O') => vec![Action::OpenLineAbove],
@@ -350,6 +635,7 @@ fn handle_normal(app: &App, key: &KeyEvent) -> Vec<Action> {
         KeyCode::Char('^') => vec![Action::FirstNonBlank],
         KeyCode::Char('$') => vec![Action::LineEnd],
         KeyCode::Char('x') => vec![Action::DeleteAt],
+        KeyCode::Char('s') => vec![Action::DeleteAt, Action::EnterInsert],
         KeyCode::Char('d') => vec![Action::EnterOperator('d')],
         KeyCode::Char('c') => vec![Action::EnterOperator('c')],
         KeyCode::Char('y') => vec![Action::EnterOperator('y')],
@@ -364,9 +650,14 @@ fn handle_normal(app: &App, key: &KeyEvent) -> Vec<Action> {
     }
 }
 
+fn single_visual_input_row(app: &App) -> bool {
+    crate::app::input_layout::layout(&app.input.lines, app.input.width).len() <= 1
+}
+
 fn handle_insert(app: &App, key: &KeyEvent) -> Vec<Action> {
     // Newline chords must win even when popups/keymaps also handle Enter.
-    // Some terminals report Shift+Enter as Enter+SHIFT; others send a literal \n.
+    // Some terminals report Shift+Enter as Enter+SHIFT; others send a literal
+    // \n or \r (depending on their terminal/kitty-protocol configuration).
     if key.code == KeyCode::Enter
         && key
             .modifiers
@@ -383,6 +674,8 @@ fn handle_insert(app: &App, key: &KeyEvent) -> Vec<Action> {
         match key.code {
             KeyCode::Up => return vec![Action::MentionUp],
             KeyCode::Down => return vec![Action::MentionDown],
+            KeyCode::Char('k') if ctrl_char(key, 'k') => return vec![Action::MentionUp],
+            KeyCode::Char('j') if ctrl_char(key, 'j') => return vec![Action::MentionDown],
             KeyCode::Tab | KeyCode::Enter => return vec![Action::MentionAccept],
             KeyCode::Esc => return vec![Action::MentionCancel],
             _ => {}
@@ -401,15 +694,24 @@ fn handle_insert(app: &App, key: &KeyEvent) -> Vec<Action> {
     // Word delete: Ctrl-W / Ctrl-Backspace (back), Ctrl-Delete (forward).
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-    // Portable newline fallback. Shift/Alt/Ctrl+Enter only reach us when the
-    // terminal speaks the kitty keyboard protocol (breaks under tmux / plain
-    // xterm), so Ctrl-J — the canonical LF chord — is always available to insert a
-    // newline without submitting, whatever the terminal.
-    if ctrl && key.code == KeyCode::Char('r') {
-        return vec![Action::RedoInput];
+    // Ctrl-K/Ctrl-J mirror Up/Down wherever the composer supports vertical
+    // movement: history in a single-line draft, cursor movement in multiline text.
+    if ctrl && key.code == KeyCode::Char('k') {
+        return if single_visual_input_row(app) {
+            vec![Action::InputHistoryPrev]
+        } else {
+            vec![Action::Move(Dir::Up)]
+        };
     }
     if ctrl && key.code == KeyCode::Char('j') {
-        return vec![Action::Newline];
+        return if single_visual_input_row(app) {
+            vec![Action::InputHistoryNext]
+        } else {
+            vec![Action::Move(Dir::Down)]
+        };
+    }
+    if ctrl && key.code == KeyCode::Char('r') {
+        return vec![Action::RedoInput];
     }
     if ctrl && matches!(key.code, KeyCode::Backspace) {
         return vec![Action::DeleteWordBack];
@@ -422,7 +724,7 @@ fn handle_insert(app: &App, key: &KeyEvent) -> Vec<Action> {
     }
 
     // Enter sends the message (same as :w); Shift/Alt/Ctrl+Enter inserts a newline
-    // (kitty-protocol terminals only — Ctrl-J above is the portable fallback).
+    // on terminals that report modified Enter distinctly.
     if key.code == KeyCode::Enter {
         let newline = key
             .modifiers
@@ -443,8 +745,8 @@ fn handle_insert(app: &App, key: &KeyEvent) -> Vec<Action> {
         KeyCode::Delete => vec![Action::DeleteAt],
         // Single-line composer: Up/Down recall sent-message history (shell style).
         // Multi-line: they move the cursor between lines.
-        KeyCode::Up if app.input.lines.len() <= 1 => vec![Action::InputHistoryPrev],
-        KeyCode::Down if app.input.lines.len() <= 1 => vec![Action::InputHistoryNext],
+        KeyCode::Up if single_visual_input_row(app) => vec![Action::InputHistoryPrev],
+        KeyCode::Down if single_visual_input_row(app) => vec![Action::InputHistoryNext],
         KeyCode::Up => vec![Action::Move(Dir::Up)],
         KeyCode::Down => vec![Action::Move(Dir::Down)],
         KeyCode::Left => vec![Action::Move(Dir::Left)],
@@ -531,15 +833,32 @@ fn chord_escapes(chord: Option<(char, char)>, last_insert: Option<char>, key: Ke
 // ── Mouse handler ─────────────────────────────────────────────────────────────
 
 fn handle_mouse(app: &App, mouse: MouseEvent) -> Vec<Action> {
-    // While the permission prompt is open the wheel scrolls its command list.
+    // While a scrollable overlay is open the wheel belongs to that overlay.
     let perm_open = matches!(app.overlay, Overlay::Permission(_));
+    let subtask_open = matches!(app.overlay, Overlay::SubtaskDetail { .. });
+    let over_sidebar_tasks = app.layout.sidebar_tasks.is_some_and(|area| {
+        mouse.column >= area.x
+            && mouse.column < area.x + area.width
+            && mouse.row >= area.y
+            && mouse.row < area.y + area.height
+    });
     match mouse.kind {
         MouseEventKind::ScrollUp if perm_open => vec![Action::AgentPermScrollUp],
         MouseEventKind::ScrollDown if perm_open => vec![Action::AgentPermScrollDown],
+        MouseEventKind::ScrollUp if subtask_open => vec![Action::SubtaskDetailUp],
+        MouseEventKind::ScrollDown if subtask_open => vec![Action::SubtaskDetailDown],
+        MouseEventKind::ScrollUp if over_sidebar_tasks => vec![Action::SidebarTaskScroll(-3)],
+        MouseEventKind::ScrollDown if over_sidebar_tasks => vec![Action::SidebarTaskScroll(3)],
         MouseEventKind::ScrollUp => vec![Action::ChatScroll(3)],
         MouseEventKind::ScrollDown => vec![Action::ChatScroll(-3)],
         MouseEventKind::Down(MouseButton::Left) => {
             vec![Action::ChatClick(mouse.column, mouse.row)]
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            vec![Action::ChatDrag(mouse.column, mouse.row)]
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            vec![Action::ChatRelease]
         }
         _ => vec![],
     }
@@ -560,10 +879,215 @@ mod tests {
         }
     }
 
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            modifiers,
+            ..key(code)
+        }
+    }
+
+    fn ctrl_key(code: KeyCode) -> KeyEvent {
+        modified_key(code, KeyModifiers::CONTROL)
+    }
+
     fn test_app() -> App {
         let mut app = App::new(Config::default()).unwrap();
+        app.overlay = Overlay::None;
         app.vim = VimMode::Insert;
         app
+    }
+
+    #[test]
+    fn shifted_printable_keys_are_normalized_before_insert() {
+        let app = test_app();
+
+        let capital = handle_event(
+            &app,
+            Event::Key(modified_key(KeyCode::Char('a'), KeyModifiers::SHIFT)),
+        );
+        let colon = handle_event(
+            &app,
+            Event::Key(modified_key(KeyCode::Char(';'), KeyModifiers::SHIFT)),
+        );
+        let symbol = handle_event(
+            &app,
+            Event::Key(modified_key(KeyCode::Char('1'), KeyModifiers::SHIFT)),
+        );
+
+        assert!(matches!(capital.as_slice(), [Action::InsertChar('A')]));
+        assert!(matches!(colon.as_slice(), [Action::InsertChar(':')]));
+        assert!(matches!(symbol.as_slice(), [Action::InsertChar('!')]));
+    }
+
+    #[test]
+    fn already_shifted_characters_are_left_unchanged() {
+        let app = test_app();
+
+        let actions = handle_event(
+            &app,
+            Event::Key(modified_key(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+        );
+
+        assert!(matches!(actions.as_slice(), [Action::InsertChar('A')]));
+    }
+
+    #[test]
+    fn normal_mode_a_and_capital_a_enter_insert_then_move() {
+        let mut app = test_app();
+        app.vim = VimMode::Normal;
+
+        let small = handle_event(&app, Event::Key(key(KeyCode::Char('a'))));
+        assert!(matches!(
+            small.as_slice(),
+            [Action::EnterInsert, Action::Move(Dir::Right)]
+        ));
+
+        let capital = handle_event(&app, Event::Key(key(KeyCode::Char('A'))));
+        assert!(matches!(
+            capital.as_slice(),
+            [
+                Action::LineEnd,
+                Action::EnterInsert,
+                Action::Move(Dir::Right)
+            ]
+        ));
+    }
+
+    #[test]
+    fn ctrl_shift_d_jumps_to_bottom_while_ctrl_d_keeps_half_scroll() {
+        let app = test_app();
+        assert!(matches!(
+            handle_key(
+                &app,
+                modified_key(
+                    KeyCode::Char('d'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                ),
+            )
+            .as_slice(),
+            [Action::ChatBottom]
+        ));
+        assert!(matches!(
+            handle_key(&app, ctrl_key(KeyCode::Char('d'))).as_slice(),
+            [Action::ChatHalfDown]
+        ));
+        assert!(!matches!(
+            handle_key(&app, ctrl_key(KeyCode::End)).as_slice(),
+            [Action::ChatBottom]
+        ));
+    }
+
+    #[test]
+    fn slash_and_colon_commands_only_open_in_normal_mode() {
+        let mut app = test_app();
+
+        assert!(matches!(
+            handle_key(&app, key(KeyCode::Char('/'))).as_slice(),
+            [Action::InsertChar('/')]
+        ));
+        assert!(matches!(
+            handle_key(&app, key(KeyCode::Char(':'))).as_slice(),
+            [Action::InsertChar(':')]
+        ));
+
+        app.vim = VimMode::Normal;
+        assert!(matches!(
+            handle_key(&app, key(KeyCode::Char('/'))).as_slice(),
+            [Action::OpenCommandPalette]
+        ));
+        assert!(matches!(
+            handle_key(&app, key(KeyCode::Char(':'))).as_slice(),
+            [Action::OpenCommandLine]
+        ));
+    }
+
+    #[test]
+    fn shift_enter_event_inserts_newline_in_insert_mode() {
+        let app = test_app();
+
+        let actions = handle_event(
+            &app,
+            Event::Key(modified_key(KeyCode::Enter, KeyModifiers::SHIFT)),
+        );
+
+        assert!(matches!(actions.as_slice(), [Action::Newline]));
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_in_insert_mode() {
+        let app = test_app();
+
+        let actions = handle_key(&app, modified_key(KeyCode::Enter, KeyModifiers::SHIFT));
+
+        assert!(matches!(actions.as_slice(), [Action::Newline]));
+    }
+
+    #[test]
+    fn arrows_move_within_a_wrapped_single_line_instead_of_recalling_history() {
+        let mut app = test_app();
+        app.input.set_width(4);
+        app.input.set_text("abcdefgh");
+        app.input.col = 6;
+
+        assert!(matches!(
+            handle_insert(&app, &key(KeyCode::Up)).as_slice(),
+            [Action::Move(Dir::Up)]
+        ));
+        assert!(matches!(
+            handle_insert(&app, &key(KeyCode::Down)).as_slice(),
+            [Action::Move(Dir::Down)]
+        ));
+    }
+
+    #[test]
+    fn plain_enter_submits_in_insert_mode() {
+        let app = test_app();
+
+        let actions = handle_key(&app, key(KeyCode::Enter));
+
+        assert!(matches!(actions.as_slice(), [Action::Submit]));
+    }
+
+    #[test]
+    fn tab_accepts_first_suggestion_in_empty_insert_composer() {
+        let mut app = test_app();
+        app.sessions.active_mut().response_suggestions = vec!["Run the tests".into()];
+
+        let actions = handle_key(&app, key(KeyCode::Tab));
+
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::AcceptResponseSuggestion(0)]
+        ));
+    }
+
+    #[test]
+    fn tab_inserts_tab_without_a_visible_suggestion() {
+        let app = test_app();
+
+        let actions = handle_key(&app, key(KeyCode::Tab));
+
+        assert!(matches!(actions.as_slice(), [Action::InsertChar('\t')]));
+    }
+
+    #[test]
+    fn ctrl_j_and_ctrl_k_navigate_command_palette() {
+        assert!(matches!(
+            handle_palette(&ctrl_key(KeyCode::Char('j'))).as_slice(),
+            [Action::PickerDown]
+        ));
+        assert!(matches!(
+            handle_palette(&ctrl_key(KeyCode::Char('k'))).as_slice(),
+            [Action::PickerUp]
+        ));
+    }
+
+    #[test]
+    fn plain_j_remains_search_text_in_command_palette() {
+        assert!(matches!(
+            handle_palette(&key(KeyCode::Char('j'))).as_slice(),
+            [Action::PickerChar('j')]
+        ));
     }
 
     #[test]
@@ -573,7 +1097,10 @@ mod tests {
 
         let actions = handle_insert(&app, &key(KeyCode::Char('k')));
 
-        assert!(matches!(actions.as_slice(), [Action::Backspace, Action::EnterNormal]));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::Backspace, Action::EnterNormal]
+        ));
     }
 
     #[test]
@@ -586,7 +1113,10 @@ mod tests {
 
         let actions = handle_insert(&app, &key(KeyCode::Char('d')));
 
-        assert!(matches!(actions.as_slice(), [Action::Backspace, Action::EnterNormal]));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::Backspace, Action::EnterNormal]
+        ));
     }
 
     #[test]
@@ -607,6 +1137,126 @@ mod tests {
             KeyCode::Char('k')
         ));
         assert!(!chord_escapes(Some(('j', 'k')), None, KeyCode::Char('k')));
+    }
+
+    #[test]
+    fn permission_enter_uses_automated_review_while_deny_reason_enter_resolves() {
+        let mut app = test_app();
+        app.overlay = Overlay::Permission(crate::app::overlay::PermissionRequest::single(
+            crate::agent::ToolCall {
+                name: "read".into(),
+                args: serde_json::json!({ "path": "README.md" }),
+                id: None,
+            },
+        ));
+        assert!(matches!(
+            handle_permission(&app, &key(KeyCode::Enter)).as_slice(),
+            [Action::AgentReviewPermission]
+        ));
+
+        if let Overlay::Permission(request) = &mut app.overlay {
+            request.begin_deny(crate::agent::Permission::Deny);
+        }
+        assert!(matches!(
+            handle_permission(&app, &key(KeyCode::Enter)).as_slice(),
+            [Action::AgentResolvePermission]
+        ));
+    }
+
+    #[test]
+    fn editing_access_entry_enter_saves_without_model_review() {
+        let mut app = test_app();
+        app.overlay = Overlay::Permission(crate::app::overlay::PermissionRequest::single(
+            crate::agent::ToolCall {
+                name: "read".into(),
+                args: serde_json::json!({ "path": "README.md" }),
+                id: None,
+            },
+        ));
+        if let Overlay::Permission(request) = &mut app.overlay {
+            request.editing_access = Some(0);
+        }
+
+        assert!(matches!(
+            handle_permission(&app, &key(KeyCode::Enter)).as_slice(),
+            [Action::AgentResolvePermission]
+        ));
+    }
+
+    #[test]
+    fn folder_picker_h_and_left_navigate_to_parent() {
+        let mut app = test_app();
+        app.overlay = Overlay::Permission(crate::app::overlay::PermissionRequest::single(
+            crate::agent::ToolCall {
+                name: "read".into(),
+                args: serde_json::json!({ "path": "README.md" }),
+                id: None,
+            },
+        ));
+        if let Overlay::Permission(request) = &mut app.overlay {
+            request.folder_picker = Some(crate::app::overlay::FolderPicker::open(
+                std::env::current_dir().unwrap(),
+            ));
+        }
+
+        for code in [KeyCode::Char('h'), KeyCode::Left, KeyCode::Backspace] {
+            assert!(matches!(
+                handle_permission(&app, &key(code)).as_slice(),
+                [Action::AgentPermissionFolderParent]
+            ));
+        }
+    }
+
+    #[test]
+    fn permission_quick_actions_remain_independent() {
+        let mut app = test_app();
+        app.overlay = Overlay::Permission(crate::app::overlay::PermissionRequest::single(
+            crate::agent::ToolCall {
+                name: "shell".into(),
+                args: serde_json::json!({ "command": "cargo test" }),
+                id: None,
+            },
+        ));
+        assert!(matches!(
+            handle_permission(&app, &key(KeyCode::Char('a'))).as_slice(),
+            [Action::AgentQuickAllow]
+        ));
+        assert!(matches!(
+            handle_permission(&app, &key(KeyCode::Char('d'))).as_slice(),
+            [Action::AgentQuickDeny]
+        ));
+        assert!(matches!(
+            handle_permission(&app, &key(KeyCode::Char('e'))).as_slice(),
+            [Action::AgentPermissionEdit]
+        ));
+        assert!(matches!(
+            handle_permission(&app, &key(KeyCode::Char('p'))).as_slice(),
+            [Action::AgentEditPolicy]
+        ));
+    }
+
+    #[test]
+    fn permission_shift_arrows_scroll_code_horizontally() {
+        let mut app = test_app();
+        app.overlay = Overlay::Permission(crate::app::overlay::PermissionRequest::single(
+            crate::agent::ToolCall {
+                name: "edit".into(),
+                args: serde_json::json!({
+                    "path": "src/main.rs",
+                    "old": "fn old() {}",
+                    "new": "fn new() {}",
+                }),
+                id: None,
+            },
+        ));
+        assert!(matches!(
+            handle_permission(&app, &modified_key(KeyCode::Left, KeyModifiers::SHIFT)).as_slice(),
+            [Action::AgentPermScrollLeft]
+        ));
+        assert!(matches!(
+            handle_permission(&app, &modified_key(KeyCode::Right, KeyModifiers::SHIFT)).as_slice(),
+            [Action::AgentPermScrollRight]
+        ));
     }
 
     #[test]

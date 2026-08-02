@@ -12,6 +12,11 @@ pub struct InputBuffer {
     pub visual_anchor: Option<(usize, usize)>,
     /// Line-wise visual mode (`V`): the selection always spans whole lines.
     pub visual_line: bool,
+    /// Preferred terminal cell for repeated visual j/k movement. It survives
+    /// vertical moves across short rows and is reset by edits/horizontal motions.
+    preferred_visual_col: Option<usize>,
+    /// Display width of the input box. Used for visual-line (wrapped) j/k navigation.
+    pub width: usize,
 }
 
 impl Default for InputBuffer {
@@ -22,6 +27,8 @@ impl Default for InputBuffer {
             col: 0,
             visual_anchor: None,
             visual_line: false,
+            preferred_visual_col: None,
+            width: 80,
         }
     }
 }
@@ -35,6 +42,10 @@ fn ordered_bounds(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usi
 }
 
 impl InputBuffer {
+    pub(crate) fn reset_visual_goal(&mut self) {
+        self.preferred_visual_col = None;
+    }
+
     pub fn text(&self) -> String {
         self.lines.join("\n")
     }
@@ -334,10 +345,14 @@ impl InputBuffer {
         self.lines[self.row].replace_range(from..to, "");
     }
 
-    pub fn delete_at(&mut self) {
+    pub fn delete_at(&mut self) -> Option<char> {
         if self.col < self.line_chars(self.row) {
             let b = Self::byte_idx(&self.lines[self.row], self.col);
+            let c = self.lines[self.row][b..].chars().next();
             self.lines[self.row].remove(b);
+            c
+        } else {
+            None
         }
     }
 
@@ -383,17 +398,47 @@ impl InputBuffer {
             self.col = 0;
         }
     }
-    pub fn up(&mut self) {
-        if self.row > 0 {
-            self.row -= 1;
-            self.col = self.col.min(self.line_chars(self.row));
+    pub fn set_width(&mut self, width: usize) {
+        self.width = width.max(1);
+    }
+
+    fn visual_position(&self) -> (Vec<crate::app::input_layout::VisualLine>, usize, usize) {
+        let visual = crate::app::input_layout::layout(&self.lines, self.width);
+        let (row, cell) = crate::app::input_layout::cursor(&visual, self.row, self.col);
+        (visual, row, cell)
+    }
+
+    fn move_vertical(&mut self, direction: i32, allow_line_end: bool) {
+        let (visual, row, current_cell) = self.visual_position();
+        let cell = self.preferred_visual_col.unwrap_or(current_cell);
+        let Some(target_row) = row.checked_add_signed(direction as isize) else {
+            return;
+        };
+        let Some(target) = visual.get(target_row) else {
+            return;
+        };
+        self.preferred_visual_col = Some(cell);
+        self.row = target.logical_row;
+        self.col = crate::app::input_layout::offset_at_cell(target, cell);
+        if !allow_line_end && self.col == target.end && target.end > target.start {
+            self.col -= 1;
         }
     }
+
+    pub fn up(&mut self) {
+        self.move_vertical(-1, true);
+    }
+
     pub fn down(&mut self) {
-        if self.row + 1 < self.lines.len() {
-            self.row += 1;
-            self.col = self.col.min(self.line_chars(self.row));
-        }
+        self.move_vertical(1, true);
+    }
+
+    pub fn up_normal(&mut self) {
+        self.move_vertical(-1, false);
+    }
+
+    pub fn down_normal(&mut self) {
+        self.move_vertical(1, false);
     }
     pub fn line_start(&mut self) {
         self.col = 0;
@@ -406,49 +451,101 @@ impl InputBuffer {
         self.col = self.line_chars(self.row).saturating_sub(1);
     }
 
-    pub fn word_forward(&mut self) {
-        let chars: Vec<char> = self.lines[self.row].chars().collect();
-        let mut c = self.col;
-        while c < chars.len() && !chars[c].is_whitespace() {
-            c += 1;
-        }
-        while c < chars.len() && chars[c].is_whitespace() {
-            c += 1;
-        }
-        self.col = c;
+    fn flat_chars(&self) -> Vec<char> {
+        self.text().chars().collect()
     }
+
+    fn flat_index(&self) -> usize {
+        self.lines
+            .iter()
+            .take(self.row)
+            .map(|line| line.chars().count() + 1)
+            .sum::<usize>()
+            + self.col
+    }
+
+    fn set_flat_index(&mut self, mut index: usize) {
+        for (row, line) in self.lines.iter().enumerate() {
+            let len = line.chars().count();
+            if index <= len {
+                self.row = row;
+                self.col = index;
+                return;
+            }
+            index = index.saturating_sub(len + 1);
+        }
+        self.row = self.lines.len().saturating_sub(1);
+        self.col = self.line_chars(self.row);
+    }
+
+    fn word_class(ch: char) -> u8 {
+        if ch.is_whitespace() {
+            0
+        } else if ch.is_alphanumeric() || ch == '_' {
+            1
+        } else {
+            2
+        }
+    }
+
+    pub fn word_forward(&mut self) {
+        let chars = self.flat_chars();
+        let mut index = self.flat_index().min(chars.len());
+        if index >= chars.len() {
+            return;
+        }
+        let class = Self::word_class(chars[index]);
+        if class != 0 {
+            while index < chars.len() && Self::word_class(chars[index]) == class {
+                index += 1;
+            }
+        }
+        while index < chars.len() && Self::word_class(chars[index]) == 0 {
+            index += 1;
+        }
+        self.set_flat_index(index);
+    }
+
     pub fn word_end(&mut self) {
-        let chars: Vec<char> = self.lines[self.row].chars().collect();
+        let chars = self.flat_chars();
         if chars.is_empty() {
+            self.row = 0;
             self.col = 0;
             return;
         }
-        let mut c = (self.col + 1).min(chars.len() - 1);
-        while c < chars.len() && chars[c].is_whitespace() {
-            c += 1;
+        let mut index = self.flat_index().min(chars.len().saturating_sub(1));
+        if Self::word_class(chars[index]) != 0 {
+            index = (index + 1).min(chars.len().saturating_sub(1));
         }
-        if c >= chars.len() {
-            self.col = chars.len() - 1;
+        while index < chars.len() && Self::word_class(chars[index]) == 0 {
+            index += 1;
+        }
+        if index >= chars.len() {
+            self.set_flat_index(chars.len().saturating_sub(1));
             return;
         }
-        while c + 1 < chars.len() && !chars[c + 1].is_whitespace() {
-            c += 1;
+        let class = Self::word_class(chars[index]);
+        while index + 1 < chars.len() && Self::word_class(chars[index + 1]) == class {
+            index += 1;
         }
-        self.col = c;
+        self.set_flat_index(index);
     }
+
     pub fn word_backward(&mut self) {
-        let chars: Vec<char> = self.lines[self.row].chars().collect();
-        if self.col == 0 {
+        let chars = self.flat_chars();
+        let mut index = self.flat_index().min(chars.len());
+        if index == 0 || chars.is_empty() {
             return;
         }
-        let mut c = self.col - 1;
-        while c > 0 && chars[c].is_whitespace() {
-            c -= 1;
+        index -= 1;
+        while index > 0 && Self::word_class(chars[index]) == 0 {
+            index -= 1;
         }
-        while c > 0 && !chars[c - 1].is_whitespace() {
-            c -= 1;
+        let class = Self::word_class(chars[index]);
+        while index > 0 && Self::word_class(chars[index - 1]) == class {
+            index -= 1;
         }
-        self.col = c;
+        self.set_flat_index(index);
     }
 
     /// Clamp the cursor for normal mode (rests on a character, not past the end).
@@ -562,6 +659,56 @@ mod tests {
         b.col = 5;
         b.backspace();
         assert_eq!(b.text(), "héll");
+    }
+
+    #[test]
+    fn vertical_motion_preserves_cell_across_wrapped_rows_and_lines() {
+        let mut b = InputBuffer::default();
+        b.set_width(3);
+        b.set_text("abcdef\nxy");
+        b.row = 0;
+        b.col = 1;
+        b.down();
+        assert_eq!((b.row, b.col), (0, 4));
+        b.down();
+        assert_eq!((b.row, b.col), (1, 1));
+        b.up();
+        assert_eq!((b.row, b.col), (0, 4));
+        b.up();
+        assert_eq!((b.row, b.col), (0, 1));
+    }
+
+    #[test]
+    fn repeated_vertical_motion_retains_column_through_a_short_row() {
+        let mut b = InputBuffer::default();
+        b.set_width(10);
+        b.set_text("abcde\nx\nvwxyz");
+        b.row = 0;
+        b.col = 4;
+        b.down();
+        assert_eq!((b.row, b.col), (1, 1));
+        b.down();
+        assert_eq!((b.row, b.col), (2, 4));
+        b.up();
+        assert_eq!((b.row, b.col), (1, 1));
+        b.up();
+        assert_eq!((b.row, b.col), (0, 4));
+    }
+
+    #[test]
+    fn word_motions_cross_lines_and_split_punctuation_runs() {
+        let mut b = InputBuffer::default();
+        b.set_text("foo.bar\nbaz");
+        b.row = 0;
+        b.col = 0;
+        b.word_forward();
+        assert_eq!((b.row, b.col), (0, 3));
+        b.word_forward();
+        assert_eq!((b.row, b.col), (0, 4));
+        b.word_forward();
+        assert_eq!((b.row, b.col), (1, 0));
+        b.word_backward();
+        assert_eq!((b.row, b.col), (0, 4));
     }
 
     #[test]

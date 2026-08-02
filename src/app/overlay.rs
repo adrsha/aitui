@@ -4,13 +4,17 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use crate::agent::{Permission, PermissionMemory, ToolCall, ToolKind};
+use crate::agent::{
+    normalize_lexical, Permission, PermissionDecision, PermissionLifetime, PermissionMemory,
+    PermissionRuleDraft, ToolCall, ToolKind,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
     Model,
     Session,
     Skill,
+    Access,
 }
 
 // ── Vim-navigable file browser ────────────────────────────────────────────────
@@ -29,6 +33,117 @@ pub struct FileEntry {
     pub name: String,
     pub is_dir: bool,
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderPicker {
+    pub dir: PathBuf,
+    pub entries: Vec<FileEntry>,
+    pub cursor: usize,
+}
+
+/// One row of the folder picker, rendered by the UI.
+pub enum FolderRow {
+    /// Navigate to the parent directory.
+    Parent,
+    /// Descend into a subdirectory.
+    Directory(FileEntry),
+    /// Choose the current directory, non-recursive (`*`).
+    Glob,
+    /// Choose the current directory recursively (`**`).
+    GlobRecursive,
+}
+
+impl FolderPicker {
+    pub fn open(dir: PathBuf) -> Self {
+        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+        let entries = read_entries(&dir)
+            .into_iter()
+            .filter(|entry| entry.is_dir)
+            .collect();
+        Self {
+            dir,
+            entries,
+            cursor: 0,
+        }
+    }
+
+    /// Rows: `..` (when a parent exists), subdirectories, then the `*` and `**`
+    /// glob options for the current directory.
+    pub fn option_count(&self) -> usize {
+        self.entries.len() + 2 + usize::from(self.has_parent())
+    }
+
+    pub fn row(&self, index: usize) -> Option<FolderRow> {
+        let mut row = 0usize;
+        if self.has_parent() {
+            if index == 0 {
+                return Some(FolderRow::Parent);
+            }
+            row = 1;
+        }
+        if let Some(entry) = self.entries.get(index.saturating_sub(row)) {
+            return Some(FolderRow::Directory(entry.clone()));
+        }
+        match index.saturating_sub(self.entries.len() + row) {
+            0 => Some(FolderRow::Glob),
+            1 => Some(FolderRow::GlobRecursive),
+            _ => None,
+        }
+    }
+
+    pub fn has_parent(&self) -> bool {
+        self.dir.parent().is_some()
+    }
+
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.option_count() {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// Navigate or choose. `None` means the picker stays open (moved up or
+    /// descended); `Some((dir, recursive))` is a confirmed glob choice.
+    pub fn enter(&mut self) -> Option<(PathBuf, bool)> {
+        match self.row(self.cursor) {
+            Some(FolderRow::Parent) => {
+                self.parent();
+                None
+            }
+            Some(FolderRow::Directory(entry)) => {
+                self.set_dir(entry.path);
+                None
+            }
+            Some(FolderRow::Glob) => Some((self.dir.clone(), false)),
+            Some(FolderRow::GlobRecursive) => Some((self.dir.clone(), true)),
+            None => None,
+        }
+    }
+
+    fn parent(&mut self) {
+        if let Some(parent) = self.dir.parent().map(|p| p.to_path_buf()) {
+            let from = self.dir.clone();
+            let previous = self.dir.clone();
+            self.set_dir(parent);
+            // Land the cursor on the directory we came from.
+            if let Some(i) = self.entries.iter().position(|e| e.path == from) {
+                self.cursor = i + usize::from(previous.parent().is_some());
+            }
+        }
+    }
+
+    fn set_dir(&mut self, dir: PathBuf) {
+        self.dir = dir;
+        self.entries = read_entries(&self.dir)
+            .into_iter()
+            .filter(|entry| entry.is_dir)
+            .collect();
+        self.cursor = 0;
+    }
 }
 
 /// A directory browser navigated with vim keys (h/j/k/l), with space to
@@ -210,6 +325,18 @@ impl Picker {
         }
     }
 
+    pub fn access(items: Vec<String>) -> Self {
+        let filtered = (0..items.len()).collect();
+        Self {
+            kind: PickerKind::Access,
+            query: String::new(),
+            items,
+            filtered,
+            selected: 0,
+            dir: PathBuf::new(),
+        }
+    }
+
     /// The original (unfiltered) index of the current selection.
     pub fn selected_index(&self) -> Option<usize> {
         self.filtered.get(self.selected).copied()
@@ -286,7 +413,9 @@ impl Palette {
             .and_then(|&i| slash_commands().get(i).copied())
     }
     pub fn up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        if self.selected > 0 {
+            self.selected = self.selected.saturating_sub(1);
+        }
     }
     pub fn down(&mut self) {
         if self.selected + 1 < self.filtered.len() {
@@ -297,18 +426,22 @@ impl Palette {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsRow {
-    AgentDefault,
     AutoApprove,
+    AccessReview,
     InputHeight,
+    ReasoningEffort,
+    ReasoningMode,
     SystemPrompt,
 }
 
 impl SettingsRow {
-    pub fn all() -> [SettingsRow; 4] {
+    pub fn all() -> [SettingsRow; 6] {
         [
-            SettingsRow::AgentDefault,
             SettingsRow::AutoApprove,
+            SettingsRow::AccessReview,
             SettingsRow::InputHeight,
+            SettingsRow::ReasoningEffort,
+            SettingsRow::ReasoningMode,
             SettingsRow::SystemPrompt,
         ]
     }
@@ -317,18 +450,119 @@ impl SettingsRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub selected: usize,
-    pub editing_prompt: bool,
-    pub prompt_buf: String,
+    pub editing: bool,
+    pub edit_buf: String,
+}
+
+/// Vim-style `:` command line — simple text input, no filtering/suggestions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandLine {
+    pub input: String,
+    pub filtered: Vec<usize>,
+    pub selected: usize,
+}
+
+impl CommandLine {
+    pub fn new() -> Self {
+        Self {
+            input: String::new(),
+            filtered: Vec::new(),
+            selected: 0,
+        }
+    }
+    pub fn push(&mut self, c: char) {
+        self.input.push(c);
+        self.refilter();
+    }
+    pub fn pop(&mut self) {
+        self.input.pop();
+        self.refilter();
+    }
+    pub fn refilter(&mut self) {
+        let first_word = self
+            .input
+            .split_once(' ')
+            .map(|(w, _)| w)
+            .unwrap_or(&self.input);
+        if first_word.is_empty() {
+            self.filtered = (0..crate::app::commands::COMMAND_DOCS.len()).collect();
+        } else {
+            let q = first_word.to_lowercase();
+            self.filtered = crate::app::commands::COMMAND_DOCS
+                .iter()
+                .enumerate()
+                .filter(|(_, doc)| doc.name.contains(&q) || doc.aliases.to_lowercase().contains(&q))
+                .map(|(i, _)| i)
+                .collect();
+        }
+        if self.selected >= self.filtered.len() {
+            self.selected = self.filtered.len().saturating_sub(1);
+        }
+    }
+    pub fn selected_name(&self) -> Option<&'static str> {
+        self.filtered
+            .get(self.selected)
+            .and_then(|&i| crate::app::commands::COMMAND_DOCS.get(i))
+            .map(|doc| doc.name)
+    }
+    pub fn accept_completion(&mut self, name: &str) {
+        let rest = self.input.split_once(' ').map(|(_, r)| r).unwrap_or("");
+        self.input = if rest.is_empty() {
+            format!("{} ", name)
+        } else {
+            format!("{} {}", name, rest)
+        };
+        self.filtered.clear();
+    }
+    pub fn next(&mut self) {
+        if !self.filtered.is_empty() {
+            self.selected = (self.selected + 1) % self.filtered.len();
+        }
+    }
+    pub fn prev(&mut self) {
+        if !self.filtered.is_empty() {
+            self.selected = if self.selected == 0 {
+                self.filtered.len() - 1
+            } else {
+                self.selected - 1
+            };
+        }
+    }
+    pub fn has_completions(&self) -> bool {
+        !self.filtered.is_empty() && !self.input.is_empty()
+    }
 }
 
 /// Pending tool call(s) awaiting the user's permission decision.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PermissionRequest {
     pub calls: Vec<ToolCall>,
+    pub cwd: PathBuf,
     pub selected: usize,
-    /// First display-line of the (possibly long) command list that's visible; the
-    /// renderer windows the list from here so a big batch stays scrollable.
     pub scroll: usize,
+    pub horizontal_scroll: usize,
+    pub deny: Option<DenyDraft>,
+    pub decision: PermissionDecision,
+    pub tool_index: usize,
+    pub location_index: usize,
+    pub lifetime_index: usize,
+    pub include_children: bool,
+    pub selecting: bool,
+    pub folder_picker: Option<FolderPicker>,
+    pub lifetime_explicit: bool,
+    pub editing_access: Option<usize>,
+    pub custom_directory: String,
+    pub custom_value: String,
+    pub editing_custom: bool,
+}
+
+/// A deny the user has chosen but not yet confirmed, plus the optional reason that
+/// goes back to the model. Telling it *why* is what stops it from immediately
+/// retrying the same call — a bare "denied" reads as a transient failure.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DenyDraft {
+    pub perm: Permission,
+    pub reason: String,
 }
 
 /// Plain-ASCII fence lines wrapping every field value in the editable buffer.
@@ -338,18 +572,53 @@ const FIELD_OPEN: &str = "<<<";
 const FIELD_CLOSE: &str = ">>>";
 
 impl PermissionRequest {
-    pub fn new(calls: Vec<ToolCall>) -> Self {
+    pub fn new(calls: Vec<ToolCall>, cwd: PathBuf) -> Self {
+        let current_kind = calls.first().and_then(ToolCall::kind);
+        let tool_index = current_kind
+            .and_then(|kind| {
+                ToolKind::all()
+                    .iter()
+                    .position(|candidate| *candidate == kind)
+            })
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let selected = usize::from(current_kind == Some(ToolKind::Edit));
+        let requested_directory = calls
+            .first()
+            .and_then(|call| call.permission_directory(&cwd))
+            .map(|directory| normalize_lexical(&directory));
+        let location_index = usize::from(requested_directory.is_some());
+        let custom_directory = requested_directory
+            .as_ref()
+            .map(|directory| directory.to_string_lossy().to_string())
+            .unwrap_or_default();
         Self {
             calls,
-            selected: 0,
+            cwd,
+            selected,
             scroll: 0,
+            horizontal_scroll: 0,
+            deny: None,
+            decision: PermissionDecision::Allow,
+            tool_index,
+            location_index,
+            // Allowing every tool defaults to a session-scoped rule.
+            lifetime_index: usize::from(tool_index == 0),
+            include_children: false,
+            selecting: false,
+            folder_picker: None,
+            lifetime_explicit: false,
+            editing_access: None,
+            custom_directory,
+            custom_value: "10".into(),
+            editing_custom: false,
         }
     }
 
     /// Build a single-call request. Test-only (production batches via the queue).
     #[cfg(test)]
     pub fn single(call: ToolCall) -> Self {
-        Self::new(vec![call])
+        Self::new(vec![call], std::env::current_dir().unwrap_or_default())
     }
 
     pub fn scroll_up(&mut self) {
@@ -357,6 +626,12 @@ impl PermissionRequest {
     }
     pub fn scroll_down(&mut self) {
         self.scroll = self.scroll.saturating_add(1);
+    }
+    pub fn scroll_left(&mut self) {
+        self.horizontal_scroll = self.horizontal_scroll.saturating_sub(4);
+    }
+    pub fn scroll_right(&mut self) {
+        self.horizontal_scroll = self.horizontal_scroll.saturating_add(4);
     }
 
     /// Render the batch as an editable plain-text buffer for `$EDITOR`. Each call
@@ -443,18 +718,46 @@ pub struct DecisionRequest {
     pub selected: usize,
     pub chosen: BTreeSet<usize>,
     pub multi: bool,
+    pub answer: String,
+    pub custom_editing: bool,
 }
 
 impl DecisionRequest {
+    pub fn free_form(&self) -> bool {
+        self.options.is_empty()
+    }
+    pub fn custom_selected(&self) -> bool {
+        !self.free_form() && self.selected == self.options.len()
+    }
+    pub fn editing_answer(&self) -> bool {
+        self.free_form() || self.custom_editing
+    }
+    pub fn option_count(&self) -> usize {
+        self.options.len() + usize::from(!self.free_form())
+    }
+    pub fn toggle_custom_editor(&mut self) {
+        if self.free_form() {
+            return;
+        }
+        self.custom_editing = !self.custom_editing;
+        if self.custom_editing {
+            self.selected = self.options.len();
+        }
+    }
     pub fn up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        if !self.custom_editing {
+            self.selected = self.selected.saturating_sub(1);
+        }
     }
     pub fn down(&mut self) {
-        if self.selected + 1 < self.options.len() {
+        if !self.custom_editing && self.selected + 1 < self.option_count() {
             self.selected += 1;
         }
     }
     pub fn toggle(&mut self) {
+        if self.free_form() || self.custom_selected() {
+            return;
+        }
         if self.multi {
             if !self.chosen.remove(&self.selected) {
                 self.chosen.insert(self.selected);
@@ -464,7 +767,23 @@ impl DecisionRequest {
             self.chosen.insert(self.selected);
         }
     }
+    pub fn push(&mut self, c: char) {
+        if self.editing_answer() {
+            self.answer.push(c);
+        }
+    }
+    pub fn backspace(&mut self) {
+        if self.editing_answer() {
+            self.answer.pop();
+        }
+    }
     pub fn labels(&self) -> Vec<String> {
+        if self.custom_selected() {
+            return (!self.answer.trim().is_empty())
+                .then(|| self.answer.trim().to_string())
+                .into_iter()
+                .collect();
+        }
         if self.multi {
             self.chosen
                 .iter()
@@ -486,30 +805,305 @@ pub struct PlanRequest {
     pub path: PathBuf,
 }
 
-/// The permission menu, in display order. Four allow options then four deny
-/// options, each: once · all of this tool type · all in this directory · timed.
-pub const PERMISSION_OPTIONS: usize = 8;
+pub const PERMISSION_OPTIONS: usize = 6;
 
 impl PermissionRequest {
+    const LIFETIME_OPTIONS: usize = 5;
+    /// Location scopes: 0 anywhere, 1 requested directory, 2 cwd, 3 cwd and all
+    /// descendants, 4 custom directory (typed or folder-picked).
+    const LOCATION_OPTIONS: usize = 5;
+
     pub fn up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        if self.deny.is_none() && !self.editing_custom {
+            if self.selecting {
+                self.adjust(-1);
+            } else {
+                self.selected = self.selected.saturating_sub(1);
+            }
+        }
     }
     pub fn down(&mut self) {
-        if self.selected + 1 < PERMISSION_OPTIONS {
-            self.selected += 1;
+        if self.deny.is_none() && !self.editing_custom {
+            if self.selecting {
+                self.adjust(1);
+            } else if self.selected + 1 < PERMISSION_OPTIONS {
+                self.selected += 1;
+            }
+        }
+    }
+    pub fn adjust(&mut self, direction: i32) {
+        if self.editing_custom || self.deny.is_some() {
+            return;
+        }
+        let forward = direction >= 0;
+        match self.selected {
+            0 => {
+                self.decision = match self.decision {
+                    PermissionDecision::Allow => PermissionDecision::Deny,
+                    PermissionDecision::Deny => PermissionDecision::Allow,
+                }
+            }
+            1 => {
+                let count = ToolKind::all().len() + 1;
+                let old = self.tool_index;
+                self.tool_index = cycle_index(self.tool_index, count, forward);
+                if old != 0 && self.tool_index == 0 && !self.lifetime_explicit {
+                    self.lifetime_index = 1;
+                }
+            }
+            2 => self.include_children = !self.include_children,
+            3 => {
+                self.location_index =
+                    cycle_index(self.location_index, Self::LOCATION_OPTIONS, forward);
+            }
+            4 => {
+                self.lifetime_index =
+                    cycle_index(self.lifetime_index, Self::LIFETIME_OPTIONS, forward);
+                self.lifetime_explicit = true;
+            }
+            _ => {}
         }
     }
     pub fn permission(&self) -> Permission {
-        match self.selected {
-            0 => Permission::Allow,
-            1 => Permission::AllowKind,
-            2 => Permission::AllowDirectory,
-            3 => Permission::AllowTimed,
-            4 => Permission::Deny,
-            5 => Permission::DenyKind,
-            6 => Permission::DenyDirectory,
-            _ => Permission::DenyTimed,
+        let current_kind = self.calls.first().and_then(ToolCall::kind);
+        let kind = if self.tool_index == 0 {
+            None
+        } else {
+            ToolKind::all()
+                .get(self.tool_index - 1)
+                .copied()
+                .or(current_kind)
+        };
+        let custom_dir = (!self.custom_directory.trim().is_empty()).then(|| {
+            let path = PathBuf::from(self.custom_directory.trim());
+            if path.is_absolute() {
+                normalize_lexical(&path)
+            } else {
+                normalize_lexical(&self.cwd.join(path))
+            }
+        });
+        let requested = self
+            .calls
+            .first()
+            .and_then(|call| call.permission_directory(&self.cwd));
+        let (directory, include_children) = match self.location_index {
+            0 => (None, false),
+            1 => (
+                requested.clone(),
+                self.include_children && requested.is_some(),
+            ),
+            2 => (Some(self.cwd.clone()), self.include_children),
+            3 => (Some(self.cwd.clone()), true),
+            _ => (custom_dir, self.include_children),
+        };
+        let value = self.custom_value.trim().parse::<u64>().unwrap_or(1).max(1);
+        let lifetime = match self.lifetime_index {
+            0 => PermissionLifetime::Once,
+            1 => PermissionLifetime::Session,
+            2 => PermissionLifetime::Minutes(value),
+            3 => PermissionLifetime::MatchingRequests(value.min(u32::MAX as u64) as u32),
+            _ => PermissionLifetime::GeneralRequests(value.min(u32::MAX as u64) as u32),
+        };
+        let include_children = include_children && directory.is_some();
+        Permission::Custom(PermissionRuleDraft {
+            decision: self.decision,
+            kind,
+            directory,
+            include_children,
+            lifetime,
+        })
+    }
+
+    pub fn tool_label(&self) -> String {
+        if self.tool_index == 0 {
+            "all access types".into()
+        } else {
+            ToolKind::all()
+                .get(self.tool_index - 1)
+                .map(|kind| kind.name().to_string())
+                .unwrap_or_else(|| "all access types".into())
         }
+    }
+
+    pub fn location_label(&self) -> String {
+        match self.location_index {
+            0 => "anywhere".into(),
+            1 => self
+                .calls
+                .first()
+                .and_then(|call| call.permission_directory(&self.cwd))
+                .map(|directory| crate::render::path::display_path(&directory))
+                .unwrap_or_else(|| "anywhere".into()),
+            2 => crate::render::path::display_path(&self.cwd),
+            3 => format!(
+                "{} (all descendants)",
+                crate::render::path::display_path(&self.cwd)
+            ),
+            _ if !self.custom_directory.is_empty() => {
+                crate::render::path::display_path(std::path::Path::new(&self.custom_directory))
+            }
+            _ => "custom directory".into(),
+        }
+    }
+
+    pub fn lifetime_label(&self) -> String {
+        match self.lifetime_index {
+            0 => "this request only".into(),
+            1 => "current session".into(),
+            2 => format!("{} minutes", self.custom_value),
+            3 => format!("next {} matching requests", self.custom_value),
+            _ => format!("next {} total requests", self.custom_value),
+        }
+    }
+
+    pub fn custom_editable(&self) -> bool {
+        self.selected == 4 && self.lifetime_index >= 2
+    }
+
+    /// Natural-language policy used when Enter delegates this batch to the access
+    /// review model. Matching calls receive the selected decision; everything else
+    /// remains an explicit human decision.
+    pub fn review_policy(&self) -> String {
+        let decision = if self.decision == PermissionDecision::Allow {
+            "ALLOW"
+        } else {
+            "DENY"
+        };
+        let children = if self.include_children && self.location_index != 0 {
+            " including all child directories"
+        } else {
+            ""
+        };
+        format!(
+            "For this pending batch, return {decision} only for calls using {} in {}{children}. Return ASK for every non-matching or uncertain call. The selected rule lifetime is {}.",
+            self.tool_label(),
+            self.location_label(),
+            self.lifetime_label(),
+        )
+    }
+
+    pub fn toggle_selector(&mut self) {
+        if self.selected == 3 && !self.editing_custom {
+            if self.folder_picker.is_none() {
+                let start = if self.custom_directory.is_empty() {
+                    self.cwd.clone()
+                } else {
+                    PathBuf::from(&self.custom_directory)
+                };
+                self.folder_picker = Some(FolderPicker::open(start));
+            } else if let Some((directory, recursive)) =
+                self.folder_picker.as_mut().and_then(FolderPicker::enter)
+            {
+                self.custom_directory = directory.to_string_lossy().to_string();
+                self.location_index = 4;
+                self.include_children = recursive;
+                self.folder_picker = None;
+            }
+            return;
+        }
+        if self.selected < PERMISSION_OPTIONS - 1 && !self.editing_custom {
+            self.selecting = !self.selecting;
+        }
+    }
+
+    pub fn selector_up(&mut self) {
+        if let Some(picker) = self.folder_picker.as_mut() {
+            picker.up();
+        } else {
+            self.up();
+        }
+    }
+
+    pub fn selector_down(&mut self) {
+        if let Some(picker) = self.folder_picker.as_mut() {
+            picker.down();
+        } else {
+            self.down();
+        }
+    }
+
+    pub fn selector_parent(&mut self) {
+        if let Some(picker) = self.folder_picker.as_mut() {
+            picker.parent();
+        }
+    }
+
+    pub fn selecting_folder(&self) -> bool {
+        self.folder_picker.is_some()
+    }
+
+    pub fn close_selector(&mut self) {
+        self.selecting = false;
+        self.folder_picker = None;
+    }
+
+    pub fn toggle_custom_edit(&mut self) {
+        if self.custom_editable() {
+            self.editing_custom = !self.editing_custom;
+        }
+    }
+
+    pub fn writing_reason(&self) -> bool {
+        self.deny.is_some()
+    }
+
+    /// Open the reason box for `perm`. Denies route through here rather than
+    /// applying immediately, so the model can be told why.
+    pub fn begin_deny(&mut self, perm: Permission) {
+        self.deny = Some(DenyDraft {
+            perm,
+            reason: String::new(),
+        });
+    }
+
+    /// Back out of the reason box, returning to the menu with nothing decided.
+    pub fn cancel_deny(&mut self) {
+        self.deny = None;
+    }
+
+    pub fn push(&mut self, c: char) {
+        if let Some(draft) = self.deny.as_mut() {
+            draft.reason.push(c);
+        } else if self.editing_custom {
+            if self.selected == 3 {
+                self.custom_directory.push(c);
+            } else {
+                self.custom_value.push(c);
+            }
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        if let Some(draft) = self.deny.as_mut() {
+            draft.reason.pop();
+        } else if self.editing_custom {
+            if self.selected == 3 {
+                self.custom_directory.pop();
+            } else {
+                self.custom_value.pop();
+            }
+        }
+    }
+
+    /// The confirmed deny: its permission plus the reason, empty text meaning none.
+    pub fn deny_choice(&self) -> Option<(Permission, Option<String>)> {
+        let draft = self.deny.as_ref()?;
+        let reason = draft.reason.trim();
+        Some((
+            draft.perm.clone(),
+            (!reason.is_empty()).then(|| reason.to_string()),
+        ))
+    }
+}
+
+fn cycle_index(current: usize, count: usize, forward: bool) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    if forward {
+        (current + 1) % count
+    } else {
+        current.checked_sub(1).unwrap_or(count - 1)
     }
 }
 
@@ -523,42 +1117,6 @@ pub struct ToolRequest {
     pub count: usize,
 }
 
-/// The launch screen: choose to resume a saved session (which `cd`s to that
-/// session's folder) or start a fresh one. Shown once at startup when there is
-/// at least one non-empty session to resume.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Startup {
-    /// Highlighted row. Index 0 is "new session"; 1..=sessions map to session
-    /// index `selected - 1`.
-    pub selected: usize,
-    /// Number of resumable sessions shown below the "new session" row.
-    pub sessions: usize,
-}
-
-impl Startup {
-    pub fn new(sessions: usize) -> Self {
-        Self {
-            selected: 0,
-            sessions,
-        }
-    }
-    /// Total selectable rows ("new" + each session).
-    pub fn options(&self) -> usize {
-        self.sessions + 1
-    }
-    pub fn up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
-    }
-    pub fn down(&mut self) {
-        if self.selected + 1 < self.options() {
-            self.selected += 1;
-        }
-    }
-}
-
-/// Prompt to enter the API endpoint URL + key, shown when a request fails because
-/// the endpoint is missing/relative (or via `:setup`). On confirm, the values are
-/// saved to config and the API client is rebuilt.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApiSetup {
     pub endpoint: String,
@@ -596,7 +1154,6 @@ impl ApiSetup {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Overlay {
     None,
-    Startup(Startup),
     Picker(Picker),
     Browser(FileBrowser),
     Palette(Palette),
@@ -608,6 +1165,13 @@ pub enum Overlay {
     ToolRequest(ToolRequest),
     /// Enter API endpoint + key (on a connection/base-URL failure, or `:setup`).
     ApiSetup(ApiSetup),
+    /// Scrollable live detail for one parallel child agent.
+    SubtaskDetail {
+        task_id: u64,
+        scroll: usize,
+    },
+    /// Vim-style `:` command line (simple text input, no filtering).
+    CommandLine(CommandLine),
     /// A transient informational dialog (title + body). Dismissed by any key.
     Notice {
         title: String,
@@ -618,11 +1182,6 @@ pub enum Overlay {
 impl Overlay {
     pub fn is_browser(&self) -> bool {
         matches!(self, Overlay::Browser(_))
-    }
-
-    /// Whether any overlay is showing (used to dim the transcript behind it).
-    pub fn is_active(&self) -> bool {
-        !matches!(self, Overlay::None)
     }
 }
 
@@ -730,6 +1289,26 @@ mod tests {
         assert!(b.resolve_targets().is_empty());
     }
 
+    #[test]
+    fn folder_picker_parent_returns_to_previous_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "aitui-folder-picker-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let child = base.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let mut picker = FolderPicker::open(child.clone());
+
+        picker.parent();
+
+        assert_eq!(picker.dir, std::fs::canonicalize(&base).unwrap());
+        assert!(
+            matches!(picker.row(picker.cursor), Some(FolderRow::Directory(entry)) if entry.path == std::fs::canonicalize(&child).unwrap())
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     // ── Picker ─────────────────────────────────────────────────────────────────
 
     #[test]
@@ -776,7 +1355,7 @@ mod tests {
     #[test]
     fn palette_filters_by_name_and_description() {
         let mut p = Palette::new();
-        assert!(p.filtered.len() > 0);
+        assert!(!p.filtered.is_empty());
         p.query = "model".into();
         p.refilter();
         let cmd = p.selected_cmd().unwrap();
@@ -802,50 +1381,277 @@ mod tests {
         assert_eq!(p.selected, initial);
     }
 
+    #[test]
+    fn custom_response_is_virtual_last_option_and_overrides_labels() {
+        let mut req = DecisionRequest {
+            call: ToolCall {
+                name: "ask".into(),
+                args: serde_json::json!({}),
+                id: None,
+            },
+            question: "Choose".into(),
+            options: vec!["A".into(), "B".into()],
+            selected: 0,
+            chosen: BTreeSet::new(),
+            multi: false,
+            answer: String::new(),
+            custom_editing: false,
+        };
+        req.down();
+        req.down();
+        assert!(req.custom_selected());
+        req.toggle_custom_editor();
+        for c in "different path".chars() {
+            req.push(c);
+        }
+        assert_eq!(req.labels(), vec!["different path"]);
+    }
+
+    #[test]
+    fn custom_editor_freezes_option_navigation_until_tab_closes_it() {
+        let mut req = DecisionRequest {
+            call: ToolCall {
+                name: "ask".into(),
+                args: serde_json::json!({}),
+                id: None,
+            },
+            question: "Choose".into(),
+            options: vec!["A".into(), "B".into()],
+            selected: 0,
+            chosen: BTreeSet::new(),
+            multi: false,
+            answer: String::new(),
+            custom_editing: false,
+        };
+        req.toggle_custom_editor();
+        req.up();
+        assert!(req.custom_selected());
+        req.toggle_custom_editor();
+        req.up();
+        assert_eq!(req.selected, 1);
+    }
+
     // ── PermissionRequest ──────────────────────────────────────────────────────
 
     #[test]
-    fn permission_maps_correctly() {
+    fn permission_defaults_to_current_tool_once() {
         let req = PermissionRequest::single(ToolCall {
             name: "read_file".into(),
             args: serde_json::json!({}),
             id: None,
         });
-        assert_eq!(req.permission(), Permission::Allow);
+        assert_eq!(
+            req.permission(),
+            Permission::Custom(PermissionRuleDraft {
+                decision: PermissionDecision::Allow,
+                kind: Some(ToolKind::Read),
+                directory: None,
+                include_children: false,
+                lifetime: PermissionLifetime::Once,
+            })
+        );
     }
 
     #[test]
-    fn permission_selected_1_allow_all() {
+    fn permission_dimensions_compose_a_custom_rule() {
         let mut req = PermissionRequest::single(ToolCall {
             name: "read_file".into(),
-            args: serde_json::json!({}),
+            args: serde_json::json!({ "path": "src/main.rs" }),
             id: None,
         });
+        req.adjust(1);
         req.down();
-        assert_eq!(req.permission(), Permission::AllowKind);
+        req.adjust(1);
+        req.down();
+        req.down();
+        req.adjust(1);
+        req.down();
+        req.adjust(1);
+
+        assert_eq!(req.tool_label(), "list");
+        assert_eq!(
+            req.location_label(),
+            crate::render::path::display_path(&std::env::current_dir().unwrap())
+        );
+        assert_eq!(req.lifetime_label(), "current session");
+        assert_eq!(
+            req.permission(),
+            Permission::Custom(PermissionRuleDraft {
+                decision: PermissionDecision::Deny,
+                kind: Some(ToolKind::List),
+                directory: Some(std::env::current_dir().unwrap()),
+                include_children: false,
+                lifetime: PermissionLifetime::Session,
+            })
+        );
     }
 
     #[test]
-    fn permission_selected_maps_all_eight() {
+    fn permission_custom_request_limit_is_editable() {
         let mut req = PermissionRequest::single(ToolCall {
-            name: "read_file".into(),
-            args: serde_json::json!({}),
+            name: "shell".into(),
+            args: serde_json::json!({ "command": "cargo test" }),
             id: None,
         });
-        let expected = [
-            Permission::Allow,
-            Permission::AllowKind,
-            Permission::AllowDirectory,
-            Permission::AllowTimed,
-            Permission::Deny,
-            Permission::DenyKind,
-            Permission::DenyDirectory,
-            Permission::DenyTimed,
-        ];
-        for want in expected {
-            assert_eq!(req.permission(), want);
-            req.down();
+        req.selected = 4;
+        for _ in 0..3 {
+            req.adjust(1);
         }
+        req.custom_value = "3".into();
+        assert!(matches!(
+            req.permission(),
+            Permission::Custom(PermissionRuleDraft {
+                lifetime: PermissionLifetime::MatchingRequests(3),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn edit_requests_focus_access_type_and_scope_requested_directory() {
+        let req = PermissionRequest::single(ToolCall {
+            name: "edit".into(),
+            args: serde_json::json!({
+                "path": "src/main.rs",
+                "old": "old",
+                "new": "new"
+            }),
+            id: None,
+        });
+        assert_eq!(req.selected, 1);
+        assert_eq!(req.tool_label(), "edit");
+        assert!(req.location_label().contains("src"));
+    }
+
+    #[test]
+    fn every_permission_dimension_combination_builds_a_rule() {
+        let mut req = PermissionRequest::single(ToolCall {
+            name: "read".into(),
+            args: serde_json::json!({ "path": "src/main.rs" }),
+            id: None,
+        });
+        req.custom_directory = "src".into();
+        req.custom_value = "3".into();
+        for decision in [PermissionDecision::Allow, PermissionDecision::Deny] {
+            for tool_index in 0..=ToolKind::all().len() {
+                for location_index in 0..PermissionRequest::LOCATION_OPTIONS {
+                    for include_children in [false, true] {
+                        for lifetime_index in 0..PermissionRequest::LIFETIME_OPTIONS {
+                            req.decision = decision;
+                            req.tool_index = tool_index;
+                            req.location_index = location_index;
+                            req.include_children = include_children;
+                            req.lifetime_index = lifetime_index;
+                            let Permission::Custom(rule) = req.permission() else {
+                                panic!("custom editor must always emit a custom rule");
+                            };
+                            assert_eq!(rule.decision, decision);
+                            assert_eq!(
+                                rule.include_children,
+                                location_index == 3 || (include_children && location_index != 0)
+                            );
+                            assert!(!req.tool_label().is_empty());
+                            assert!(!req.location_label().is_empty());
+                            assert!(!req.lifetime_label().is_empty());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn child_directory_option_only_applies_with_a_location_scope() {
+        let mut req = PermissionRequest::single(ToolCall {
+            name: "read".into(),
+            args: serde_json::json!({ "path": "src/main.rs" }),
+            id: None,
+        });
+        req.include_children = true;
+        req.location_index = 0;
+        let Permission::Custom(anywhere) = req.permission() else {
+            panic!("custom rule");
+        };
+        assert!(!anywhere.include_children);
+
+        req.location_index = 2;
+        let Permission::Custom(scoped) = req.permission() else {
+            panic!("custom rule");
+        };
+        assert!(scoped.include_children);
+        assert_eq!(scoped.directory, Some(std::env::current_dir().unwrap()));
+    }
+
+    #[test]
+    fn every_lifetime_option_maps_to_its_individual_behavior() {
+        let mut req = PermissionRequest::single(ToolCall {
+            name: "shell".into(),
+            args: serde_json::json!({ "command": "cargo test" }),
+            id: None,
+        });
+        req.custom_value = "7".into();
+        let expected = [
+            PermissionLifetime::Once,
+            PermissionLifetime::Session,
+            PermissionLifetime::Minutes(7),
+            PermissionLifetime::MatchingRequests(7),
+            PermissionLifetime::GeneralRequests(7),
+        ];
+        for (index, lifetime) in expected.into_iter().enumerate() {
+            req.lifetime_index = index;
+            let Permission::Custom(rule) = req.permission() else {
+                panic!("custom rule");
+            };
+            assert_eq!(rule.lifetime, lifetime);
+        }
+    }
+
+    #[test]
+    fn automated_review_policy_contains_every_selected_condition() {
+        let mut req = PermissionRequest::single(ToolCall {
+            name: "read".into(),
+            args: serde_json::json!({ "path": "src/main.rs" }),
+            id: None,
+        });
+        req.decision = PermissionDecision::Deny;
+        req.tool_index = ToolKind::all()
+            .iter()
+            .position(|kind| *kind == ToolKind::Read)
+            .unwrap()
+            + 1;
+        req.location_index = 4;
+        req.custom_directory = "src".into();
+        req.include_children = true;
+        req.lifetime_index = 3;
+        req.custom_value = "4".into();
+
+        let policy = req.review_policy();
+        assert!(policy.contains("DENY"));
+        assert!(policy.contains("read"));
+        assert!(policy.contains("src"));
+        assert!(policy.contains("including all child directories"));
+        assert!(policy.contains("next 4 matching requests"));
+        assert!(policy.contains("ASK"));
+    }
+
+    #[test]
+    fn permission_locations_use_the_session_cwd_not_the_process_cwd() {
+        let session_cwd = std::env::temp_dir().join("aitui-permission-session-cwd");
+        let req = PermissionRequest::new(
+            vec![ToolCall {
+                name: "read".into(),
+                args: serde_json::json!({ "path": "src/main.rs" }),
+                id: None,
+            }],
+            session_cwd.clone(),
+        );
+
+        assert_eq!(req.cwd, session_cwd);
+        assert!(req.location_label().contains("src"));
+        let Permission::Custom(rule) = req.permission() else {
+            panic!("custom rule");
+        };
+        assert_eq!(rule.directory, Some(req.cwd.join("src")));
     }
 
     #[test]
@@ -863,22 +1669,25 @@ mod tests {
 
     #[test]
     fn edit_buffer_roundtrips_multiline_edits() {
-        let mut req = PermissionRequest::new(vec![
-            ToolCall {
-                name: "shell".into(),
-                args: serde_json::json!({ "command": "cargo test" }),
-                id: None,
-            },
-            ToolCall {
-                name: "edit".into(),
-                args: serde_json::json!({
-                    "path": "src/main.rs",
-                    "old": "let x = 1;\nlet y = 2;",
-                    "new": "let x = 10;",
-                }),
-                id: None,
-            },
-        ]);
+        let mut req = PermissionRequest::new(
+            vec![
+                ToolCall {
+                    name: "shell".into(),
+                    args: serde_json::json!({ "command": "cargo test" }),
+                    id: None,
+                },
+                ToolCall {
+                    name: "edit".into(),
+                    args: serde_json::json!({
+                        "path": "src/main.rs",
+                        "old": "let x = 1;\nlet y = 2;",
+                        "new": "let x = 10;",
+                    }),
+                    id: None,
+                },
+            ],
+            std::env::current_dir().unwrap(),
+        );
         // Simulate the user editing the shell command and the edit's `new` body.
         let edited = req
             .edit_buffer()
@@ -897,18 +1706,21 @@ mod tests {
 
     #[test]
     fn apply_edits_reports_deleted_blocks_as_dropped() {
-        let mut req = PermissionRequest::new(vec![
-            ToolCall {
-                name: "shell".into(),
-                args: serde_json::json!({ "command": "a" }),
-                id: None,
-            },
-            ToolCall {
-                name: "shell".into(),
-                args: serde_json::json!({ "command": "b" }),
-                id: None,
-            },
-        ]);
+        let mut req = PermissionRequest::new(
+            vec![
+                ToolCall {
+                    name: "shell".into(),
+                    args: serde_json::json!({ "command": "a" }),
+                    id: None,
+                },
+                ToolCall {
+                    name: "shell".into(),
+                    args: serde_json::json!({ "command": "b" }),
+                    id: None,
+                },
+            ],
+            std::env::current_dir().unwrap(),
+        );
         // Keep only the first block; the user removed the second entirely.
         let kept: String = req
             .edit_buffer()
@@ -977,8 +1789,8 @@ mod tests {
     // ── SettingsRow ────────────────────────────────────────────────────────────
 
     #[test]
-    fn settings_row_all_returns_four() {
-        assert_eq!(SettingsRow::all().len(), 4);
+    fn settings_row_all_returns_every_row() {
+        assert_eq!(SettingsRow::all().len(), 6);
     }
 
     // ── SlashCommand ───────────────────────────────────────────────────────────

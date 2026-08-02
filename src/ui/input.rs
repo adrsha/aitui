@@ -1,60 +1,28 @@
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 use ratatui::Frame;
 
+use crate::app::input_layout::{layout as layout_input, VisualLine};
 use crate::app::state::App;
 use crate::input::vim::VimMode;
 use crate::render::theme::Theme;
-use crate::render::wrap::hard_chunks;
-
-/// Wrapped visual line: text, owning logical line, and char offset within it.
-struct VisualLine {
-    text: String,
-    logical_row: usize,
-    char_offset: usize,
-}
-
-fn wrap_input_lines(lines: &[String], width: usize) -> Vec<VisualLine> {
-    let mut out = Vec::new();
-    for (ri, line) in lines.iter().enumerate() {
-        let mut offset = 0;
-        for chunk in hard_chunks(line, width) {
-            let chunk_len = chunk.chars().count();
-            out.push(VisualLine {
-                text: chunk,
-                logical_row: ri,
-                char_offset: offset,
-            });
-            offset += chunk_len;
-        }
-    }
-    if out.is_empty() {
-        out.push(VisualLine {
-            text: String::new(),
-            logical_row: 0,
-            char_offset: 0,
-        });
-    }
-    out
-}
 
 fn visual_cursor(visual: &[VisualLine], logical_row: usize, logical_col: usize) -> (usize, usize) {
-    for (vi, vl) in visual.iter().enumerate() {
-        if vl.logical_row == logical_row {
-            let chunk_end = vl.char_offset + vl.text.chars().count();
-            if vl.char_offset <= logical_col && logical_col <= chunk_end {
-                return (vi, logical_col - vl.char_offset);
-            }
+    let mut fallback = None;
+    for (index, line) in visual.iter().enumerate() {
+        if line.logical_row != logical_row {
+            continue;
+        }
+        fallback = Some(index);
+        if logical_col >= line.start && logical_col < line.end {
+            return (index, logical_col - line.start);
         }
     }
-    let vi = visual
-        .iter()
-        .rposition(|vl| vl.logical_row == logical_row)
-        .unwrap_or(0);
-    let col = visual[vi].text.chars().count().min(logical_col);
-    (vi, col)
+    let index = fallback.unwrap_or(0);
+    let line = &visual[index];
+    (index, line.end.saturating_sub(line.start))
 }
 
 fn visual_selection_bounds(
@@ -72,7 +40,7 @@ fn visual_selection_bounds(
 }
 
 pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
-    let panel = Style::default();
+    let panel = theme.surface();
     // Breathing room inside the input panel: 2 cols each side, 1 row top/bottom.
     // The layout allots `input_height + 2` rows, so the vertical padding consumes
     // that slack and the text area stays `input_height` tall.
@@ -89,7 +57,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
 
     // ── Multi-line input with wrapping ───────────────────────────────────
     let avail_w = inner.width.saturating_sub(1).max(1) as usize;
-    let visual = wrap_input_lines(&app.input.lines, avail_w);
+    let visual = layout_input(&app.input.lines, avail_w);
     let total_visual = visual.len();
 
     let (cursor_vi, cursor_vc) = visual_cursor(&visual, app.input.row, app.input.col);
@@ -102,6 +70,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     };
 
     let mut rendered: Vec<Line<'static>> = Vec::with_capacity(inner_h);
+    let ghost = ghost_suggestion(app);
     for vi in start_row..start_row + input_h {
         if vi >= total_visual {
             rendered.push(Line::from(""));
@@ -112,6 +81,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         if app.vim == VimMode::Visual && app.input.visual_anchor.is_some() {
             rendered.push(Line::from(render_visual_wrapped(
                 app, &visual, vi, vl, theme,
+            )));
+        } else if vi == cursor_vi && ghost.is_some() {
+            rendered.push(Line::from(render_ghost_line(
+                ghost.unwrap_or_default(),
+                theme,
             )));
         } else if vi == cursor_vi {
             rendered.push(Line::from(render_input_line(line_text, cursor_vc, theme)));
@@ -132,6 +106,32 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     if app.mention.active && !app.mention.matches.is_empty() {
         render_mention_popup(f, app, inner, theme);
     }
+}
+
+fn ghost_suggestion(app: &App) -> Option<&str> {
+    app.input
+        .text()
+        .is_empty()
+        .then(|| app.sessions.active().response_suggestions.first())
+        .flatten()
+        .map(String::as_str)
+}
+
+fn render_ghost_line(suggestion: &str, theme: &Theme) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(
+            "Tab ↹  ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            suggestion.to_string(),
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ]
 }
 
 /// Render a wrapped visual line with visual selection highlighting.
@@ -187,9 +187,15 @@ fn render_input_line(line: &str, cursor_col: usize, theme: &Theme) -> Vec<Span<'
 }
 
 fn render_mention_popup(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
-    let max_h = 10usize.min(app.mention.matches.len());
+    let available_h = area.y.saturating_sub(f.area().y) as usize;
+    let max_h = 10usize
+        .min(app.mention.matches.len())
+        .min(available_h.saturating_sub(1));
+    if max_h == 0 {
+        return;
+    }
     let popup_w = area.width.min(50);
-    let popup_h = (max_h as u16 + 2).min(area.height.saturating_sub(2)).max(3);
+    let popup_h = max_h as u16 + 2;
 
     let x = area.x;
     let y = area.y.saturating_sub(popup_h);
@@ -200,22 +206,45 @@ fn render_mention_popup(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         width: popup_w,
         height: popup_h,
     };
+    let padding = if popup_w >= 24 {
+        Padding::new(2, 1, 1, 1)
+    } else {
+        Padding::new(1, 0, 0, 0)
+    };
     let block = Block::default()
-        .title(" @file ")
-        .padding(Padding::horizontal(1));
+        .title(Span::styled(
+            " @file ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .padding(padding)
+        .style(Style::default().bg(Color::Black).fg(theme.text));
     let inner = block.inner(popup_area);
     f.render_widget(ratatui::widgets::Clear, popup_area);
     f.render_widget(block, popup_area);
+    f.render_widget(
+        Paragraph::new(
+            (0..popup_area.height)
+                .map(|_| Line::from(Span::styled("█", Style::default().fg(theme.accent))))
+                .collect::<Vec<_>>(),
+        ),
+        Rect {
+            width: 1,
+            ..popup_area
+        },
+    );
 
     for i in 0..max_h {
         if let Some(path) = app.mention.matches.get(i) {
             let style = if i == app.mention.selected {
-                theme.selection()
+                theme.selection().add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme.text)
+                Style::default().bg(Color::Black).fg(theme.text)
             };
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled(path.clone(), style))),
+                Paragraph::new(Line::from(Span::styled(format!("  {}", path), style)))
+                    .style(Style::default().bg(Color::Black)),
                 Rect {
                     x: inner.x,
                     y: inner.y + i as u16,

@@ -6,15 +6,14 @@
 
 use std::collections::HashSet;
 
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthChar;
-
 use crate::domain::blocks::Block;
 use crate::render::highlight::{self, Segment};
 use crate::render::search::{render_search_output, search_pattern_from_summary};
 use crate::render::theme::Theme;
-use crate::render::wrap::{hard_chunks, wrap_words};
+use crate::render::wrap::wrap_words;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthChar;
 
 /// One rendered screen row.
 #[derive(Clone)]
@@ -31,6 +30,9 @@ pub struct RenderedLine {
     pub msg: usize,
     /// If this row is a collapsible header, the (msg, block) it toggles.
     pub toggle: Option<(usize, usize)>,
+    /// If set, paint this transcript row edge-to-edge with the given background.
+    /// Normal transcript rows, including edit diffs, leave this unset.
+    pub background: Option<Color>,
     /// Set on the first row of each message to its role ("user"/"assistant"/…),
     /// so the scrollbar can place a coloured marker per turn.
     pub role_start: Option<&'static str>,
@@ -43,6 +45,7 @@ impl RenderedLine {
             plain,
             msg,
             toggle: None,
+            background: None,
             role_start: None,
         }
     }
@@ -50,17 +53,10 @@ impl RenderedLine {
         self.toggle = Some(key);
         self
     }
-}
-
-/// What a responder is currently doing, used by role-header animations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LoadingKind {
-    /// Request started but no content token has arrived yet.
-    Network,
-    /// Tokens are streaming from the model.
-    Streaming,
-    /// A local tool is executing.
-    Tool,
+    pub(crate) fn with_background(mut self, background: Option<Color>) -> Self {
+        self.background = background;
+        self
+    }
 }
 
 /// A message ready to render: its role, parsed blocks, and optional timing state.
@@ -68,13 +64,11 @@ pub struct DocMessage {
     pub role: String,
     pub blocks: Vec<Block>,
     pub duration_ms: Option<u64>,
-    /// Time-to-first-result in ms (once known), shown next to the total time.
-    pub first_ms: Option<u64>,
-    pub loading: Option<LoadingKind>,
-    pub started_at: Option<std::time::Instant>,
+    /// Wall-clock unix-timestamp seconds when the original ChatMessage was created.
+    pub created_at: Option<u64>,
 }
 
-fn fmt_duration_ms(ms: u64) -> String {
+pub(crate) fn fmt_duration_ms(ms: u64) -> String {
     if ms < 1_000 {
         format!("{}ms", ms.max(1))
     } else {
@@ -90,6 +84,7 @@ fn fmt_duration_ms(ms: u64) -> String {
 /// Build the full document. `toggled` holds (msg, block) keys the user has
 /// explicitly flipped from their default collapse state.
 /// `streaming` controls whether partial tool calls are rendered as placeholders.
+#[cfg(test)]
 pub fn build(
     messages: &[DocMessage],
     width: usize,
@@ -99,24 +94,23 @@ pub fn build(
     streaming: bool,
 ) -> Vec<RenderedLine> {
     let mut out: Vec<RenderedLine> = Vec::new();
+    let mut prev_role: Option<&str> = None;
     for (mi, msg) in messages.iter().enumerate() {
-        out.extend(build_message(
-            msg,
-            mi,
-            width,
-            theme,
-            toggled,
-            show_output,
-            streaming,
-        ));
+        let mut rows = build_message(msg, mi, width, theme, toggled, show_output, streaming);
+        // No separator before assistant when it directly follows a tool message.
+        if prev_role == Some("tool") && msg.role != "tool" {
+            rows.retain(|r| r.role_start.is_none());
+        }
+        prev_role = Some(msg.role.as_str());
+        out.extend(rows);
     }
     out
 }
 
 /// Render a single message (index `mi`) into its screen rows: role header, its
-/// blocks, the coloured left gutter bar, and a trailing blank separator. Factored
-/// out so `render::chat` can cache each message's rows independently and rebuild
-/// only the ones that actually changed (see `ChatState`'s doc cache).
+/// blocks, and a trailing blank separator. Factored out so `render::chat` can
+/// cache each message's rows independently and rebuild only the ones that actually
+/// changed (see `ChatState`'s doc cache).
 pub fn build_message(
     msg: &DocMessage,
     mi: usize,
@@ -124,44 +118,78 @@ pub fn build_message(
     theme: &Theme,
     toggled: &HashSet<(usize, usize)>,
     show_output: bool,
-    streaming: bool,
+    _streaming: bool,
 ) -> Vec<RenderedLine> {
-    // No left gutter bars: turns run flush to the left edge and use the full width.
-    let inner = width.max(1);
+    let indent_w = 2usize;
+    let inner = width.saturating_sub(indent_w).max(1);
+
+    let has_visible_block = msg
+        .blocks
+        .iter()
+        .enumerate()
+        .any(|(bi, block)| match block {
+            Block::Markdown(text) => {
+                let next_is_tool = block_followed_by_tool(&msg.blocks, bi);
+                visible_prose_before_tool(text, next_is_tool).is_some()
+            }
+            Block::Thinking(text) => !text.trim().is_empty(),
+            Block::Code { lang, code } => lang != "tool" && !code.trim().is_empty(),
+            Block::ToolCall(_) => false,
+            Block::ToolResult { .. } | Block::ToolFileResult { .. } => true,
+        });
+    if !has_visible_block {
+        return Vec::new();
+    }
+
+    let first_visible_is_thinking =
+        msg.blocks
+            .iter()
+            .enumerate()
+            .find_map(|(bi, block)| match block {
+                Block::Markdown(text)
+                    if visible_prose_before_tool(text, block_followed_by_tool(&msg.blocks, bi))
+                        .is_some() =>
+                {
+                    Some(false)
+                }
+                Block::Thinking(text) if !text.trim().is_empty() => Some(true),
+                Block::Code { lang, code } if lang != "tool" && !code.trim().is_empty() => {
+                    Some(false)
+                }
+                Block::ToolResult { .. } | Block::ToolFileResult { .. } => Some(false),
+                _ => None,
+            })
+            == Some(true);
 
     let mut out: Vec<RenderedLine> = Vec::new();
-    render_role_header(
-        &msg.role,
-        mi,
-        theme,
-        msg.duration_ms,
-        msg.first_ms,
-        msg.loading,
-        msg.started_at,
-        &mut out,
-    );
+    if msg.role != "tool" {
+        render_message_separator(msg, mi, width, theme, &mut out);
+        if !first_visible_is_thinking {
+            out.push(RenderedLine::new(Line::raw(""), String::new(), mi));
+        }
+    }
 
-    // While streaming, once this turn is producing a tool call, hide the assistant's
-    // interstitial prose so only the animated "generating tool" chip + reasoning show
-    // — the raw generation around the call is noise until the tool runs.
-    let hide_prose = streaming && msg.blocks.iter().any(is_tool_ish);
+    // Tool payloads are hidden, but surrounding assistant prose remains part of
+    // the transcript. A plan or explanation before a call must not disappear
+    // merely because the message also contains a tool block.
 
     for (bi, block) in msg.blocks.iter().enumerate() {
         match block {
-            Block::Markdown(_) if hide_prose => {}
-            Block::Markdown(text) => render_markdown(text, mi, inner, theme, &mut out),
-            // While streaming, a partial ```tool block (JSON not yet complete) is
-            // shown as a quiet "preparing tool call" chip rather than raw JSON.
-            Block::Code { lang, code } if streaming && lang == "tool" => {
-                render_preparing_tool(code, mi, inner, theme, &mut out)
+            Block::Markdown(text) => {
+                let next_is_tool = block_followed_by_tool(&msg.blocks, bi);
+                if let Some(visible) = visible_prose_before_tool(text, next_is_tool) {
+                    render_text_segment(visible, mi, inner, theme, &mut out);
+                }
             }
+            // Tool-call payloads remain in the document for session/API fidelity,
+            // but are not user-facing transcript content. The matching result block
+            // is the single visual representation of an executed tool.
+            Block::Code { lang, .. } if lang == "tool" => {}
             Block::Code { lang, code } => render_code(lang, code, mi, inner, theme, &mut out),
             Block::Thinking(text) => {
-                render_thinking(text, mi, bi, inner, theme, toggled, streaming, &mut out)
+                render_thinking(text, (mi, bi), inner, theme, toggled, &mut out)
             }
-            Block::ToolCall(call) => {
-                render_tool_call(call, mi, bi, inner, theme, toggled, &mut out)
-            }
+            Block::ToolCall(_) => {}
             Block::ToolResult {
                 ok,
                 name,
@@ -172,6 +200,27 @@ pub fn build_message(
                 name.as_deref(),
                 summary,
                 output,
+                None,
+                mi,
+                bi,
+                inner,
+                theme,
+                toggled,
+                show_output,
+                &mut out,
+            ),
+            Block::ToolFileResult {
+                ok,
+                name,
+                summary,
+                output,
+                call,
+            } => render_tool_result(
+                *ok,
+                name.as_deref(),
+                summary,
+                output,
+                Some(call),
                 mi,
                 bi,
                 inner,
@@ -183,77 +232,236 @@ pub fn build_message(
         }
     }
 
-    // A blank line separates turns.
-    out.push(RenderedLine::new(Line::raw(""), String::new(), mi));
+    let trailing = RenderedLine::new(Line::raw(""), String::new(), mi);
+    for row in &mut out {
+        if row.role_start.is_none() {
+            row.line.spans.insert(0, Span::raw("  "));
+            row.plain = format!("  {}", row.plain);
+        }
+    }
+    wrap_message_panel(&mut out, width, theme);
+    out.push(trailing);
 
     out
 }
 
-fn render_role_header(
-    role: &str,
+fn render_message_separator(
+    msg: &DocMessage,
     mi: usize,
+    width: usize,
     theme: &Theme,
-    duration_ms: Option<u64>,
-    first_ms: Option<u64>,
-    loading: Option<LoadingKind>,
-    started_at: Option<std::time::Instant>,
     out: &mut Vec<RenderedLine>,
 ) {
-    // Each role gets an icon + its own denoting colour (matching the gutter bar),
-    // bold — so "you" / "assistant" read as distinct speakers, not muted text.
-    let (label, marker, icon, color): (&str, &'static str, &str, Color) = match role {
-        "user" => ("you", "user", "❯", theme.gutter_user),
-        "assistant" => ("assistant", "assistant", "✦", theme.gutter_assistant),
-        "system" => ("system", "system", "◆", theme.gutter_system),
-        "tool" => ("tool", "tool", "⚙", theme.gutter_tool),
-        _ => ("?", "assistant", "✦", theme.gutter_assistant),
+    let role = msg.role.as_str();
+    let (symbol, marker): (&str, &str) = match role {
+        "user" => ("\u{275d}", "user"),
+        "assistant" => ("\u{274b}", "assistant"),
+        "system" => ("\u{2699}", "system"),
+        "tool" => ("\u{26a1}", "tool"),
+        _ => ("\u{274b}", "assistant"),
     };
-    let mut text = format!("{} {}", icon, label);
-    let mut spans = vec![Span::styled(
-        text.clone(),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    )];
-    if matches!(role, "assistant" | "tool") {
-        // The timing reads as a small badge: the dark `faint` colour as the
-        // background with a bright foreground, so it stands out instead of blending
-        // into the terminal bg the way dim `faint` foreground text did.
-        let time_style = Style::default()
-            .bg(theme.muted)
-            .fg(theme.text)
-            .add_modifier(Modifier::BOLD);
-        let badge_text = if loading.is_some() {
-            // Live: the total keeps climbing every frame. Before the first byte the
-            // total IS the time-to-first-result ("waiting"); after it, show the
-            // frozen first-result time alongside the still-growing total.
-            let elapsed = started_at
-                .map(|t| t.elapsed().as_millis() as u64)
-                .unwrap_or(0);
-            match first_ms {
-                None => Some(format!(" waiting {} ", fmt_duration_ms(elapsed))),
-                Some(f) => Some(format!(
-                    " {}  ·first {} ",
-                    fmt_duration_ms(elapsed),
-                    fmt_duration_ms(f)
-                )),
-            }
-        } else {
-            // Finalized: total time, plus the time-to-first-result when it differs.
-            duration_ms.map(|ms| match first_ms {
-                Some(f) if f + 50 < ms => {
-                    format!(" {}  ·first {} ", fmt_duration_ms(ms), fmt_duration_ms(f))
-                }
-                _ => format!(" {} ", fmt_duration_ms(ms)),
-            })
-        };
-        if let Some(badge) = badge_text {
-            text.push_str(&format!("  {}", badge));
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(badge, time_style));
+    let color = match role {
+        "user" => theme.gutter_user,
+        "assistant" => theme.gutter_assistant,
+        "system" => theme.gutter_system,
+        "tool" => theme.gutter_tool,
+        _ => theme.gutter_assistant,
+    };
+    let duration = msg.duration_ms.map(fmt_duration_ms);
+    let time_str = msg.created_at.and_then(|ts| fmt_time(ts));
+    let label = match (role, duration.as_deref(), time_str) {
+        ("user", _, Some(ref t)) => {
+            format!(" {} {} {} ", symbol, t, duration.as_deref().unwrap_or(""))
         }
-    }
-    let mut row = RenderedLine::new(Line::from(spans), text, mi);
+        ("user", _, None) => format!(" {} {} ", symbol, duration.as_deref().unwrap_or("")),
+        (_, Some(d), _) => format!(" {} {} ", symbol, d),
+        (_, None, _) => format!(" {} ", symbol),
+    };
+    let plain = if width > label.chars().count() {
+        let pad = " ".repeat(width - label.chars().count());
+        format!("{}{}", label, pad)
+    } else {
+        label.clone()
+    };
+    let mut row = RenderedLine::new(
+        Line::from(Span::styled(
+            label,
+            Style::default().fg(Color::White).bg(color),
+        )),
+        plain,
+        mi,
+    );
     row.role_start = Some(marker);
+    row.background = Some(color);
     out.push(row);
+}
+
+/// Format unix timestamp seconds as relative label + "H:MM am/pm".
+///   today    → "2:30 pm"
+///   yesterday → "yesterday 2:30 pm"
+///   3 days ago → "3 days ago 2:30 pm"
+///   last week → "last week 2:30 pm"
+///   3 weeks ago → "3 weeks ago 2:30 pm"
+///   last month → "last month 2:30 pm"
+fn fmt_time(unix_secs: u64) -> Option<String> {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let day_secs = unix_secs % 86400;
+    let total_minutes = day_secs / 60;
+    let hours_24 = total_minutes / 60;
+    let minutes = total_minutes % 60;
+    let period = if hours_24 < 12 { "am" } else { "pm" };
+    let hours_12 = if hours_24 % 12 == 0 {
+        12
+    } else {
+        hours_24 % 12
+    };
+    let time = format!("{}:{:02} {}", hours_12, minutes, period);
+    let msg_time = UNIX_EPOCH.checked_add(Duration::from_secs(unix_secs))?;
+    let now = SystemTime::now();
+    let diff = now.duration_since(msg_time).ok()?;
+    let days = diff.as_secs() / 86400;
+    let label = match days {
+        0 => String::new(),
+        1 => "yesterday ".into(),
+        2..=6 => format!("{} days ago ", days),
+        7..=13 => "last week ".into(),
+        14..=20 => "2 weeks ago ".into(),
+        21..=27 => "3 weeks ago ".into(),
+        28..=59 => "last month ".into(),
+        _ => {
+            let months = days / 30;
+            if months == 1 {
+                "last month ".into()
+            } else {
+                format!("{} months ago ", months)
+            }
+        }
+    };
+    Some(format!("{}{}", label, time))
+}
+
+fn wrap_message_panel(rows: &mut [RenderedLine], width: usize, _theme: &Theme) {
+    for row in rows {
+        let role_start = row.role_start;
+        let toggle = row.toggle;
+        let background = row.background;
+        let content_width = row
+            .plain
+            .chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum::<usize>();
+        let mut spans = Vec::with_capacity(row.line.spans.len() + 1);
+        spans.extend(
+            row.line
+                .spans
+                .iter()
+                .map(|span| Span::styled(span.content.clone().into_owned(), span.style)),
+        );
+        if width > content_width {
+            let padding = " ".repeat(width - content_width);
+            if let Some(background) = background {
+                spans.push(Span::styled(padding, Style::default().bg(background)));
+            } else {
+                spans.push(Span::raw(padding));
+            }
+        }
+        row.line = Line::from(spans);
+        row.plain = format!(
+            "{}{}",
+            row.plain,
+            " ".repeat(width.saturating_sub(content_width))
+        );
+        row.role_start = role_start;
+        row.toggle = toggle;
+    }
+}
+
+fn block_followed_by_tool(blocks: &[Block], index: usize) -> bool {
+    blocks.get(index + 1).is_some_and(|next| {
+        matches!(next, Block::ToolCall(_))
+            || matches!(next, Block::Code { lang, .. } if lang == "tool")
+    })
+}
+
+fn visible_prose_before_tool(text: &str, next_is_tool: bool) -> Option<&str> {
+    if !next_is_tool {
+        return (!text.trim().is_empty()).then_some(text);
+    }
+    let trimmed = text.trim_end();
+    let paragraph_start = trimmed.rfind("\n\n").map(|pos| pos + 2).unwrap_or(0);
+    let trailing = trimmed[paragraph_start..].trim();
+    let invocation = trailing.lines().count() <= 2
+        && trailing.split_whitespace().count() <= 14
+        && looks_like_tool_invocation(trailing);
+    let visible = if invocation {
+        trimmed[..paragraph_start].trim_end()
+    } else {
+        trimmed
+    };
+    (!visible.trim().is_empty()).then_some(visible)
+}
+
+fn looks_like_tool_invocation(text: &str) -> bool {
+    let lower = text
+        .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '-' | '*' | '>'))
+        .to_ascii_lowercase();
+    [
+        "i'll ",
+        "i’ll ",
+        "i will ",
+        "let me ",
+        "i'm going to ",
+        "i’m going to ",
+        "now i'll ",
+        "now i’ll ",
+        "next i'll ",
+        "next i’ll ",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+        && [
+            "read",
+            "inspect",
+            "search",
+            "edit",
+            "write",
+            "run",
+            "check",
+            "list",
+            "fetch",
+            "open",
+            "update",
+            "delete",
+            "move",
+            "copy",
+            "download",
+            "use the tool",
+        ]
+        .iter()
+        .any(|verb| lower.contains(verb))
+}
+
+fn render_text_segment(
+    text: &str,
+    mi: usize,
+    width: usize,
+    theme: &Theme,
+    out: &mut Vec<RenderedLine>,
+) {
+    let indent = "  ";
+    let mut rows = Vec::new();
+    render_markdown(
+        text,
+        mi,
+        width.saturating_sub(indent.len()).max(1),
+        theme,
+        &mut rows,
+    );
+    for mut row in rows {
+        row.line.spans.insert(0, Span::raw(indent));
+        row.plain = format!("{}{}", indent, row.plain);
+        out.push(row);
+    }
 }
 
 fn render_markdown(
@@ -264,7 +472,7 @@ fn render_markdown(
     out: &mut Vec<RenderedLine>,
 ) {
     for raw in text.split('\n') {
-        // Thematic break (`---`, `***`, `___`) → a full-width horizontal rule.
+        // Thematic break (`---`, `***`, `___`) → a full-width text rule.
         if is_hr(raw) {
             let rule = "─".repeat(width.max(1));
             out.push(RenderedLine::new(
@@ -355,7 +563,7 @@ fn classify_line(raw: &str, theme: &Theme) -> (String, String, Style, bool) {
     }
     if let Some(rest) = raw.strip_prefix("> ") {
         return (
-            "▌ ".into(),
+            "  ".into(),
             rest.to_string(),
             Style::default().fg(theme.muted),
             false,
@@ -386,11 +594,6 @@ fn ordered_list_item(raw: &str) -> Option<(String, String)> {
     Some((prefix, body.to_string()))
 }
 
-/// Solid dark background for code blocks (ANSI bright-black / grey, index 8) — a
-/// touch darker than most terminal backgrounds, so code reads as a distinct panel
-/// without needing a coloured border. Index 16 (pure black) read too dark.
-const CODE_BG: Color = Color::Indexed(8);
-
 fn render_code(
     lang: &str,
     code: &str,
@@ -399,68 +602,29 @@ fn render_code(
     theme: &Theme,
     out: &mut Vec<RenderedLine>,
 ) {
-    let start = out.len();
-    // A coloured left border bar (▌) + a dim lang label, on a dark panel background
-    // — the border and the background go together.
     let lang_disp = if lang.is_empty() { "code" } else { lang };
-    let border = Style::default()
-        .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
-    let header = format!("▌ {} ", lang_disp);
-    let hspans = vec![
-        Span::styled("▌ ".to_string(), border),
-        Span::styled(
-            format!("{} ", lang_disp),
-            Style::default()
-                .fg(theme.muted)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
+    let header = format!(" {} ", lang_disp);
+    let hspans = vec![Span::styled(
+        header.clone(),
+        Style::default()
+            .bg(Color::DarkGray)
+            .fg(theme.muted)
+            .add_modifier(Modifier::BOLD),
+    )];
     out.push(RenderedLine::new(Line::from(hspans), header, mi));
-    let avail = width.saturating_sub(2).max(1);
     push_code(
         code,
         lang,
-        "▌ ",
-        "▌ ",
-        border,
+        "",
+        "",
+        Style::default(),
         Style::default().fg(theme.text),
-        avail,
+        width.max(1),
         mi,
         theme,
         out,
     );
-    // Paint the whole block (header + code) onto the dark panel background.
-    paint_bg(&mut out[start..], width, CODE_BG);
-}
-
-/// Give every row a solid background and pad it out to `width` columns so the
-/// background reads as a continuous panel rather than only colouring the glyphs.
-fn paint_bg(rows: &mut [RenderedLine], width: usize, bg: Color) {
-    for r in rows {
-        let used: usize = r
-            .plain
-            .chars()
-            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-            .sum();
-        let mut spans: Vec<Span<'static>> = r
-            .line
-            .spans
-            .iter()
-            .map(|s| {
-                let mut st = s.style;
-                st.bg = Some(bg);
-                Span::styled(s.content.clone().into_owned(), st)
-            })
-            .collect();
-        if width > used {
-            spans.push(Span::styled(
-                " ".repeat(width - used),
-                Style::default().bg(bg),
-            ));
-        }
-        r.line = Line::from(spans);
-    }
+    // Keep code rows on the transcript's terminal background.
 }
 
 /// Emit code rows for `code`, syntax-highlighted with tree-sitter when the
@@ -502,78 +666,154 @@ fn push_code(
         }
         None => {
             for src in code.split('\n') {
-                let chunks = if src.is_empty() {
-                    vec![String::new()]
-                } else {
-                    hard_chunks(src, width)
-                };
-                for (ci, chunk) in chunks.into_iter().enumerate() {
+                let segments = vec![(src.to_string(), fallback_style)];
+                for (ci, (spans, chunk)) in wrap_segments(&segments, width).into_iter().enumerate()
+                {
                     let lead = if ci == 0 { prefix } else { cont_prefix };
                     let plain = format!("{}{}", lead, chunk);
-                    out.push(RenderedLine::new(
-                        Line::from(vec![
-                            Span::styled(lead.to_string(), prefix_style),
-                            Span::styled(chunk, fallback_style),
-                        ]),
-                        plain,
-                        mi,
-                    ));
+                    let mut row_spans = Vec::with_capacity(spans.len() + 1);
+                    row_spans.push(Span::styled(lead.to_string(), prefix_style));
+                    row_spans.extend(spans);
+                    out.push(RenderedLine::new(Line::from(row_spans), plain, mi));
                 }
             }
         }
     }
 }
 
-/// Break a line of styled segments into visual rows no wider than `width`,
-/// returning `(spans, plain_text)` per row. Splits happen at the display-width
-/// boundary; each segment keeps its own style across the split.
-pub(crate) fn wrap_segments(segments: &[Segment], width: usize) -> Vec<(Vec<Span<'static>>, String)> {
-    let w = width.max(1);
-    let mut rows: Vec<(Vec<Span<'static>>, String)> = Vec::new();
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut plain = String::new();
-    let mut col = 0usize;
+/// Break a line of styled segments into visual rows no wider than `width`.
+/// Wrapping prefers whitespace boundaries, drops separator whitespace at a wrap,
+/// and only hard-breaks words that cannot fit on a row. Segment styles survive
+/// unchanged, including Tree-sitter foregrounds and opaque backgrounds.
+pub(crate) fn wrap_segments(
+    segments: &[Segment],
+    width: usize,
+) -> Vec<(Vec<Span<'static>>, String)> {
+    #[derive(Clone, Copy)]
+    struct StyledChar {
+        ch: char,
+        style: Style,
+    }
 
-    for (text, style) in segments {
+    fn display_width(chars: &[StyledChar]) -> usize {
+        chars
+            .iter()
+            .map(|styled| UnicodeWidthChar::width(styled.ch).unwrap_or(0))
+            .sum()
+    }
+
+    fn push_row(chars: &mut Vec<StyledChar>, rows: &mut Vec<(Vec<Span<'static>>, String)>) {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut plain = String::new();
         let mut run = String::new();
-        for ch in text.chars() {
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if col + cw > w {
-                if !run.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut run), *style));
+        let mut run_style = None;
+
+        for styled in chars.drain(..) {
+            plain.push(styled.ch);
+            if run_style == Some(styled.style) {
+                run.push(styled.ch);
+            } else {
+                if let Some(style) = run_style.replace(styled.style) {
+                    spans.push(Span::styled(std::mem::take(&mut run), style));
                 }
-                rows.push((std::mem::take(&mut spans), std::mem::take(&mut plain)));
-                col = 0;
+                run.push(styled.ch);
             }
-            run.push(ch);
-            plain.push(ch);
-            col += cw;
         }
-        if !run.is_empty() {
-            spans.push(Span::styled(run, *style));
+        if let Some(style) = run_style {
+            spans.push(Span::styled(run, style));
+        }
+        rows.push((spans, plain));
+    }
+
+    fn append_hard_wrapped(
+        chars: &[StyledChar],
+        width: usize,
+        row: &mut Vec<StyledChar>,
+        col: &mut usize,
+        rows: &mut Vec<(Vec<Span<'static>>, String)>,
+    ) {
+        for styled in chars {
+            let cw = UnicodeWidthChar::width(styled.ch).unwrap_or(0);
+            if *col + cw > width && !row.is_empty() {
+                push_row(row, rows);
+                *col = 0;
+            }
+            row.push(*styled);
+            *col += cw;
         }
     }
-    rows.push((spans, plain));
+
+    let width = width.max(1);
+    let chars: Vec<StyledChar> = segments
+        .iter()
+        .flat_map(|(text, style)| text.chars().map(|ch| StyledChar { ch, style: *style }))
+        .collect();
+    if chars.is_empty() {
+        return vec![(Vec::new(), String::new())];
+    }
+
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut col = 0usize;
+    let mut pending_space = Vec::new();
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        let whitespace = chars[index].ch.is_whitespace();
+        let start = index;
+        while index < chars.len() && chars[index].ch.is_whitespace() == whitespace {
+            index += 1;
+        }
+        let token = &chars[start..index];
+
+        if whitespace {
+            pending_space.extend_from_slice(token);
+            continue;
+        }
+
+        let word_width = display_width(token);
+        if row.is_empty() {
+            append_hard_wrapped(&pending_space, width, &mut row, &mut col, &mut rows);
+            pending_space.clear();
+        } else if col + display_width(&pending_space) + word_width > width {
+            push_row(&mut row, &mut rows);
+            col = 0;
+            pending_space.clear();
+        } else {
+            append_hard_wrapped(&pending_space, width, &mut row, &mut col, &mut rows);
+            pending_space.clear();
+        }
+
+        append_hard_wrapped(token, width, &mut row, &mut col, &mut rows);
+    }
+
+    if row.is_empty() || col + display_width(&pending_space) <= width {
+        append_hard_wrapped(&pending_space, width, &mut row, &mut col, &mut rows);
+    }
+    if !row.is_empty() {
+        push_row(&mut row, &mut rows);
+    }
+    if rows.is_empty() {
+        rows.push((Vec::new(), String::new()));
+    }
     rows
 }
 
 fn render_thinking(
     text: &str,
-    mi: usize,
-    bi: usize,
+    key: (usize, usize),
     width: usize,
     theme: &Theme,
     toggled: &HashSet<(usize, usize)>,
-    _streaming: bool,
     out: &mut Vec<RenderedLine>,
 ) {
+    let (mi, bi) = key;
     let expanded = toggled.contains(&(mi, bi));
     let n = text.lines().count().max(1);
     let arrow = if expanded { "▾" } else { "▸" };
     let header = format!(" {} thinking ({} lines) ", arrow, n);
     let chip_style = Style::default()
-        .bg(Color::Green)
-        .fg(Color::Gray)
+        .fg(Color::Green)
         .add_modifier(Modifier::BOLD);
     out.push(
         RenderedLine::new(
@@ -584,7 +824,6 @@ fn render_thinking(
         .with_toggle((mi, bi)),
     );
     if expanded {
-        let bg = Color::Indexed(8);
         let avail = width.saturating_sub(4).max(1);
         for raw in text.split('\n') {
             for wline in wrap_words(raw, avail) {
@@ -592,7 +831,7 @@ fn render_thinking(
                 out.push(RenderedLine::new(
                     Line::from(Span::styled(
                         plain.clone(),
-                        Style::default().fg(theme.thinking).bg(bg),
+                        Style::default().fg(theme.thinking),
                     )),
                     plain,
                     mi,
@@ -602,63 +841,45 @@ fn render_thinking(
     }
 }
 
-/// A quiet placeholder shown while the assistant is still emitting a tool call
-/// (the JSON isn't closed yet). Hides the raw partial JSON and shows the tool
-/// name as it resolves, leaving animation to the activity bar.
-fn render_preparing_tool(
-    partial: &str,
-    mi: usize,
-    width: usize,
+fn tool_chip_header(
+    _label: &str,
+    arrow: &str,
+    icon: &str,
+    summary: &str,
+    meta: Option<&str>,
+    ok: bool,
     theme: &Theme,
-    out: &mut Vec<RenderedLine>,
-) {
-    let start = out.len();
-    let name = extract_partial_name(partial);
-    let label = match &name {
-        Some(n) if !n.is_empty() => format!("  Preparing {} …", n),
-        _ => "  Preparing tool call…".to_string(),
-    };
-    out.push(RenderedLine::new(
-        Line::from(Span::styled(
-            label.clone(),
+) -> Line<'static> {
+    let status = if ok { theme.accent } else { theme.danger };
+    let mut spans = vec![
+        Span::styled(
+            format!(" {}{} ", arrow, icon),
             Style::default()
-                .fg(theme.accent)
+                .bg(status)
+                .fg(crate::render::theme::fg_guard(Color::Black))
                 .add_modifier(Modifier::BOLD),
-        )),
-        label,
-        mi,
-    ));
-    // A dim, truncated peek at what's forming inside, so it's clear it's live.
-    let peek: String = partial.split_whitespace().collect::<Vec<_>>().join(" ");
-    if !peek.trim().is_empty() {
-        let avail = width.saturating_sub(6).max(1);
-        let shown: String = peek.chars().take(avail).collect();
-        let line = format!("      {}", shown);
-        out.push(RenderedLine::new(
-            Line::from(Span::styled(line.clone(), Style::default().fg(theme.muted))),
-            line,
-            mi,
+        ),
+        Span::styled(
+            format!(" {} ", summary),
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(theme.text)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(meta) = meta {
+        spans.push(Span::styled(
+            format!(" {} ", meta),
+            Style::default()
+                .bg(Color::Black)
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
         ));
     }
-    paint_bg(&mut out[start..], width, CODE_BG);
+    Line::from(spans)
 }
 
-/// Whether a block is a tool call — complete (`ToolCall`) or a mid-stream partial
-/// (`Code` fenced as `tool`). Used to hide interstitial prose while a call forms.
-fn is_tool_ish(b: &Block) -> bool {
-    matches!(b, Block::ToolCall(_)) || matches!(b, Block::Code { lang, .. } if lang == "tool")
-}
-
-/// Best-effort extraction of the `"name"` value from a (possibly partial) tool JSON.
-fn extract_partial_name(s: &str) -> Option<String> {
-    let i = s.find("\"name\"")?;
-    let rest = &s[i + 6..];
-    let q1 = rest.find('"')?;
-    let after = &rest[q1 + 1..];
-    let q2 = after.find('"')?;
-    Some(after[..q2].to_string())
-}
-
+#[allow(dead_code)]
 fn render_tool_call(
     call: &crate::agent::ToolCall,
     mi: usize,
@@ -681,8 +902,7 @@ fn render_tool_call(
         return;
     }
 
-    let icon = kind.map(|k| k.icon()).unwrap_or("⚙");
-    let color = theme.warning; // edit/write are Medium risk
+    let icon = kind.map(|k| k.icon()).unwrap_or("tool");
     let expanded = is_write && toggled.contains(&(mi, bi));
     let arrow = if is_write {
         if expanded {
@@ -693,19 +913,18 @@ fn render_tool_call(
     } else {
         "▸ "
     };
-    let head = format!("  {} {}", icon, call.summary());
+    let summary = crate::render::path::abbreviate_home(&call.summary());
+    let head = format!("  {} {}", icon, summary);
     let mut row = RenderedLine::new(
-        Line::from(vec![
-            Span::styled(
-                format!("    {}", arrow),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("{} ", icon), Style::default().fg(color)),
-            Span::styled(
-                call.summary(),
-                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-            ),
-        ]),
+        tool_chip_header(
+            kind.map(|k| k.name()).unwrap_or("tool"),
+            arrow,
+            icon,
+            &summary,
+            None,
+            true,
+            theme,
+        ),
         head,
         mi,
     );
@@ -766,21 +985,19 @@ fn render_write_preview(
     theme: &Theme,
     out: &mut Vec<RenderedLine>,
 ) {
-    let start = out.len();
-    let avail = width.saturating_sub(4).max(1);
+    let avail = width.max(1);
     let total = content.lines().count();
     let shown: String = content
         .lines()
         .take(WRITE_PREVIEW_LINES)
         .collect::<Vec<_>>()
         .join("\n");
-    let gutter = Style::default().fg(theme.accent);
     push_code(
         &shown,
         path,
-        "▌ ",
-        "▌ ",
-        gutter,
+        "",
+        "",
+        Style::default(),
         Style::default().fg(theme.muted),
         avail,
         mi,
@@ -788,18 +1005,396 @@ fn render_write_preview(
         out,
     );
     if total > WRITE_PREVIEW_LINES {
-        let more = format!("▌ … {} more line(s)", total - WRITE_PREVIEW_LINES);
+        let more = format!("… {} more line(s)", total - WRITE_PREVIEW_LINES);
         out.push(RenderedLine::new(
             Line::from(Span::styled(more.clone(), Style::default().fg(theme.muted))),
             more,
             mi,
         ));
     }
-    paint_bg(&mut out[start..], width, CODE_BG);
 }
 
-/// Render a context diff with line numbers, soft add/remove markers, and syntax
-/// highlighting for changed code when the edited path has a known language.
+fn render_source_card(
+    label: &str,
+    rail_color: Color,
+    path: &str,
+    code: &str,
+    start_line: usize,
+    mi: usize,
+    width: usize,
+    theme: &Theme,
+    out: &mut Vec<RenderedLine>,
+) {
+    let header_plain = format!("█ {}", label);
+    out.push(RenderedLine::new(
+        Line::from(vec![
+            Span::styled("█ ", Style::default().fg(rail_color)),
+            Span::styled(
+                label.to_string(),
+                Style::default().fg(rail_color).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        header_plain,
+        mi,
+    ));
+
+    let code = code.strip_suffix('\n').unwrap_or(code);
+    let source_lines: Vec<&str> = code.split('\n').collect();
+    let last_line = start_line.saturating_add(source_lines.len().saturating_sub(1));
+    let number_width = last_line.max(1).to_string().len();
+    let gutter_width = number_width + 5;
+    let code_width = width.saturating_sub(gutter_width).max(1);
+    let highlighted = highlight::highlight(code, path, theme);
+
+    for (index, source) in source_lines.iter().enumerate() {
+        let fallback = vec![(source.to_string(), Style::default().fg(theme.text))];
+        let segments = highlighted
+            .as_ref()
+            .and_then(|lines| lines.get(index))
+            .filter(|segments| !segments.is_empty())
+            .unwrap_or(&fallback);
+        for (row_index, (spans, chunk)) in
+            wrap_segments(segments, code_width).into_iter().enumerate()
+        {
+            let number = if row_index == 0 {
+                format!("{:>width$}", start_line + index, width = number_width)
+            } else {
+                " ".repeat(number_width)
+            };
+            let gutter = format!("█ {} │ ", number);
+            let mut row_spans = vec![
+                Span::styled("█ ", Style::default().fg(rail_color)),
+                Span::styled(number, Style::default().fg(theme.muted)),
+                Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+            ];
+            row_spans.extend(spans);
+            out.push(RenderedLine::new(
+                Line::from(row_spans),
+                format!("{}{}", gutter, chunk),
+                mi,
+            ));
+        }
+    }
+}
+
+fn read_file_body(output: &str) -> (usize, String, Vec<String>) {
+    let mut lines: Vec<&str> = output.lines().collect();
+    let mut start_line = 1usize;
+    let mut notes = Vec::new();
+
+    if let Some(first) = lines.first().copied() {
+        if let Some(range) = first
+            .strip_prefix("[lines ")
+            .and_then(|line| line.split_once(" of ").map(|(range, _)| range))
+            .and_then(|range| range.split_once('-'))
+        {
+            start_line = range.0.parse().unwrap_or(1);
+            lines.remove(0);
+        }
+    }
+    while lines
+        .first()
+        .is_some_and(|line| line.starts_with("[limit capped"))
+    {
+        notes.push(lines.remove(0).to_string());
+    }
+    if lines
+        .last()
+        .is_some_and(|line| line.starts_with("[next: read("))
+    {
+        if let Some(note) = lines.pop() {
+            notes.push(note.to_string());
+        }
+    }
+    (start_line, lines.join("\n"), notes)
+}
+
+const TOOL_BODY_INDENT: usize = 2;
+
+fn indent_tool_body(rows: &mut [RenderedLine], indent: usize) {
+    if indent == 0 {
+        return;
+    }
+    let pad = " ".repeat(indent);
+    for row in rows {
+        row.line.spans.insert(0, Span::raw(pad.clone()));
+        row.plain = format!("{}{}", pad, row.plain);
+    }
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum()
+}
+
+/// Below this width the old/new comparison falls back to stacked cards.
+const SIDE_BY_SIDE_MIN_WIDTH: usize = 110;
+
+fn render_edit_comparison(
+    path: &str,
+    old: &str,
+    new: &str,
+    start_line: usize,
+    mi: usize,
+    width: usize,
+    theme: &Theme,
+    out: &mut Vec<RenderedLine>,
+) {
+    if width >= SIDE_BY_SIDE_MIN_WIDTH {
+        let o: Vec<&str> = old.lines().collect();
+        let n: Vec<&str> = new.lines().collect();
+        let (p, removed_end, added_end) = diff_alignment(&o, &n);
+        render_diff_columns(
+            &o,
+            &n,
+            p,
+            removed_end,
+            added_end,
+            path,
+            start_line,
+            mi,
+            width,
+            theme,
+            out,
+        );
+        return;
+    }
+    render_source_card(
+        "OLD",
+        theme.danger,
+        path,
+        old,
+        start_line,
+        mi,
+        width,
+        theme,
+        out,
+    );
+    out.push(RenderedLine::new(Line::default(), String::new(), mi));
+    render_source_card(
+        "NEW",
+        theme.success,
+        path,
+        new,
+        start_line,
+        mi,
+        width,
+        theme,
+        out,
+    );
+}
+
+/// Common prefix `p` and the change ranges `removed_end`/`added_end` that line
+/// up the two sides of a comparison: identical leading lines, then the removed
+/// block, then the added block, then identical trailing lines.
+fn diff_alignment(o: &[&str], n: &[&str]) -> (usize, usize, usize) {
+    let mut p = 0;
+    while p < o.len() && p < n.len() && o[p] == n[p] {
+        p += 1;
+    }
+    let mut s = 0;
+    while s < o.len().saturating_sub(p)
+        && s < n.len().saturating_sub(p)
+        && o[o.len() - 1 - s] == n[n.len() - 1 - s]
+    {
+        s += 1;
+    }
+    (p, o.len() - s, n.len() - s)
+}
+
+/// Side-by-side old | new diff. Every line has a block and at least one
+/// separating space before its line number: red = removed, green = added,
+/// dark gray = unchanged.
+#[allow(clippy::too_many_arguments)]
+fn render_diff_columns(
+    o: &[&str],
+    n: &[&str],
+    p: usize,
+    removed_end: usize,
+    added_end: usize,
+    path: &str,
+    start_line: usize,
+    mi: usize,
+    width: usize,
+    theme: &Theme,
+    out: &mut Vec<RenderedLine>,
+) {
+    let last_line = start_line.saturating_add(n.len().max(o.len()).saturating_sub(1));
+    let num_width = last_line.max(1).to_string().len().max(3);
+    let gutter_w = num_width + 5;
+    let col_width = width.saturating_sub(3) / 2;
+    let code_w = col_width.saturating_sub(gutter_w).max(1);
+    let divider = Span::styled(" │ ", Style::default().fg(Color::DarkGray));
+    let divider_plain = " │ ";
+    let old_hl = highlight::highlight(&o.join("\n"), path, theme);
+    let new_hl = highlight::highlight(&n.join("\n"), path, theme);
+    let old_seg = |i: usize| old_hl.as_ref().and_then(|l| l.get(i).map(Vec::as_slice));
+    let new_seg = |i: usize| new_hl.as_ref().and_then(|l| l.get(i).map(Vec::as_slice));
+
+    let ctx = Style::default().fg(theme.muted);
+    let mut plan: Vec<(
+        Option<(usize, Option<Color>, Option<&[Segment]>, Style)>,
+        Option<(usize, Option<Color>, Option<&[Segment]>, Style)>,
+    )> = Vec::new();
+    for i in 0..p {
+        plan.push((
+            Some((start_line + i, None, old_seg(i), ctx)),
+            Some((start_line + i, None, new_seg(i), ctx)),
+        ));
+    }
+    let removed_count = removed_end.saturating_sub(p);
+    let added_count = added_end.saturating_sub(p);
+    for j in 0..removed_count.max(added_count) {
+        let left = (j < removed_count).then(|| {
+            let i = p + j;
+            (
+                start_line + i,
+                Some(theme.danger),
+                old_seg(i),
+                Style::default().bg(Color::DarkGray),
+            )
+        });
+        let right = (j < added_count).then(|| {
+            let i = p + j;
+            (
+                start_line + i,
+                Some(theme.success),
+                new_seg(i),
+                Style::default().bg(Color::DarkGray),
+            )
+        });
+        plan.push((left, right));
+    }
+    for i in removed_end..o.len() {
+        let new_index = added_end + (i - removed_end);
+        plan.push((
+            Some((start_line + i, None, old_seg(i), ctx)),
+            Some((start_line + new_index, None, new_seg(new_index), ctx)),
+        ));
+    }
+
+    for (left, right) in plan {
+        let left_bar = left.as_ref().and_then(|(_, bar, _, _)| *bar);
+        let right_bar = right.as_ref().and_then(|(_, bar, _, _)| *bar);
+        let left_rows = diff_column_rows(left, num_width, code_w);
+        let right_rows = diff_column_rows(right, num_width, code_w);
+        let rows = left_rows.len().max(right_rows.len()).max(1);
+        for row in 0..rows {
+            let mut spans = Vec::new();
+            let mut plain = String::new();
+            match left_rows.get(row) {
+                Some((s, p)) => {
+                    spans.extend(s.iter().cloned());
+                    plain.push_str(p);
+                }
+                None => {
+                    let (s, p) = diff_column_continuation(left_bar, num_width);
+                    spans.extend(s);
+                    plain.push_str(&p);
+                }
+            }
+            let left_width = display_width(&plain);
+            if left_width < col_width {
+                let padding = " ".repeat(col_width - left_width);
+                spans.push(Span::raw(padding.clone()));
+                plain.push_str(&padding);
+            }
+            spans.push(divider.clone());
+            plain.push_str(divider_plain);
+            let right_start = display_width(&plain);
+            match right_rows.get(row) {
+                Some((s, p)) => {
+                    spans.extend(s.iter().cloned());
+                    plain.push_str(p);
+                }
+                None => {
+                    let (s, p) = diff_column_continuation(right_bar, num_width);
+                    spans.extend(s);
+                    plain.push_str(&p);
+                }
+            }
+            let right_width = display_width(&plain).saturating_sub(right_start);
+            if right_width < col_width {
+                let padding = " ".repeat(col_width - right_width);
+                spans.push(Span::raw(padding.clone()));
+                plain.push_str(&padding);
+            }
+            out.push(RenderedLine::new(Line::from(spans), plain, mi));
+        }
+    }
+}
+
+/// One column of a side-by-side diff row: optional bar, line number, content.
+fn diff_column_rows(
+    cell: Option<(usize, Option<Color>, Option<&[Segment]>, Style)>,
+    num_width: usize,
+    code_w: usize,
+) -> Vec<(Vec<Span<'static>>, String)> {
+    let Some((num, bar, segments, style)) = cell else {
+        return Vec::new();
+    };
+    let bar_text = "█ ";
+    let bar_style = Style::default().fg(bar.unwrap_or(Color::DarkGray));
+    let num_text = format!("{:>width$}", num, width = num_width);
+    let gutter_spans = vec![
+        Span::styled(bar_text.to_string(), bar_style),
+        Span::styled(
+            num_text.clone(),
+            Style::default().fg(Color::White).bg(Color::Reset),
+        ),
+        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+    ];
+    let gutter_plain = format!("{}{} │ ", bar_text, num_text);
+    let fallback = vec![(String::new(), style)];
+    let segments: &[(String, Style)] = if segments.is_some_and(|s| !s.is_empty()) {
+        segments.unwrap()
+    } else {
+        &fallback
+    };
+    let mut rows = Vec::new();
+    for (ci, (spans, chunk)) in wrap_segments(segments, code_w).into_iter().enumerate() {
+        if ci == 0 {
+            let mut line_spans = gutter_spans.clone();
+            line_spans.extend(spans);
+            rows.push((line_spans, format!("{}{}", gutter_plain, chunk)));
+        } else {
+            // Keep the gutter block connected through wrapped rows. The blank
+            // line-number/divider area has exactly the same width as the first
+            // row, so wrapped code starts in the identical content column.
+            let continuation = " ".repeat(num_width + 3);
+            let mut line_spans = vec![
+                Span::styled(bar_text.to_string(), bar_style),
+                Span::raw(continuation.clone()),
+            ];
+            line_spans.extend(spans);
+            rows.push((line_spans, format!("{}{}{}", bar_text, continuation, chunk)));
+        }
+    }
+    if rows.is_empty() {
+        rows.push((gutter_spans, gutter_plain));
+    }
+    rows
+}
+
+/// Blank visual row used to keep side-by-side columns aligned when only the
+/// counterpart has another wrapped segment. It continues this side's colored
+/// block while deliberately leaving the line-number and content cells empty.
+fn diff_column_continuation(bar: Option<Color>, num_width: usize) -> (Vec<Span<'static>>, String) {
+    let bar_text = "█ ";
+    let continuation = " ".repeat(num_width + 3);
+    (
+        vec![
+            Span::styled(
+                bar_text.to_string(),
+                Style::default().fg(bar.unwrap_or(Color::DarkGray)),
+            ),
+            Span::raw(continuation.clone()),
+        ],
+        format!("{}{}", bar_text, continuation),
+    )
+}
+
 fn render_diff(
     old: &str,
     new: &str,
@@ -815,96 +1410,137 @@ fn render_diff(
     let o: Vec<&str> = old.lines().collect();
     let n: Vec<&str> = new.lines().collect();
 
-    let mut p = 0;
-    while p < o.len() && p < n.len() && o[p] == n[p] {
-        p += 1;
-    }
-    let mut s = 0;
-    while s < o.len().saturating_sub(p)
-        && s < n.len().saturating_sub(p)
-        && o[o.len() - 1 - s] == n[n.len() - 1 - s]
-    {
-        s += 1;
+    let (p, removed_end, added_end) = diff_alignment(&o, &n);
+
+    if width >= SIDE_BY_SIDE_MIN_WIDTH {
+        render_diff_columns(
+            &o,
+            &n,
+            p,
+            removed_end,
+            added_end,
+            path,
+            1,
+            mi,
+            width,
+            theme,
+            out,
+        );
+        return;
     }
 
-    let removed_end = o.len() - s;
-    let added_end = n.len() - s;
     let ctx: usize = 3;
     let num_width = n.len().max(o.len()).to_string().len().max(3);
     let gutter_w = num_width + 3;
-    let avail = width.saturating_sub(gutter_w + 1).max(1);
+    let avail = width.saturating_sub(gutter_w).max(1);
     let ctx_style = Style::default().fg(theme.muted);
-    let changed_style = Style::default().bg(theme.subtle_pill);
-    let removed_border = Style::default().fg(Color::Red).bg(theme.subtle_pill);
-    let added_border = Style::default().fg(Color::Green).bg(theme.subtle_pill);
+    let changed_style = Style::default().bg(Color::DarkGray);
     let old_hl = highlight::highlight(old, path, theme);
     let new_hl = highlight::highlight(new, path, theme);
+    let mut line_idx = 0usize;
 
     // Context before change
     let before_start = p.saturating_sub(ctx);
-    for i in before_start..p {
+    for (i, &line) in o.iter().enumerate().take(p).skip(before_start) {
         push_diff_line(
-            o[i],
-            old_hl.as_ref().and_then(|lines| lines.get(i).map(Vec::as_slice)),
+            line,
+            old_hl
+                .as_ref()
+                .and_then(|lines| lines.get(i).map(Vec::as_slice)),
             i + 1,
-            num_width,
-            "│",
-            ctx_style,
-            ctx_style,
-            avail,
-            mi,
+            DiffLineFormat {
+                num_width,
+                style: ctx_style,
+                bar: None,
+                background: None,
+                avail,
+                message_index: mi,
+                line_idx,
+            },
             out,
         );
+        line_idx += 1;
     }
 
     // Removed lines
-    for i in p..removed_end {
+    for (i, &line) in o.iter().enumerate().take(removed_end).skip(p) {
         push_diff_line(
-            o[i],
-            old_hl.as_ref().and_then(|lines| lines.get(i).map(Vec::as_slice)),
+            line,
+            old_hl
+                .as_ref()
+                .and_then(|lines| lines.get(i).map(Vec::as_slice)),
             i + 1,
-            num_width,
-            "▌",
-            changed_style,
-            removed_border,
-            avail,
-            mi,
+            DiffLineFormat {
+                num_width,
+                style: changed_style,
+                bar: Some(Color::Red),
+                background: Some(Color::DarkGray),
+                avail,
+                message_index: mi,
+                line_idx,
+            },
             out,
         );
+        line_idx += 1;
     }
 
     // Added lines
-    for i in p..added_end {
+    for (i, &line) in n.iter().enumerate().take(added_end).skip(p) {
         push_diff_line(
-            n[i],
-            new_hl.as_ref().and_then(|lines| lines.get(i).map(Vec::as_slice)),
+            line,
+            new_hl
+                .as_ref()
+                .and_then(|lines| lines.get(i).map(Vec::as_slice)),
             i + 1,
-            num_width,
-            "▌",
-            changed_style,
-            added_border,
-            avail,
-            mi,
+            DiffLineFormat {
+                num_width,
+                style: changed_style,
+                bar: Some(Color::Green),
+                background: Some(Color::DarkGray),
+                avail,
+                message_index: mi,
+                line_idx,
+            },
             out,
         );
+        line_idx += 1;
     }
 
     // Context after change
     let after_end = (removed_end + ctx).min(o.len());
-    for i in removed_end..after_end {
+    for (i, &line) in o.iter().enumerate().take(after_end).skip(removed_end) {
         push_diff_line(
-            o[i],
-            old_hl.as_ref().and_then(|lines| lines.get(i).map(Vec::as_slice)),
+            line,
+            old_hl
+                .as_ref()
+                .and_then(|lines| lines.get(i).map(Vec::as_slice)),
             i + 1,
-            num_width,
-            "│",
-            ctx_style,
-            ctx_style,
-            avail,
-            mi,
+            DiffLineFormat {
+                num_width,
+                style: ctx_style,
+                bar: None,
+                background: None,
+                avail,
+                message_index: mi,
+                line_idx,
+            },
             out,
         );
+        line_idx += 1;
     }
+}
+
+#[derive(Clone, Copy)]
+struct DiffLineFormat {
+    num_width: usize,
+    style: Style,
+    /// Block color left of the line number: red = removed, green = added,
+    /// None = unchanged dark gray.
+    bar: Option<Color>,
+    background: Option<Color>,
+    avail: usize,
+    message_index: usize,
+    line_idx: usize,
 }
 
 /// Push one diff line with line number gutter, optional syntax segments, and hard-wrapping.
@@ -912,26 +1548,41 @@ fn push_diff_line(
     src: &str,
     segments: Option<&[Segment]>,
     line_num: usize,
-    num_width: usize,
-    marker: &str,
-    style: Style,
-    marker_style: Style,
-    avail: usize,
-    mi: usize,
+    format: DiffLineFormat,
     out: &mut Vec<RenderedLine>,
 ) {
+    let DiffLineFormat {
+        num_width,
+        style,
+        bar,
+        background,
+        avail,
+        message_index: mi,
+        line_idx,
+    } = format;
+    let ln_bg = if line_idx % 2 == 0 {
+        Color::Reset
+    } else {
+        Color::DarkGray
+    };
+    let ln_style = Style::default().fg(Color::White).bg(ln_bg);
+    let bar_text = "█ ";
+    let bar_style = Style::default().fg(bar.unwrap_or(Color::DarkGray));
+    let gutter_pad = format!("{:>width$} ", line_num, width = num_width);
     if src.is_empty() {
-        let prefix = format!("{:>width$}", line_num, width = num_width);
-        let plain = format!("{}{}  ", prefix, marker);
-        out.push(RenderedLine::new(
-            Line::from(vec![
-                Span::styled(prefix, style),
-                Span::styled(marker.to_string(), marker_style),
-                Span::styled("  ".to_string(), style),
-            ]),
-            plain,
-            mi,
-        ));
+        let plain = format!("{}{}  ", bar_text, gutter_pad);
+        out.push(
+            RenderedLine::new(
+                Line::from(vec![
+                    Span::styled(bar_text.to_string(), bar_style),
+                    Span::styled(gutter_pad, ln_style),
+                    Span::styled("  ".to_string(), style),
+                ]),
+                plain,
+                mi,
+            )
+            .with_background(background),
+        );
         return;
     }
 
@@ -951,62 +1602,62 @@ fn push_diff_line(
             .into_iter()
             .enumerate()
         {
-            let (mut row_spans, gutter) = diff_gutter(
-                line_num,
-                num_width,
-                marker,
-                style,
-                marker_style,
-                ci == 0,
-            );
+            let (mut row_spans, gutter) = diff_gutter(line_num, num_width, bar, ln_style, ci == 0);
             row_spans.extend(spans);
-            out.push(RenderedLine::new(
-                Line::from(row_spans),
-                format!("{}{}", gutter, chunk_plain),
-                mi,
-            ));
+            out.push(
+                RenderedLine::new(
+                    Line::from(row_spans),
+                    format!("{}{}", gutter, chunk_plain),
+                    mi,
+                )
+                .with_background(background),
+            );
         }
         return;
     }
 
-    for (ci, chunk) in hard_chunks(src, avail).into_iter().enumerate() {
-        let (row_spans, gutter) = diff_gutter(
-            line_num,
-            num_width,
-            marker,
-            style,
-            marker_style,
-            ci == 0,
-        );
+    let styled_segments = vec![(src.to_string(), style)];
+    for (ci, (content_spans, chunk)) in wrap_segments(&styled_segments, avail)
+        .into_iter()
+        .enumerate()
+    {
+        let (row_spans, gutter) = diff_gutter(line_num, num_width, bar, ln_style, ci == 0);
         let plain = format!("{}{}", gutter, chunk);
         let mut spans = row_spans;
-        spans.push(Span::styled(chunk, style));
-        out.push(RenderedLine::new(Line::from(spans), plain, mi));
+        spans.extend(content_spans);
+        out.push(RenderedLine::new(Line::from(spans), plain, mi).with_background(background));
     }
 }
 
 fn diff_gutter(
     line_num: usize,
     num_width: usize,
-    marker: &str,
-    style: Style,
-    marker_style: Style,
+    bar: Option<Color>,
+    ln_style: Style,
     first: bool,
 ) -> (Vec<Span<'static>>, String) {
+    let bar_text = "█ ";
+    let bar_style = Style::default().fg(bar.unwrap_or(Color::DarkGray));
     if first {
-        let prefix = format!("{:>width$}", line_num, width = num_width);
-        let plain = format!("{}{} ", prefix, marker);
+        let prefix = format!("{:>width$} ", line_num, width = num_width);
+        let plain = format!("{}{} ", bar_text, prefix);
         (
             vec![
-                Span::styled(prefix, style),
-                Span::styled(marker.to_string(), marker_style),
-                Span::styled(" ".to_string(), style),
+                Span::styled(bar_text.to_string(), bar_style),
+                Span::styled(prefix, ln_style),
             ],
             plain,
         )
     } else {
-        let plain = format!("{:>width$}  ", "", width = num_width + 1);
-        (vec![Span::styled(plain.clone(), style)], plain)
+        let padding = format!("{:>width$} ", "", width = num_width);
+        let plain = format!("{}{} ", bar_text, padding);
+        (
+            vec![
+                Span::styled(bar_text.to_string(), bar_style),
+                Span::styled(padding, ln_style),
+            ],
+            plain,
+        )
     }
 }
 
@@ -1033,9 +1684,8 @@ fn summary_arg(summary: &str) -> Option<&str> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_tool_result(
+fn render_agent_result(
     ok: bool,
-    name: Option<&str>,
     summary: &str,
     output: &str,
     mi: usize,
@@ -1046,8 +1696,315 @@ fn render_tool_result(
     show_output: bool,
     out: &mut Vec<RenderedLine>,
 ) {
+    if !output.contains("[agent-meta] ") {
+        let legacy = output
+            .strip_prefix("[agent-id:")
+            .and_then(|text| text.split_once("]\n").map(|(_, body)| body))
+            .unwrap_or(output);
+        let running = legacy.strip_prefix("[running]\n");
+        let report = running.unwrap_or(legacy);
+        let state = if running.is_some() {
+            "running"
+        } else if ok {
+            "completed"
+        } else {
+            "failed"
+        };
+        let expanded = show_output || toggled.contains(&(mi, bi));
+        let arrow = if expanded { "▾ " } else { "▸ " };
+        let icon = if running.is_some() {
+            "◐"
+        } else if ok {
+            "●"
+        } else {
+            "×"
+        };
+        let header = format!("{} · {}", summary, state);
+        out.push(
+            RenderedLine::new(
+                tool_chip_header("agent", arrow, icon, &header, None, ok, theme),
+                header,
+                mi,
+            )
+            .with_toggle((mi, bi)),
+        );
+        if expanded && !report.trim().is_empty() {
+            render_markdown(report.trim(), mi, width.max(1), theme, out);
+        }
+        return;
+    }
+
+    let mut metadata = serde_json::Value::Null;
+    let mut events = Vec::new();
+    let mut report = "";
+    let mut section = "";
+    for line in output.lines() {
+        if let Some(json) = line.strip_prefix("[agent-meta] ") {
+            metadata = serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
+        } else if line == "[agent-events]" {
+            section = "events";
+        } else if line == "[agent-report]" {
+            section = "report";
+        } else if line.starts_with("[agent-id:") {
+            continue;
+        } else if section == "events" && !line.is_empty() {
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                events.push(event);
+            }
+        } else if section == "report" {
+            let offset = line.as_ptr() as usize - output.as_ptr() as usize;
+            report = &output[offset..];
+            break;
+        }
+    }
+
+    let state = metadata["status"]
+        .as_str()
+        .unwrap_or(if ok { "completed" } else { "failed" });
+    let activity = metadata["activity"].as_str().unwrap_or(state);
+    let elapsed = metadata["elapsed_ms"].as_u64().map(fmt_duration_ms);
+    let icon = match state {
+        "running" => "◐",
+        "completed" => "●",
+        _ => "×",
+    };
+    let expanded = show_output || toggled.contains(&(mi, bi));
+    let arrow = if expanded { "▾ " } else { "▸ " };
+    let header = format!("{} · {}", summary, activity);
+    let mut row = RenderedLine::new(
+        tool_chip_header(
+            "agent",
+            arrow,
+            icon,
+            &header,
+            elapsed.as_deref(),
+            state != "failed",
+            theme,
+        ),
+        header,
+        mi,
+    )
+    .with_toggle((mi, bi));
+    row.background = Some(Color::DarkGray);
+    out.push(row);
+
+    if !expanded {
+        return;
+    }
+
+    let status_color = match state {
+        "running" => theme.warning,
+        "completed" => theme.success,
+        _ => theme.danger,
+    };
+    let mut details = vec![
+        Span::styled(
+            " STATUS ",
+            Style::default()
+                .bg(status_color)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {} ", state.to_uppercase()),
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(duration) = elapsed.as_deref() {
+        details.push(Span::styled(
+            " DURATION ",
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(theme.text)
+                .add_modifier(Modifier::BOLD),
+        ));
+        details.push(Span::styled(
+            format!(" {} ", duration),
+            Style::default().fg(theme.text),
+        ));
+    }
+    if let Some(task) = metadata["todo_index"].as_u64() {
+        details.push(Span::styled(
+            format!(" TASK {} ", task),
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    out.push(RenderedLine::new(
+        Line::from(details),
+        format!("{} {}", state, elapsed.as_deref().unwrap_or("")),
+        mi,
+    ));
+
+    if let Some(cwd) = metadata["cwd"].as_str() {
+        out.push(RenderedLine::new(
+            Line::from(vec![
+                Span::styled(
+                    " CWD ",
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .fg(theme.text)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {}", crate::render::path::abbreviate_home(cwd)),
+                    Style::default().fg(theme.muted),
+                ),
+            ]),
+            cwd.to_string(),
+            mi,
+        ));
+    }
+
+    for (event_index, event) in events.into_iter().enumerate() {
+        match event["kind"].as_str().unwrap_or("") {
+            "tool" => {
+                let name = event["name"].as_str().unwrap_or("tool");
+                let summary = event["summary"].as_str().unwrap_or(name);
+                let status = event["status"].as_str().unwrap_or("running");
+                let event_ok = status != "failed";
+                if status != "running" {
+                    let call =
+                        serde_json::from_value::<crate::agent::ToolCall>(event["call"].clone())
+                            .ok();
+                    if let Some(output) = event["output"].as_str() {
+                        let nested_bi = usize::MAX.saturating_sub(event_index);
+                        render_tool_result(
+                            event_ok,
+                            Some(name),
+                            summary,
+                            output,
+                            call.as_ref(),
+                            mi,
+                            nested_bi,
+                            width,
+                            theme,
+                            toggled,
+                            show_output,
+                            out,
+                        );
+                        continue;
+                    }
+                }
+                let (event_icon, event_ok) = match status {
+                    "completed" => ("✓", true),
+                    "failed" => ("×", false),
+                    _ => ("◐", true),
+                };
+                let duration = event["duration_ms"].as_u64().map(fmt_duration_ms);
+                out.push(RenderedLine::new(
+                    tool_chip_header(
+                        name,
+                        "",
+                        event_icon,
+                        summary,
+                        duration.as_deref(),
+                        event_ok,
+                        theme,
+                    ),
+                    format!("{} {}", name, summary),
+                    mi,
+                ));
+            }
+            "checklist" => {
+                let done = event["done"].as_u64().unwrap_or(0);
+                let running = event["running"].as_u64().unwrap_or(0);
+                let pending = event["pending"].as_u64().unwrap_or(0);
+                let finalizing = running == 0 && pending == 0;
+                let label = if finalizing {
+                    format!(
+                        "Local checklist complete · {} done · finalizing report",
+                        done
+                    )
+                } else {
+                    format!(
+                        "Local checklist · {} done · {} running · {} pending",
+                        done, running, pending
+                    )
+                };
+                out.push(RenderedLine::new(
+                    Line::from(vec![
+                        Span::styled(
+                            " CHECKLIST ",
+                            Style::default()
+                                .bg(theme.accent)
+                                .fg(Color::Black)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!(" {} ", label),
+                            Style::default().fg(if finalizing {
+                                theme.warning
+                            } else {
+                                theme.text
+                            }),
+                        ),
+                    ]),
+                    label,
+                    mi,
+                ));
+            }
+            "phase" => {
+                if let Some(text) = event["text"].as_str() {
+                    out.push(RenderedLine::new(
+                        Line::from(vec![
+                            Span::styled(
+                                " PHASE ",
+                                Style::default()
+                                    .bg(Color::DarkGray)
+                                    .fg(theme.text)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(format!(" {}", text), Style::default().fg(theme.muted)),
+                        ]),
+                        text.to_string(),
+                        mi,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !report.trim().is_empty() {
+        out.push(RenderedLine::new(
+            Line::from(Span::styled(
+                " REPORT ",
+                Style::default()
+                    .bg(theme.accent)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            "REPORT".into(),
+            mi,
+        ));
+        render_markdown(report.trim(), mi, width.max(1), theme, out);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_tool_result(
+    ok: bool,
+    name: Option<&str>,
+    summary: &str,
+    output: &str,
+    call: Option<&crate::agent::ToolCall>,
+    mi: usize,
+    bi: usize,
+    width: usize,
+    theme: &Theme,
+    toggled: &HashSet<(usize, usize)>,
+    show_output: bool,
+    out: &mut Vec<RenderedLine>,
+) {
     use crate::agent::ToolKind;
     let kind = name.and_then(ToolKind::from_name);
+    let display_summary = crate::render::path::abbreviate_home(summary);
+    let display_output = crate::render::path::abbreviate_home(output);
 
     // `todo` lives entirely in the sticky panel above the input — it never appears
     // in the scrollable transcript.
@@ -1055,24 +2012,248 @@ fn render_tool_result(
         return;
     }
 
-    // Single-visibility: `edit`/`write` already rendered on the call side (diff /
-    // preview). Their success result is redundant — show nothing. A failure must
-    // still surface, so render the error only.
-    if matches!(kind, Some(ToolKind::Edit) | Some(ToolKind::Write)) {
-        if ok {
-            return;
-        }
-        push_status(
-            "✗",
-            &format!(
-                "{} failed: {}",
-                summary,
-                output.lines().next().unwrap_or("")
-            ),
-            theme.danger,
+    if kind == Some(ToolKind::Task) {
+        render_agent_result(
+            ok,
+            &display_summary,
+            &display_output,
             mi,
+            bi,
+            width,
+            theme,
+            toggled,
+            show_output,
             out,
         );
+        return;
+    }
+
+    // Mutating file tools have purpose-built source views backed by the original
+    // executed call, rather than reconstructing code from the confirmation text.
+    if matches!(kind, Some(ToolKind::Edit) | Some(ToolKind::Write)) {
+        if !ok {
+            push_status(
+                "✗",
+                &format!(
+                    "{} failed: {}",
+                    display_summary,
+                    display_output.lines().next().unwrap_or("")
+                ),
+                theme.danger,
+                mi,
+                out,
+            );
+            return;
+        }
+
+        let confirmation = output
+            .lines()
+            .next()
+            .filter(|line| !line.is_empty())
+            .unwrap_or(&display_summary);
+        let preview_lines = call
+            .and_then(|call| match kind {
+                Some(ToolKind::Edit) => call
+                    .args
+                    .get("old")
+                    .or_else(|| call.args.get("old_string"))
+                    .and_then(|value| value.as_str())
+                    .map(|old| old.lines().count()),
+                Some(ToolKind::Write) => call
+                    .args
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .map(|content| content.lines().count()),
+                _ => None,
+            })
+            .unwrap_or_else(|| output.lines().skip(1).count());
+        let collapse_limit = if call.is_some() {
+            WRITE_PREVIEW_LINES
+        } else {
+            12
+        };
+        let default_expanded = preview_lines <= collapse_limit;
+        let expanded = show_output || (toggled.contains(&(mi, bi)) != default_expanded);
+        let collapsible = preview_lines > collapse_limit && !show_output;
+        let arrow = if collapsible {
+            if expanded {
+                "▾ "
+            } else {
+                "▸ "
+            }
+        } else {
+            ""
+        };
+        let icon = kind.map(|tool| tool.icon()).unwrap_or("✓");
+        let meta = (preview_lines > 0).then(|| format!("{} lines", preview_lines));
+        let mut row = RenderedLine::new(
+            tool_chip_header(
+                kind.map(|tool| tool.name()).unwrap_or("tool"),
+                arrow,
+                icon,
+                confirmation,
+                meta.as_deref(),
+                true,
+                theme,
+            ),
+            format!("{} {}", icon, confirmation),
+            mi,
+        );
+        if collapsible {
+            row = row.with_toggle((mi, bi));
+        }
+        out.push(row);
+
+        if expanded {
+            let body_start = out.len();
+            if let Some(call) = call {
+                let path = call
+                    .args
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                match kind {
+                    Some(ToolKind::Edit) => {
+                        let old = call
+                            .args
+                            .get("old")
+                            .or_else(|| call.args.get("old_string"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        let new = call
+                            .args
+                            .get("new")
+                            .or_else(|| call.args.get("new_string"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        let start_line = call
+                            .args
+                            .get("__display_start_line")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(1) as usize;
+                        render_edit_comparison(
+                            path,
+                            old,
+                            new,
+                            start_line,
+                            mi,
+                            width.saturating_sub(TOOL_BODY_INDENT).max(1),
+                            theme,
+                            out,
+                        );
+                    }
+                    Some(ToolKind::Write) => {
+                        let content = call
+                            .args
+                            .get("content")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        render_source_card(
+                            "CONTENT",
+                            theme.success,
+                            path,
+                            content,
+                            1,
+                            mi,
+                            width.saturating_sub(TOOL_BODY_INDENT).max(1),
+                            theme,
+                            out,
+                        );
+                    }
+                    _ => {}
+                }
+            } else {
+                let detail = output.lines().skip(1).collect::<Vec<_>>().join("\n");
+                if !detail.is_empty() {
+                    render_compact_diff_output(
+                        &detail,
+                        mi,
+                        width.saturating_sub(TOOL_BODY_INDENT).max(1),
+                        theme,
+                        out,
+                    );
+                }
+            }
+            indent_tool_body(&mut out[body_start..], TOOL_BODY_INDENT);
+        }
+        return;
+    }
+
+    if kind == Some(ToolKind::Read) {
+        if !ok {
+            push_status(
+                "✗",
+                &format!(
+                    "{} failed: {}",
+                    display_summary,
+                    output.lines().next().unwrap_or("")
+                ),
+                theme.danger,
+                mi,
+                out,
+            );
+            return;
+        }
+
+        let path = call
+            .and_then(|call| call.args.get("path"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or_else(|| summary_arg(summary).map(str::to_string))
+            .unwrap_or_default();
+        let (start_line, content, notes) = read_file_body(output);
+        let source_lines = content.lines().count();
+        let default_expanded = source_lines <= WRITE_PREVIEW_LINES;
+        let expanded = show_output || (toggled.contains(&(mi, bi)) != default_expanded);
+        let collapsible = source_lines > WRITE_PREVIEW_LINES && !show_output;
+        let arrow = if collapsible {
+            if expanded {
+                "▾ "
+            } else {
+                "▸ "
+            }
+        } else {
+            ""
+        };
+        let mut row = RenderedLine::new(
+            tool_chip_header(
+                "read",
+                arrow,
+                kind.map(|tool| tool.icon()).unwrap_or("✓"),
+                &crate::render::path::abbreviate_home(&path),
+                Some(&format!("{} lines", source_lines)),
+                true,
+                theme,
+            ),
+            format!("read {} ({} lines)", path, source_lines),
+            mi,
+        );
+        if collapsible {
+            row = row.with_toggle((mi, bi));
+        }
+        out.push(row);
+        if expanded {
+            let body_start = out.len();
+            render_source_card(
+                "CONTENT",
+                theme.accent,
+                &path,
+                &content,
+                start_line,
+                mi,
+                width.saturating_sub(TOOL_BODY_INDENT).max(1),
+                theme,
+                out,
+            );
+            for note in notes {
+                out.push(RenderedLine::new(
+                    Line::from(Span::styled(note.clone(), Style::default().fg(theme.muted))),
+                    note,
+                    mi,
+                ));
+            }
+            indent_tool_body(&mut out[body_start..], TOOL_BODY_INDENT);
+        }
         return;
     }
 
@@ -1090,26 +2271,34 @@ fn render_tool_result(
         } else {
             "✗"
         };
-        let color = if ok { theme.success } else { theme.danger };
-        let msg = output
+        let msg = display_output
             .lines()
             .next()
             .filter(|l| !l.is_empty())
-            .unwrap_or(summary);
-        push_status(icon, msg, color, mi, out);
+            .unwrap_or(&display_summary);
+        let label = kind.map(|k| k.name()).unwrap_or("tool");
+        let plain = format!("{} {}", icon, msg);
+        out.push(RenderedLine::new(
+            tool_chip_header(label, "", icon, msg, None, ok, theme),
+            plain,
+            mi,
+        ));
         return;
     }
 
     // Result-side tools (read/list/search/shell/web_*): the output is the payload.
-    let lines: Vec<&str> = output.lines().collect();
+    let lines: Vec<&str> = display_output.lines().collect();
     // Short output is always shown; long output collapses unless the global
     // "show output" toggle is on (or this block was individually flipped).
     let default_expanded = lines.len() <= 6;
     let expanded = show_output || (toggled.contains(&(mi, bi)) != default_expanded);
     let collapsible = lines.len() > 6 && !show_output;
 
-    let icon = if ok { "✓" } else { "✗" };
-    let color = if ok { theme.success } else { theme.danger };
+    let icon = if ok {
+        kind.map(|tool| tool.icon()).unwrap_or("✓")
+    } else {
+        "✗"
+    };
     let arrow = if collapsible {
         if expanded {
             "▾ "
@@ -1119,22 +2308,38 @@ fn render_tool_result(
     } else {
         ""
     };
-    let header = format!("    {}{} {} ({} lines)", arrow, icon, summary, lines.len());
-    let mut row = RenderedLine::new(
-        Line::from(Span::styled(
-            header.clone(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )),
-        header,
-        mi,
+    // The shell's command is already shown as a terminal prompt beneath the
+    // header — don't repeat the `shell(...)` call wrapper on top.
+    let header_summary = if ok && kind == Some(ToolKind::Shell) {
+        crate::render::path::abbreviate_home(shell_command(call, summary))
+    } else {
+        display_summary.clone()
+    };
+    let header = format!(
+        "    {}{} {} ({} lines)",
+        arrow,
+        icon,
+        header_summary,
+        lines.len()
     );
+    let header_line = tool_chip_header(
+        kind.map(|tool| tool.name()).unwrap_or("tool"),
+        arrow,
+        icon,
+        &header_summary,
+        Some(&format!("{} lines", lines.len())),
+        ok,
+        theme,
+    );
+    let mut row = RenderedLine::new(header_line, header, mi);
     if collapsible {
         row = row.with_toggle((mi, bi));
     }
     out.push(row);
 
     if expanded {
-        let avail = width.saturating_sub(6).max(1);
+        let body_start = out.len();
+        let avail = width.saturating_sub(TOOL_BODY_INDENT).max(1);
         // A successful `read` result is file content — syntax-highlight it by the
         // language inferred from the path inside the `read(path)` summary.
         let read_lang = if ok && kind == Some(ToolKind::Read) {
@@ -1143,16 +2348,21 @@ fn render_tool_result(
             None
         };
         // Web results carry markdown links — render as markdown so sources are clickable.
-        let as_markdown =
-            ok && matches!(kind, Some(ToolKind::WebSearch) | Some(ToolKind::WebFetch));
-        if let Some(lang) = read_lang {
-            let gutter = Style::default().fg(theme.accent);
+        let as_markdown = ok
+            && matches!(
+                kind,
+                Some(ToolKind::WebSearch)
+                    | Some(ToolKind::WebFetch)
+                    | Some(ToolKind::WebImages)
+                    | Some(ToolKind::ReverseImage)
+            );
+        if let Some(lang) = read_lang.as_deref() {
             push_code(
-                output,
-                &lang,
-                "    │ ",
-                "    │ ",
-                gutter,
+                &display_output,
+                lang,
+                "",
+                "",
+                Style::default(),
                 Style::default().fg(theme.muted),
                 avail,
                 mi,
@@ -1160,26 +2370,260 @@ fn render_tool_result(
                 out,
             );
         } else if as_markdown {
-            render_markdown(output, mi, avail, theme, out);
+            render_markdown(&display_output, mi, avail, theme, out);
         } else if ok && kind == Some(ToolKind::Search) {
             let pattern = search_pattern_from_summary(summary);
-            render_search_output(output, pattern.as_deref(), mi, avail, theme, out);
+            render_search_output(&display_output, pattern.as_deref(), mi, avail, theme, out);
+        } else if ok
+            && kind == Some(ToolKind::Shell)
+            && render_shell_diff(
+                shell_command(call, summary),
+                &display_output,
+                mi,
+                avail,
+                theme,
+                out,
+            )
+        {
+            // Shell patches keep their diff renderer beneath the highlighted prompt.
+        } else if ok && kind == Some(ToolKind::Shell) {
+            render_shell_output(
+                shell_command(call, summary),
+                &display_output,
+                mi,
+                avail,
+                theme,
+                out,
+            );
+        } else if render_unified_diff_output(&display_output, mi, avail, theme, out) {
+            // Unified patches carry their own filenames, so changed code can be
+            // parsed with the matching grammar instead of receiving only a flat
+            // red/green line colour.
         } else {
+            let style = Style::default().fg(theme.muted);
             for l in &lines {
-                // Colour diff lines (`git diff`, patches): `+` added green, `-`
-                // removed red, `@@` hunk headers accent.
-                let color = diff_line_color(l, theme);
-                for chunk in hard_chunks(l, avail) {
-                    let plain = format!("    │ {}", chunk);
-                    out.push(RenderedLine::new(
-                        Line::from(Span::styled(plain.clone(), Style::default().fg(color))),
-                        plain,
-                        mi,
-                    ));
+                let segments = vec![(l.to_string(), style)];
+                for (spans, plain) in wrap_segments(&segments, avail) {
+                    out.push(RenderedLine::new(Line::from(spans), plain, mi));
                 }
             }
         }
+        indent_tool_body(&mut out[body_start..], TOOL_BODY_INDENT);
     }
+}
+fn render_compact_diff_output(
+    output: &str,
+    mi: usize,
+    width: usize,
+    theme: &Theme,
+    out: &mut Vec<RenderedLine>,
+) {
+    for line in output.lines() {
+        let style = if line.starts_with("+ ") {
+            Style::default().fg(theme.success)
+        } else if line.starts_with("- ") {
+            Style::default().fg(theme.danger)
+        } else if line.starts_with("@@") {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        for (spans, plain) in wrap_segments(&[(line.to_string(), style)], width) {
+            out.push(RenderedLine::new(Line::from(spans), plain, mi));
+        }
+    }
+}
+
+fn shell_command<'a>(call: Option<&'a crate::agent::ToolCall>, summary: &'a str) -> &'a str {
+    call.and_then(|call| call.args.get("command"))
+        .and_then(|value| value.as_str())
+        .or_else(|| summary_arg(summary))
+        .unwrap_or("")
+}
+
+fn render_shell_diff(
+    command: &str,
+    output: &str,
+    mi: usize,
+    width: usize,
+    theme: &Theme,
+    out: &mut Vec<RenderedLine>,
+) -> bool {
+    let is_diff = output.lines().any(|line| line.starts_with("@@"))
+        && output
+            .lines()
+            .any(|line| line.starts_with("--- ") || line.starts_with("+++ "));
+    if !is_diff {
+        return false;
+    }
+    render_terminal_prompt(command, mi, width, theme, out);
+    render_unified_diff_output(output, mi, width, theme, out)
+}
+
+/// Render shell output as a terminal session: a Bash-highlighted prompt followed
+/// by opaque output rows and explicit stderr/exit status styling.
+fn render_shell_output(
+    command: &str,
+    output: &str,
+    mi: usize,
+    width: usize,
+    theme: &Theme,
+    out: &mut Vec<RenderedLine>,
+) {
+    render_terminal_prompt(command, mi, width, theme, out);
+
+    let bg = Color::Black;
+    let term_style = Style::default().bg(bg).fg(Color::White);
+    let stderr_style = Style::default().bg(bg).fg(theme.danger);
+    let exit_ok = Style::default()
+        .bg(bg)
+        .fg(theme.success)
+        .add_modifier(Modifier::BOLD);
+    let exit_fail = Style::default()
+        .bg(bg)
+        .fg(theme.danger)
+        .add_modifier(Modifier::BOLD);
+    let gutter = Style::default().bg(bg).fg(Color::DarkGray);
+    let mut stderr = false;
+
+    for line in output.lines() {
+        let (display, style) = if line == "[stderr]" {
+            stderr = true;
+            (
+                "stderr".to_string(),
+                stderr_style.add_modifier(Modifier::BOLD),
+            )
+        } else if let Some(code) = line
+            .strip_prefix("[exit ")
+            .and_then(|text| text.strip_suffix(']'))
+        {
+            let ok = code == "0";
+            (
+                format!("process exited with status {}", code),
+                if ok { exit_ok } else { exit_fail },
+            )
+        } else {
+            (
+                line.to_string(),
+                if stderr { stderr_style } else { term_style },
+            )
+        };
+        let segments = vec![("│ ".to_string(), gutter), (display, style)];
+        for (spans, plain) in wrap_segments(&segments, width) {
+            out.push(RenderedLine::new(Line::from(spans), plain, mi).with_background(Some(bg)));
+        }
+    }
+}
+
+fn render_terminal_prompt(
+    command: &str,
+    mi: usize,
+    width: usize,
+    theme: &Theme,
+    out: &mut Vec<RenderedLine>,
+) {
+    let bg = Color::Black;
+    let prompt = Style::default()
+        .bg(bg)
+        .fg(theme.success)
+        .add_modifier(Modifier::BOLD);
+    let continuation = Style::default().bg(bg).fg(Color::DarkGray);
+    let fallback = Style::default().bg(bg).fg(Color::White);
+    let highlighted = highlight::highlight(command, "bash", theme).unwrap_or_else(|| {
+        command
+            .lines()
+            .map(|line| vec![(line.to_string(), fallback)])
+            .collect()
+    });
+
+    for (line_index, segments) in highlighted.into_iter().enumerate() {
+        let prefix = if line_index == 0 { "$ " } else { "> " };
+        let prefix_style = if line_index == 0 {
+            prompt
+        } else {
+            continuation
+        };
+        let mut terminal_segments = vec![(prefix.to_string(), prefix_style)];
+        terminal_segments.extend(segments.into_iter().map(|(text, style)| {
+            let mut style = style;
+            style.bg = Some(bg);
+            (text, style)
+        }));
+        for (spans, plain) in wrap_segments(&terminal_segments, width) {
+            out.push(RenderedLine::new(Line::from(spans), plain, mi).with_background(Some(bg)));
+        }
+    }
+}
+
+/// Render unified-diff output with Tree-sitter styles inferred from each file
+/// header. Returns false when `output` is not recognisably a patch.
+fn render_unified_diff_output(
+    output: &str,
+    mi: usize,
+    width: usize,
+    theme: &Theme,
+    out: &mut Vec<RenderedLine>,
+) -> bool {
+    let is_diff = output.lines().any(|line| line.starts_with("@@"))
+        && output
+            .lines()
+            .any(|line| line.starts_with("--- ") || line.starts_with("+++ "));
+    if !is_diff {
+        return false;
+    }
+
+    let mut path = String::new();
+    for line in output.lines() {
+        if let Some(candidate) = line.strip_prefix("+++ ") {
+            path = candidate
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_start_matches("b/")
+                .to_string();
+        }
+        let (marker, body, marker_color) = if line.starts_with("+++") || line.starts_with("---") {
+            ("", line, theme.accent)
+        } else if let Some(body) = line.strip_prefix('+') {
+            ("+", body, theme.success)
+        } else if let Some(body) = line.strip_prefix('-') {
+            ("-", body, theme.danger)
+        } else if let Some(body) = line.strip_prefix(' ') {
+            (" ", body, theme.muted)
+        } else {
+            ("", line, diff_line_color(line, theme))
+        };
+
+        let segments = if marker.is_empty() || path.is_empty() {
+            vec![(body.to_string(), Style::default().fg(marker_color))]
+        } else {
+            highlight::highlight(body, &path, theme)
+                .and_then(|lines| lines.into_iter().next())
+                .unwrap_or_else(|| vec![(body.to_string(), Style::default().fg(theme.muted))])
+        };
+        for (row_index, (spans, plain)) in
+            wrap_segments(&segments, width.saturating_sub(marker.len()).max(1))
+                .into_iter()
+                .enumerate()
+        {
+            let lead = if row_index == 0 { marker } else { " " };
+            let mut row_spans = vec![Span::styled(
+                lead.to_string(),
+                Style::default()
+                    .fg(marker_color)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            row_spans.extend(spans);
+            out.push(RenderedLine::new(
+                Line::from(row_spans),
+                format!("{}{}", lead, plain),
+                mi,
+            ));
+        }
+    }
+    true
 }
 
 /// Colour for a tool-output line by its leading diff marker.
@@ -1289,10 +2733,94 @@ mod tests {
             role: role.to_string(),
             blocks,
             duration_ms: None,
-            first_ms: None,
-            loading: None,
-            started_at: None,
+            created_at: None,
         }]
+    }
+
+    #[test]
+    fn hides_only_the_final_tool_invocation_paragraph() {
+        let call = crate::agent::ToolCall {
+            name: "read".into(),
+            args: serde_json::json!({"path": "a.rs"}),
+            id: None,
+        };
+        let rows = build(
+            &doc(
+                "assistant",
+                vec![
+                    Block::Markdown(
+                        "The parser needs one more verification.\n\nI’ll inspect the file now."
+                            .into(),
+                    ),
+                    Block::ToolCall(call),
+                ],
+            ),
+            60,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| row
+            .plain
+            .contains("The parser needs one more verification.")));
+        assert!(!rows
+            .iter()
+            .any(|row| row.plain.contains("I’ll inspect the file now.")));
+    }
+
+    #[test]
+    fn unrelated_plan_prose_before_tool_call_remains_visible() {
+        let call = crate::agent::ToolCall {
+            name: "read".into(),
+            args: serde_json::json!({"path": "a.rs"}),
+            id: None,
+        };
+        let rows = build(
+            &doc(
+                "assistant",
+                vec![
+                    Block::Markdown("Plan:\n1. Confirm parsing.\n2. Verify rendering.".into()),
+                    Block::ToolCall(call),
+                ],
+            ),
+            60,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| row.plain.contains("Plan:")));
+        assert!(rows.iter().any(|row| row.plain.contains("Confirm parsing")));
+    }
+
+    #[test]
+    fn prose_around_partial_tool_payload_remains_visible() {
+        let rows = build(
+            &doc(
+                "assistant",
+                vec![
+                    Block::Markdown("Preparing one operation.".into()),
+                    Block::Code {
+                        lang: "tool".into(),
+                        code: "{\"name\":\"read\"".into(),
+                    },
+                    Block::Markdown("This explanation remains visible.".into()),
+                ],
+            ),
+            60,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            true,
+        );
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("Preparing one operation.")));
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("This explanation remains visible.")));
+        assert!(!rows.iter().any(|row| row.plain.contains("{\"name\"")));
     }
 
     #[test]
@@ -1302,15 +2830,83 @@ mod tests {
             vec![Block::Markdown("aaaa bbbb cccc dddd".into())],
         );
         let rows = build(&msgs, 9, &Theme::default(), &HashSet::new(), false, false);
-        // header + wrapped lines + separator + blank
-        let texts: Vec<&str> = rows.iter().map(|r| r.plain.as_str()).collect();
-        assert!(texts.iter().any(|t| t.contains("assistant")));
+        // block header + 2-space indented wrapped lines + blank
         for r in &rows {
-            assert!(
-                unicode_width::UnicodeWidthStr::width(r.plain.as_str()) <= 9
-                    || r.plain.contains("assistant")
-            );
+            let w = unicode_width::UnicodeWidthStr::width(r.plain.as_str());
+            assert!(w <= 9, "row exceeds width 9: {:?} (width={})", r.plain, w);
         }
+    }
+
+    #[test]
+    fn styled_segments_wrap_whole_words_and_keep_styles() {
+        let keyword = Style::default().fg(Color::Blue);
+        let string = Style::default().fg(Color::Green).bg(Color::DarkGray);
+        let rows = wrap_segments(
+            &[
+                ("let value = ".into(), keyword),
+                ("highlighted text".into(), string),
+            ],
+            13,
+        );
+
+        assert_eq!(
+            rows.iter()
+                .map(|(_, plain)| plain.as_str())
+                .collect::<Vec<_>>(),
+            vec!["let value =", "highlighted", "text"]
+        );
+        assert!(rows[1].0.iter().all(|span| span.style == string));
+        assert!(rows[2].0.iter().all(|span| span.style == string));
+    }
+
+    #[test]
+    fn styled_segments_only_hard_break_overlong_words() {
+        let style = Style::default().fg(Color::Yellow);
+        let rows = wrap_segments(&[("tiny abcdefghij".into(), style)], 6);
+        assert_eq!(
+            rows.iter()
+                .map(|(_, plain)| plain.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tiny", "abcdef", "ghij"]
+        );
+    }
+
+    #[test]
+    fn text_segments_are_indented_inside_the_message() {
+        let rows = build(
+            &doc("assistant", vec![Block::Markdown("indented text".into())]),
+            40,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        let text = rows
+            .iter()
+            .find(|row| row.plain.contains("indented text"))
+            .expect("text row");
+        assert!(text.plain.starts_with("    indented text"));
+    }
+
+    #[test]
+    fn thinking_first_message_has_no_blank_row_above_section() {
+        let rows = build(
+            &doc("assistant", vec![Block::Thinking("reasoning".into())]),
+            40,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        let thinking = rows
+            .iter()
+            .position(|row| row.plain.contains("thinking (1 lines)"))
+            .expect("thinking row");
+        assert_eq!(
+            thinking, 1,
+            "thinking should immediately follow role header"
+        );
+        assert!(!rows[thinking - 1].plain.trim().is_empty());
     }
 
     #[test]
@@ -1327,7 +2923,7 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_rule_renders_as_line_not_dashes() {
+    fn horizontal_rule_renders_as_text_rule_without_background() {
         let rows = build(
             &doc("assistant", vec![Block::Markdown("a\n---\nb".into())]),
             20,
@@ -1336,9 +2932,18 @@ mod tests {
             false,
             false,
         );
-        // The `---` becomes a run of box-drawing chars, not three dashes.
-        assert!(rows.iter().any(|r| r.plain.contains("─────")));
-        assert!(!rows.iter().any(|r| r.plain.trim() == "---"));
+        assert!(rows.iter().any(|row| row.plain.contains('─')));
+        // The block header row has a colored background; horizontal rule content does not.
+        for row in rows.iter().filter(|r| r.role_start.is_none()) {
+            for span in &row.line.spans {
+                assert!(
+                    span.style.bg.is_none(),
+                    "non-header span has bg: {:?}",
+                    span
+                );
+            }
+        }
+        assert!(!rows.iter().any(|row| row.plain.trim() == "---"));
     }
 
     #[test]
@@ -1418,12 +3023,151 @@ mod tests {
     }
 
     #[test]
+    fn tool_headers_show_status_icon_without_tool_name_chip() {
+        let theme = Theme::default();
+        let line = tool_chip_header("shell", "▸ ", "✓", "cargo test", Some("1.2s"), true, &theme);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("✓"));
+        assert!(text.contains("cargo test"));
+        assert!(!text.to_ascii_lowercase().contains("shell"));
+    }
+
+    #[test]
+    fn subagent_tool_events_use_the_same_file_renderer() {
+        let output = concat!(
+            "[agent-id:7]\n",
+            "[agent-meta] {\"status\":\"completed\",\"activity\":\"done\"}\n",
+            "[agent-events]\n",
+            "{\"kind\":\"tool\",\"name\":\"read\",\"summary\":\"read(src/main.rs)\",\"status\":\"completed\",\"duration_ms\":42,\"call\":{\"name\":\"file_management\",\"args\":{\"action\":\"read\",\"path\":\"src/main.rs\"},\"id\":null},\"output\":\"[lines 5-6 of 6]\\nfn main() {}\\nlet value = true;\"}\n",
+            "[agent-report]\n",
+            "Done."
+        );
+        let block = Block::ToolResult {
+            ok: true,
+            name: Some("agent".into()),
+            summary: "agent 1 (\"inspect\")".into(),
+            output: output.into(),
+        };
+        let mut toggled = HashSet::new();
+        toggled.insert((0, 0));
+        let rows = build(
+            &doc("tool", vec![block]),
+            100,
+            &Theme::default(),
+            &toggled,
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| row.plain.contains("█ CONTENT")));
+        assert!(rows.iter().any(|row| row.plain.contains("█ 5 │ fn main()")));
+        assert!(rows.iter().any(|row| {
+            row.line.spans.iter().any(|span| {
+                span.content.as_ref() == "fn" && span.style.fg == Some(Theme::default().hl_keyword)
+            })
+        }));
+    }
+
+    #[test]
+    fn agent_result_is_inline_collapsed_and_expands_with_highlighted_tools() {
+        let output = concat!(
+            "[agent-id:7]\n",
+            "[agent-meta] {\"status\":\"running\",\"activity\":\"Local checklist complete · finalizing report\",\"todo_index\":2,\"cwd\":\"/tmp/project\",\"elapsed_ms\":1250}\n",
+            "[agent-events]\n",
+            "{\"kind\":\"checklist\",\"done\":3,\"running\":0,\"pending\":0}\n",
+            "{\"kind\":\"tool\",\"name\":\"search\",\"summary\":\"search(\\\"barrier\\\")\",\"status\":\"completed\",\"duration_ms\":42}\n",
+            "[agent-report]\n",
+            "Found the lifecycle boundary."
+        );
+        let block = Block::ToolResult {
+            ok: true,
+            name: Some("agent".into()),
+            summary: "agent 1 → task 2 (\"trace lifecycle\")".into(),
+            output: output.into(),
+        };
+        let collapsed = build(
+            &doc("tool", vec![block.clone()]),
+            100,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(collapsed.iter().any(|row| {
+            row.plain
+                .contains("Local checklist complete · finalizing report")
+                && row.toggle == Some((0, 0))
+        }));
+        assert!(!collapsed
+            .iter()
+            .any(|row| row.plain.contains("Found the lifecycle boundary")));
+
+        let mut toggled = HashSet::new();
+        toggled.insert((0, 0));
+        let expanded = build(
+            &doc("tool", vec![block]),
+            100,
+            &Theme::default(),
+            &toggled,
+            false,
+            false,
+        );
+        assert!(expanded.iter().any(|row| {
+            row.plain
+                .contains("Local checklist complete · 3 done · finalizing report")
+        }));
+        assert!(expanded.iter().any(|row| {
+            row.plain.contains("search(\"barrier\")")
+                && row.line.spans.iter().any(|span| span.style.bg.is_some())
+        }));
+        assert!(expanded
+            .iter()
+            .any(|row| row.plain.contains("Found the lifecycle boundary")));
+        assert!(expanded
+            .iter()
+            .any(|row| row.plain.contains("running 1.2s")));
+    }
+
+    #[test]
+    fn completed_agent_card_shows_final_status_and_duration() {
+        let output = concat!(
+            "[agent-id:8]\n",
+            "[agent-meta] {\"status\":\"completed\",\"activity\":\"trace lifecycle\",\"todo_index\":null,\"cwd\":\".\",\"elapsed_ms\":2345}\n",
+            "[agent-events]\n",
+            "[agent-report]\n",
+            "Done."
+        );
+        let block = Block::ToolResult {
+            ok: true,
+            name: Some("agent".into()),
+            summary: "agent 1 (\"trace lifecycle\")".into(),
+            output: output.into(),
+        };
+        let mut toggled = HashSet::new();
+        toggled.insert((0, 0));
+        let rows = build(
+            &doc("tool", vec![block]),
+            80,
+            &Theme::default(),
+            &toggled,
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| row.plain.contains("completed 2.3s")));
+        assert!(rows.iter().any(|row| row.plain.contains("Done.")));
+    }
+
+    #[test]
     fn search_result_highlights_path_line_and_match() {
         let block = Block::ToolResult {
             ok: true,
             name: Some("search".into()),
             summary: "search(\"needle\")".into(),
-            output: "2 match(es) for 'needle' (showing 1-2):\n  src/a.rs:12: let needle = true;".into(),
+            output: "2 match(es) for 'needle' (showing 1-2):\n  src/a.rs:12: let needle = true;"
+                .into(),
         };
         let rows = build(
             &doc("tool", vec![block]),
@@ -1433,14 +3177,140 @@ mod tests {
             false,
             false,
         );
-        assert!(rows.iter().any(|r| r.plain.contains("src/a.rs:12")));
+        let file_index = rows
+            .iter()
+            .position(|row| row.plain.trim() == "FILE  src/a.rs")
+            .expect("search FILE row");
+        assert!(file_index > 0);
+        assert!(rows[file_index - 1].plain.trim().is_empty());
+        assert!(rows[file_index].plain.starts_with("    "));
+        let match_row = rows
+            .iter()
+            .find(|row| row.plain.contains("let needle = true"))
+            .expect("search match row");
+        assert!(match_row.plain.starts_with("    "));
+        assert!(rows.iter().any(|r| r.plain.contains("src/a.rs")));
         assert!(rows.iter().any(|r| {
             r.line.spans.iter().any(|s| {
                 s.content.as_ref() == "needle"
-                    && s.style.fg == Some(Theme::default().warning)
-                    && s.style.bg == Some(Theme::default().subtle_pill)
+                    && s.style.fg == Some(Color::Black)
+                    && s.style.bg == Some(Theme::default().warning)
+                    && s.style.add_modifier.contains(Modifier::BOLD)
             })
         }));
+        assert!(rows.iter().any(|r| {
+            r.plain.trim() == "FILE  src/a.rs"
+                && r.line.spans.iter().any(|span| {
+                    span.content.as_ref() == "FILE"
+                        && span.style.fg == Some(Theme::default().accent)
+                })
+        }));
+        assert!(rows.iter().any(|r| {
+            r.line.spans.iter().any(|s| {
+                s.content.as_ref() == "let" && s.style.fg == Some(Theme::default().hl_keyword)
+            })
+        }));
+    }
+
+    #[test]
+    fn search_result_highlights_regex_match_segments() {
+        let block = Block::ToolResult {
+            ok: true,
+            name: Some("search".into()),
+            summary: "search(\"foo\\s+bar\")".into(),
+            output:
+                "1 match(es) for 'foo\\s+bar' (showing 1-1):\n  src/a.rs:7: let value = foo   bar;"
+                    .into(),
+        };
+        let rows = build(
+            &doc("tool", vec![block]),
+            80,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| {
+            row.line.spans.iter().any(|span| {
+                span.content.as_ref() == "foo   bar"
+                    && span.style.bg == Some(Theme::default().warning)
+            })
+        }));
+    }
+
+    #[test]
+    fn search_results_are_grouped_below_one_home_shortened_path_header() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let home = std::path::Path::new(&home).display();
+        let path = format!("{home}/Codes/demo/src/a.rs");
+        let block = Block::ToolResult {
+            ok: true,
+            name: Some("search".into()),
+            summary: "search(\"needle\")".into(),
+            output: format!(
+                "2 match(es) for 'needle' (showing 1-2):\n  {path}:12: let needle = true;\n  {path}:18: println!(\"needle\");"
+            ),
+        };
+        let rows = build(
+            &doc("tool", vec![block]),
+            80,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        let header_indices: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.plain.contains("~/Codes/demo/src/a.rs"))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(header_indices.len(), 1);
+        let header = header_indices[0];
+        let first_match = rows
+            .iter()
+            .position(|row| row.plain.trim_start().starts_with("12 "))
+            .expect("first match row");
+        let second_match = rows
+            .iter()
+            .position(|row| row.plain.trim_start().starts_with("18 "))
+            .expect("second match row");
+        assert!(header < first_match && first_match < second_match);
+        assert!(!rows[first_match].plain.contains(&path));
+        assert!(!rows[second_match].plain.contains(&path));
+    }
+
+    #[test]
+    fn wrapped_search_results_keep_an_opaque_aligned_gutter() {
+        let block = Block::ToolResult {
+            ok: true,
+            name: Some("search".into()),
+            summary: "search(\"needle\")".into(),
+            output: "1 match(es) for 'needle' (showing 1-1):\n  src/a.rs:12: alpha beta gamma needle delta epsilon"
+                .into(),
+        };
+        let rows = build(
+            &doc("tool", vec![block]),
+            24,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        let result_rows: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row.plain.contains("alpha beta")
+                    || row.plain.contains("needle delta")
+                    || row.plain.contains("epsilon")
+            })
+            .collect();
+        assert!(result_rows.len() >= 2);
+        for row in result_rows {
+            assert!(!row.line.spans.is_empty());
+        }
     }
 
     #[test]
@@ -1468,11 +3338,15 @@ mod tests {
         assert!(!rows.iter().any(|r| r.toggle.is_some()));
     }
 
-    /// Whether any rendered row contains a span in the keyword highlight colour.
+    /// Whether a rendered code row contains a highlighted `fn` keyword span.
     fn has_keyword_colour(rows: &[RenderedLine]) -> bool {
         let kw = Theme::default().hl_keyword;
-        rows.iter()
-            .any(|r| r.line.spans.iter().any(|s| s.style.fg == Some(kw)))
+        rows.iter().any(|row| {
+            row.line
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref() == "fn" && span.style.fg == Some(kw))
+        })
     }
 
     #[test]
@@ -1507,47 +3381,45 @@ mod tests {
     }
 
     #[test]
-    fn write_file_call_previews_highlighted_content() {
-        let call = crate::agent::ToolCall {
-            name: "write_file".into(),
-            args: serde_json::json!({"path": "a.rs", "content": "fn a() {}\n"}),
-            id: None,
-        };
-        // Write previews are collapsed by default (click to expand); collapsed
-        // shows a hint, not the content.
-        let collapsed = build(
-            &doc("assistant", vec![Block::ToolCall(call.clone())]),
+    fn code_blocks_use_terminal_background() {
+        let rows = build(
+            &doc(
+                "assistant",
+                vec![Block::Code {
+                    lang: "rust".into(),
+                    code: "fn a() {}".into(),
+                }],
+            ),
             60,
             &Theme::default(),
             &HashSet::new(),
             false,
             false,
         );
-        assert!(collapsed.iter().any(|r| r.plain.contains("click to view")));
-        assert!(
-            collapsed.iter().any(|r| r.toggle == Some((0, 0))),
-            "header is a toggle"
-        );
-        assert!(!collapsed.iter().any(|r| r.plain.contains("fn a()")));
+        let code = rows.iter().find(|row| row.plain.contains("fn a()"));
+        assert!(code.is_some_and(|row| row.line.spans.iter().all(|span| span.style.bg.is_none())));
+    }
 
-        // Expanded (the block toggled open) → the syntax-highlighted content shows.
-        let mut toggled = HashSet::new();
-        toggled.insert((0usize, 0usize));
+    #[test]
+    fn tool_call_blocks_are_not_user_visible() {
+        let call = crate::agent::ToolCall {
+            name: "write_file".into(),
+            args: serde_json::json!({"path": "a.rs", "content": "fn a() {}\n"}),
+            id: None,
+        };
         let rows = build(
             &doc("assistant", vec![Block::ToolCall(call)]),
             60,
             &Theme::default(),
-            &toggled,
+            &HashSet::new(),
             false,
             false,
         );
-        assert!(rows.iter().any(|r| r.plain.contains("fn a()")));
-        assert!(has_keyword_colour(&rows));
+        assert!(rows.is_empty(), "call-only messages leave no visible shell");
     }
 
     #[test]
-    fn streaming_partial_tool_shows_preparing_chip() {
-        // Mid-stream, an unclosed ```tool block renders as the quiet placeholder.
+    fn streaming_partial_tool_payload_is_hidden() {
         let block = Block::Code {
             lang: "tool".into(),
             code: "{\"name\":\"read_file\",\"args\":{\"pa".into(),
@@ -1560,71 +3432,30 @@ mod tests {
             false,
             true,
         );
-        assert!(rows.iter().any(|r| r.plain.contains("Preparing")));
-        assert!(
-            rows.iter().any(|r| r.plain.contains("read_file")),
-            "tool name shows as it resolves"
-        );
-
-        // Not streaming → a `tool` code block renders normally (no placeholder).
-        let block2 = Block::Code {
-            lang: "tool".into(),
-            code: "half".into(),
-        };
-        let rows2 = build(
-            &doc("assistant", vec![block2]),
-            60,
-            &Theme::default(),
-            &HashSet::new(),
-            false,
-            false,
-        );
-        assert!(!rows2.iter().any(|r| r.plain.contains("Preparing")));
+        assert!(rows.is_empty());
     }
 
     #[test]
-    fn streaming_hides_interstitial_prose_around_tool_call() {
+    fn streaming_and_finalized_messages_hide_only_tool_invocation_prose() {
         let blocks = vec![
             Block::Markdown("let me edit the file".into()),
-            // `edit` is a call-side tool, so it renders during streaming (as a diff).
             Block::ToolCall(crate::agent::ToolCall {
                 name: "edit".into(),
                 args: serde_json::json!({"path": "a.rs", "old": "x", "new": "y"}),
                 id: None,
             }),
         ];
-        // Streaming → prose hidden, only the tool call shows.
-        let rows = build(
-            &doc("assistant", blocks.clone()),
-            60,
-            &Theme::default(),
-            &HashSet::new(),
-            false,
-            true,
-        );
-        assert!(!rows.iter().any(|r| r.plain.contains("let me edit")));
-        // The tool call itself still renders (its summary shows the path).
-        assert!(rows.iter().any(|r| r.plain.contains("a.rs")));
-        // Finalized (not streaming) → prose shows normally.
-        let rows2 = build(
-            &doc("assistant", blocks),
-            60,
-            &Theme::default(),
-            &HashSet::new(),
-            false,
-            false,
-        );
-        assert!(rows2.iter().any(|r| r.plain.contains("let me edit")));
-    }
-
-    #[test]
-    fn extract_partial_name_reads_name_when_terminated() {
-        assert_eq!(
-            extract_partial_name("{\"name\":\"read_file\",\"args\":{}}").as_deref(),
-            Some("read_file")
-        );
-        assert_eq!(extract_partial_name("{\"name\":\"read_f"), None); // value not closed yet
-        assert!(extract_partial_name("{\"args\":{}}").is_none());
+        for streaming in [true, false] {
+            let rows = build(
+                &doc("assistant", blocks.clone()),
+                60,
+                &Theme::default(),
+                &HashSet::new(),
+                false,
+                streaming,
+            );
+            assert!(rows.is_empty());
+        }
     }
 
     #[test]
@@ -1644,6 +3475,358 @@ mod tests {
             false,
         );
         assert!(has_keyword_colour(&rows));
+    }
+
+    #[test]
+    fn read_file_view_shows_path_actual_line_numbers_and_highlighting() {
+        let block = Block::ToolFileResult {
+            ok: true,
+            name: Some("read".into()),
+            summary: "read(src/main.rs)".into(),
+            output: "[lines 41-42 of 100]\nfn main() {}\nlet value = 1;\n[next: read(path=\"src/main.rs\", offset=43, limit=2)]".into(),
+            call: crate::agent::ToolCall {
+                name: "file_management".into(),
+                args: serde_json::json!({"action": "read", "path": "src/main.rs", "offset": "41", "limit": "2"}),
+                id: None,
+            },
+        };
+        let rows = build(
+            &doc("tool", vec![block]),
+            80,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| row.plain.contains("█ CONTENT")));
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("█ 41 │ fn main()")));
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("█ 42 │ let value")));
+        assert!(rows.iter().any(|row| row.plain.contains("[next: read(")));
+        assert!(has_keyword_colour(&rows));
+    }
+
+    #[test]
+    fn write_file_view_shows_path_line_numbers_and_highlighting() {
+        let block = Block::ToolFileResult {
+            ok: true,
+            name: Some("write".into()),
+            summary: "write(src/lib.rs · 2 lines)".into(),
+            output: "Created /tmp/src/lib.rs (2 lines)".into(),
+            call: crate::agent::ToolCall {
+                name: "file_management".into(),
+                args: serde_json::json!({
+                    "action": "write",
+                    "path": "src/lib.rs",
+                    "content": "pub fn answer() -> usize {\n    42\n}"
+                }),
+                id: None,
+            },
+        };
+        let rows = build(
+            &doc("tool", vec![block]),
+            80,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| row.plain.contains("█ CONTENT")));
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("█ 1 │ pub fn answer")));
+        assert!(rows.iter().any(|row| row.plain.contains("█ 3 │ }")));
+        assert!(has_keyword_colour(&rows));
+    }
+
+    #[test]
+    fn edit_file_view_matches_access_request_old_new_cards_with_actual_lines() {
+        let theme = Theme::default();
+        let block = Block::ToolFileResult {
+            ok: true,
+            name: Some("edit".into()),
+            summary: "edit(src/lib.rs)".into(),
+            output: "Edit /tmp/src/lib.rs (1 occurrence)".into(),
+            call: crate::agent::ToolCall {
+                name: "file_management".into(),
+                args: serde_json::json!({
+                    "action": "edit",
+                    "path": "src/lib.rs",
+                    "old": "fn old() {\n    false\n}",
+                    "new": "fn new() {\n    true\n}",
+                    "__display_start_line": 18
+                }),
+                id: None,
+            },
+        };
+        let rows = build(
+            &doc("tool", vec![block]),
+            100,
+            &theme,
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| row.plain.contains("█ OLD")));
+        assert!(rows.iter().any(|row| row.plain.contains("█ NEW")));
+        assert!(!rows
+            .iter()
+            .any(|row| row.plain.contains("BEFORE") || row.plain.contains("AFTER")));
+        let old = rows
+            .iter()
+            .find(|row| row.plain.contains("█ 18 │ fn old()"))
+            .expect("OLD card source row");
+        let new = rows
+            .iter()
+            .find(|row| row.plain.contains("█ 18 │ fn new()"))
+            .expect("NEW card source row");
+        assert!(old.line.spans.iter().any(|span| {
+            span.content.as_ref() == "█ " && span.style.fg == Some(theme.danger)
+        }));
+        assert!(new.line.spans.iter().any(|span| {
+            span.content.as_ref() == "█ " && span.style.fg == Some(theme.success)
+        }));
+        assert!(old
+            .line
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(theme.hl_keyword)));
+        assert!(new
+            .line
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(theme.hl_keyword)));
+    }
+
+    #[test]
+    fn edit_gutter_always_has_a_spaced_gray_or_change_block() {
+        let (unchanged_spans, unchanged_plain) =
+            diff_gutter(12, 3, None, Style::default().fg(Color::White), true);
+        assert!(unchanged_plain.starts_with("█  12"));
+        assert_eq!(unchanged_spans[0].content.as_ref(), "█ ");
+        assert_eq!(unchanged_spans[0].style.fg, Some(Color::DarkGray));
+
+        let (changed_spans, changed_plain) = diff_gutter(
+            12,
+            3,
+            Some(Color::Green),
+            Style::default().fg(Color::White),
+            true,
+        );
+        assert!(changed_plain.starts_with("█  12"));
+        assert_eq!(changed_spans[0].content.as_ref(), "█ ");
+        assert_eq!(changed_spans[0].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn wrapped_edit_lines_keep_the_change_block_without_repeating_line_numbers() {
+        let theme = Theme::default();
+        let mut rows = Vec::new();
+        push_diff_line(
+            "a deliberately long changed line",
+            None,
+            12,
+            DiffLineFormat {
+                num_width: 3,
+                style: Style::default().fg(theme.text),
+                bar: Some(theme.success),
+                background: None,
+                avail: 8,
+                message_index: 0,
+                line_idx: 0,
+            },
+            &mut rows,
+        );
+
+        assert!(rows.len() > 1);
+        assert!(rows[0].plain.starts_with("█  12 "));
+        assert!(rows[1].plain.starts_with("█      "));
+        assert!(!rows[1].plain.contains("12"));
+        assert!(rows.iter().all(|row| {
+            row.line.spans.first().is_some_and(|span| {
+                span.content.as_ref() == "█ " && span.style.fg == Some(theme.success)
+            })
+        }));
+    }
+
+    #[test]
+    fn side_by_side_diff_fills_old_gutter_when_new_wraps_farther() {
+        let theme = Theme::default();
+        let mut rows = Vec::new();
+        render_diff_columns(
+            &["short old"],
+            &["a much longer new line that needs several wrapped visual rows"],
+            0,
+            1,
+            1,
+            "src/lib.rs",
+            7,
+            0,
+            56,
+            &theme,
+            &mut rows,
+        );
+
+        assert!(rows.len() > 1);
+        let continuation_colors = rows[1]
+            .line
+            .spans
+            .iter()
+            .filter(|span| span.content.as_ref() == "█ ")
+            .map(|span| span.style.fg)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            continuation_colors,
+            vec![Some(theme.danger), Some(theme.success)]
+        );
+        assert!(!rows[1].plain.contains("  7 │"));
+    }
+
+    #[test]
+    fn side_by_side_diff_fills_new_gutter_when_old_wraps_farther() {
+        let theme = Theme::default();
+        let mut rows = Vec::new();
+        render_diff_columns(
+            &["a much longer old line that needs several wrapped visual rows"],
+            &["short new"],
+            0,
+            1,
+            1,
+            "src/lib.rs",
+            9,
+            0,
+            56,
+            &theme,
+            &mut rows,
+        );
+
+        assert!(rows.len() > 1);
+        let continuation_colors = rows[1]
+            .line
+            .spans
+            .iter()
+            .filter(|span| span.content.as_ref() == "█ ")
+            .map(|span| span.style.fg)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            continuation_colors,
+            vec![Some(theme.danger), Some(theme.success)]
+        );
+        assert!(!rows[1].plain.contains("  9 │"));
+    }
+
+    #[test]
+    fn wide_edit_diff_keeps_a_fixed_center_divider_when_lines_wrap() {
+        let block = Block::ToolFileResult {
+            ok: true,
+            name: Some("edit".into()),
+            summary: "edit(src/lib.rs)".into(),
+            output: "Edit src/lib.rs (1 occurrence)".into(),
+            call: crate::agent::ToolCall {
+                name: "file_management".into(),
+                args: serde_json::json!({
+                    "action": "edit",
+                    "path": "src/lib.rs",
+                    "old": "/// A deliberately long documentation line that wraps on the left side without moving the divider.\nfn old() {}",
+                    "new": "/// A deliberately long documentation line that wraps on the right side without moving the divider.\nfn new() {}",
+                    "__display_start_line": 41
+                }),
+                id: None,
+            },
+        };
+        let rows = build(
+            &doc("tool", vec![block]),
+            120,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        let diff_rows = rows
+            .iter()
+            .filter(|row| row.plain.contains(" │ ") && row.plain.contains("│"))
+            .collect::<Vec<_>>();
+        assert!(diff_rows.len() >= 2);
+        let divider_columns = diff_rows
+            .iter()
+            .map(|row| {
+                let midpoint = display_width(&row.plain) / 2;
+                row.plain
+                    .match_indices(" │ ")
+                    .map(|(byte, _)| display_width(&row.plain[..byte]))
+                    .min_by_key(|column| column.abs_diff(midpoint))
+                    .expect("center divider")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            divider_columns
+                .iter()
+                .all(|column| *column == divider_columns[0]),
+            "divider columns {divider_columns:?}; rows: {:?}",
+            diff_rows
+                .iter()
+                .map(|row| row.plain.trim_end().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(diff_rows.iter().all(|row| row.plain.starts_with("    ")));
+        assert!(diff_rows.iter().any(|row| row.plain.contains(" 41 │")));
+    }
+
+    #[test]
+    fn unified_diff_tool_output_is_syntax_highlighted() {
+        let block = Block::ToolResult {
+            ok: true,
+            name: Some("shell".into()),
+            summary: "shell(git diff)".into(),
+            output: "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-fn old() {}\n+fn new() {}"
+                .into(),
+        };
+        let rows = build(
+            &doc("tool", vec![block]),
+            80,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| row.plain.contains("+fn new()")));
+        assert!(has_keyword_colour(&rows));
+    }
+
+    #[test]
+    fn shell_result_renders_bash_highlighted_terminal_session() {
+        let block = Block::ToolResult {
+            ok: true,
+            name: Some("shell".into()),
+            summary: "shell(if true; then echo \"ok\"; fi)".into(),
+            output: "ok".into(),
+        };
+        let theme = Theme::default();
+        let rows = build(
+            &doc("tool", vec![block]),
+            80,
+            &theme,
+            &HashSet::new(),
+            false,
+            false,
+        );
+        let prompt = rows
+            .iter()
+            .find(|row| {
+                row.plain.trim_start().starts_with("$ if true")
+                    && row.background == Some(Color::Black)
+            })
+            .expect("terminal prompt");
+        assert_eq!(prompt.background, Some(Color::Black));
+        assert!(prompt.line.spans.iter().any(|span| {
+            span.content.as_ref() == "if" && span.style.fg == Some(theme.hl_keyword)
+        }));
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.trim() == "│ ok" && row.background == Some(Color::Black)));
     }
 
     #[test]
@@ -1695,6 +3878,89 @@ mod tests {
     }
 
     #[test]
+    fn child_agent_result_marks_running_then_completed() {
+        let running = Block::ToolResult {
+            ok: true,
+            name: Some("agent".into()),
+            summary: "agent 1 (\"inspect UI\")".into(),
+            output: "[agent-id:1]\n[running]\nsearch(src/ui)".into(),
+        };
+        let rows = build(
+            &doc("tool", vec![running]),
+            80,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| row.plain.contains("running")));
+        assert!(!rows.iter().any(|row| row.plain.contains("search(src/ui)")));
+
+        let mut toggled = HashSet::new();
+        toggled.insert((0, 0));
+        let expanded = build(
+            &doc(
+                "tool",
+                vec![Block::ToolResult {
+                    ok: true,
+                    name: Some("agent".into()),
+                    summary: "agent 1 (\"inspect UI\")".into(),
+                    output: "[agent-id:1]\n[running]\nsearch(src/ui)".into(),
+                }],
+            ),
+            80,
+            &Theme::default(),
+            &toggled,
+            false,
+            false,
+        );
+        assert!(expanded
+            .iter()
+            .any(|row| row.plain.contains("search(src/ui)")));
+
+        let completed = Block::ToolResult {
+            ok: true,
+            name: Some("agent".into()),
+            summary: "agent 1 (\"inspect UI\")".into(),
+            output: "Found the implementation.".into(),
+        };
+        let rows = build(
+            &doc("tool", vec![completed]),
+            80,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| row.plain.contains("completed")));
+        assert!(!rows
+            .iter()
+            .any(|row| row.plain.contains("Found the implementation.")));
+
+        let mut toggled = HashSet::new();
+        toggled.insert((0, 0));
+        let expanded = build(
+            &doc(
+                "tool",
+                vec![Block::ToolResult {
+                    ok: true,
+                    name: Some("agent".into()),
+                    summary: "agent 1 (\"inspect UI\")".into(),
+                    output: "Found the implementation.".into(),
+                }],
+            ),
+            80,
+            &Theme::default(),
+            &toggled,
+            false,
+            false,
+        );
+        assert!(expanded
+            .iter()
+            .any(|row| row.plain.contains("Found the implementation.")));
+    }
+
+    #[test]
     fn delete_result_is_single_removed_line() {
         let block = Block::ToolResult {
             ok: true,
@@ -1716,46 +3982,120 @@ mod tests {
     }
 
     #[test]
-    fn edit_file_call_renders_diff() {
-        let call = crate::agent::ToolCall {
-            name: "edit_file".into(),
-            args: serde_json::json!({"path":"a.rs","old_string":"foo","new_string":"bar"}),
-            id: None,
+    fn edit_result_renders_completed_diff_without_call_payload() {
+        let block = Block::ToolResult {
+            ok: true,
+            name: Some("edit".into()),
+            summary: "edit(a.rs)".into(),
+            output: "Edit a.rs (1 occurrence)\n@@ line 1 @@\n- foo\n+ bar".into(),
         };
         let rows = build(
-            &doc("assistant", vec![Block::ToolCall(call)]),
+            &doc("tool", vec![block]),
             40,
             &Theme::default(),
             &HashSet::new(),
             false,
             false,
         );
-        assert!(rows.iter().any(|r| r.plain.contains("▌ foo")));
-        assert!(rows.iter().any(|r| r.plain.contains("▌ bar")));
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("Edit a.rs (1 occurrence)")));
+        let removed = rows
+            .iter()
+            .find(|row| row.plain.contains("- foo"))
+            .expect("removed result line");
+        let added = rows
+            .iter()
+            .find(|row| row.plain.contains("+ bar"))
+            .expect("added result line");
+        assert!(removed
+            .line
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(Theme::default().danger)));
+        assert!(added
+            .line
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(Theme::default().success)));
     }
 
     #[test]
-    fn edit_diff_is_syntax_highlighted() {
-        let call = crate::agent::ToolCall {
-            name: "edit".into(),
-            args: serde_json::json!({
-                "path": "a.rs",
-                "old": "fn foo() { 1 }",
-                "new": "fn bar() { 2 }",
-            }),
-            id: None,
-        };
+    fn tool_role_has_no_separator() {
         let rows = build(
-            &doc("assistant", vec![Block::ToolCall(call)]),
+            &doc("tool", vec![]),
             60,
             &Theme::default(),
             &HashSet::new(),
             false,
             false,
         );
-        assert!(
-            has_keyword_colour(&rows),
-            "the `fn` keyword in the diff should be tree-sitter highlighted"
+        assert!(rows.iter().all(|row| row.role_start.is_none()));
+        assert!(rows.iter().all(|row| !row.plain.starts_with('─')));
+        assert!(rows
+            .iter()
+            .all(|row| !row.plain.trim_start().starts_with('▌')));
+    }
+
+    #[test]
+    fn write_result_reports_actual_created_file() {
+        let block = Block::ToolResult {
+            ok: true,
+            name: Some("write".into()),
+            summary: "write(a.rs)".into(),
+            output: "Created a.rs (12 lines)".into(),
+        };
+        let rows = build(
+            &doc("tool", vec![block]),
+            60,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
         );
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("Created a.rs (12 lines)")));
+        assert!(!rows.iter().any(|row| row.toggle.is_some()));
+    }
+
+    #[test]
+    fn long_edit_result_is_collapsible() {
+        let detail = (1..=14)
+            .map(|line| format!("+ changed line {}", line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = Block::ToolResult {
+            ok: true,
+            name: Some("edit".into()),
+            summary: "edit(a.rs)".into(),
+            output: format!("Edit a.rs (1 occurrence)\n{}", detail),
+        };
+        let collapsed = build(
+            &doc("tool", vec![block.clone()]),
+            60,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(collapsed.iter().any(|row| row.toggle == Some((0, 0))));
+        assert!(!collapsed
+            .iter()
+            .any(|row| row.plain.contains("changed line 14")));
+
+        let mut toggled = HashSet::new();
+        toggled.insert((0, 0));
+        let expanded = build(
+            &doc("tool", vec![block]),
+            60,
+            &Theme::default(),
+            &toggled,
+            false,
+            false,
+        );
+        assert!(expanded
+            .iter()
+            .any(|row| row.plain.contains("changed line 14")));
     }
 }

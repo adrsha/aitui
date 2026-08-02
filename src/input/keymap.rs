@@ -4,15 +4,17 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::config::config::KeybindConfig;
+use crate::config::KeybindConfig;
 
-/// A single parsed key binding: a key code plus required ctrl/alt modifiers.
-/// Shift is folded into the character itself (e.g. `?`), so it isn't tracked.
+/// A single parsed key binding: a key code plus required modifiers.
+/// Shift remains explicit for named keys/chords such as `ctrl-shift-d`; for a
+/// printable symbol such as `?`, terminals may already fold it into the char.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeySpec {
     code: KeyCode,
     ctrl: bool,
     alt: bool,
+    shift: bool,
 }
 
 impl KeySpec {
@@ -24,6 +26,7 @@ impl KeySpec {
         }
         let mut ctrl = false;
         let mut alt = false;
+        let mut shift = false;
         loop {
             // Prefixes are ASCII; compare case-insensitively without allocating.
             if let Some(r) = strip_prefix_ci(rest, "ctrl-").or_else(|| strip_prefix_ci(rest, "c-"))
@@ -38,7 +41,7 @@ impl KeySpec {
             } else if let Some(r) =
                 strip_prefix_ci(rest, "shift-").or_else(|| strip_prefix_ci(rest, "s-"))
             {
-                // Shift is represented by the resulting character; nothing to record.
+                shift = true;
                 rest = r;
             } else {
                 break;
@@ -48,6 +51,7 @@ impl KeySpec {
             code: parse_code(rest)?,
             ctrl,
             alt,
+            shift,
         })
     }
 
@@ -55,7 +59,8 @@ impl KeySpec {
     pub fn matches(&self, ev: &KeyEvent) -> bool {
         let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
         let alt = ev.modifiers.contains(KeyModifiers::ALT);
-        if ctrl != self.ctrl || alt != self.alt {
+        let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
+        if ctrl != self.ctrl || alt != self.alt || (self.shift && !shift) {
             return false;
         }
         match (self.code, ev.code) {
@@ -72,6 +77,9 @@ impl KeySpec {
         }
         if self.alt {
             s.push_str("Alt-");
+        }
+        if self.shift {
+            s.push_str("Shift-");
         }
         s.push_str(&code_label(self.code));
         s
@@ -146,6 +154,8 @@ pub struct Keymap {
     pub quit: KeySpec,
     pub next_session: KeySpec,
     pub prev_session: KeySpec,
+    pub prev_subtask: KeySpec,
+    pub next_subtask: KeySpec,
     pub session_picker: KeySpec,
     pub fork_session: KeySpec,
     pub open_editor: KeySpec,
@@ -155,7 +165,6 @@ pub struct Keymap {
     pub model_picker: KeySpec,
     pub next_model: KeySpec,
     pub prev_model: KeySpec,
-    pub toggle_agent: KeySpec,
     pub redraw: KeySpec,
     pub scroll_up: KeySpec,
     pub scroll_down: KeySpec,
@@ -192,6 +201,8 @@ impl Keymap {
             quit: p(&k.quit, &d.quit),
             next_session: p(&k.next_session, &d.next_session),
             prev_session: p(&k.prev_session, &d.prev_session),
+            prev_subtask: p(&k.prev_subtask, &d.prev_subtask),
+            next_subtask: p(&k.next_subtask, &d.next_subtask),
             session_picker: p(&k.session_picker, &d.session_picker),
             fork_session: p(&k.fork_session, &d.fork_session),
             open_editor: p(&k.open_editor, &d.open_editor),
@@ -201,7 +212,6 @@ impl Keymap {
             model_picker: p(&k.model_picker, &d.model_picker),
             next_model: p(&k.next_model, &d.next_model),
             prev_model: p(&k.prev_model, &d.prev_model),
-            toggle_agent: p(&k.toggle_agent, &d.toggle_agent),
             redraw: p(&k.redraw, &d.redraw),
             scroll_up: p(&k.scroll_up, &d.scroll_up),
             scroll_down: p(&k.scroll_down, &d.scroll_down),
@@ -222,6 +232,7 @@ impl Keymap {
     }
 
     /// Label for the help overlay, e.g. `jk / Esc` or just `Esc`.
+    #[cfg(test)]
     pub fn normal_label(&self) -> String {
         match self.normal_chord {
             Some((a, b)) => format!("{}{} / {}", a, b, self.normal.label()),
@@ -312,9 +323,22 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_shift_binding_requires_shift_and_has_readable_label() {
+        let spec = KeySpec::parse("ctrl-shift-d").unwrap();
+        assert!(spec.matches(&ev(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+        assert!(!spec.matches(&ev(KeyCode::Char('d'), KeyModifiers::CONTROL)));
+        assert_eq!(spec.label(), "Ctrl-Shift-D");
+    }
+
+    #[test]
     fn keymap_falls_back_on_invalid_spec() {
-        let mut cfg = KeybindConfig::default();
-        cfg.next_session = "this is not valid".into();
+        let cfg = KeybindConfig {
+            next_session: "this is not valid".into(),
+            ..KeybindConfig::default()
+        };
         let km = Keymap::from_config(&cfg);
         // Falls back to the default ctrl-n.
         assert!(km
@@ -331,8 +355,10 @@ mod tests {
 
     #[test]
     fn normal_chord_parsed_with_esc_fallback() {
-        let mut cfg = KeybindConfig::default();
-        cfg.normal = "jk".into();
+        let cfg = KeybindConfig {
+            normal: "jk".into(),
+            ..KeybindConfig::default()
+        };
         let km = Keymap::from_config(&cfg);
         assert_eq!(km.normal_chord, Some(('j', 'k')));
         // Esc still leaves insert mode.
@@ -342,8 +368,10 @@ mod tests {
 
     #[test]
     fn single_key_normal_has_no_chord() {
-        let mut cfg = KeybindConfig::default();
-        cfg.normal = "esc".into();
+        let cfg = KeybindConfig {
+            normal: "esc".into(),
+            ..KeybindConfig::default()
+        };
         let km = Keymap::from_config(&cfg);
         assert!(km.normal_chord.is_none());
         assert!(km.normal.matches(&ev(KeyCode::Esc, KeyModifiers::NONE)));
