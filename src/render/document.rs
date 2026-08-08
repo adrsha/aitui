@@ -471,7 +471,16 @@ fn render_markdown(
     theme: &Theme,
     out: &mut Vec<RenderedLine>,
 ) {
-    for raw in text.split('\n') {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut index = 0;
+    while index < lines.len() {
+        if let Some((table, consumed)) = parse_markdown_table(&lines[index..]) {
+            render_markdown_table(&table, mi, width, theme, out);
+            index += consumed;
+            continue;
+        }
+
+        let raw = lines[index];
         // Thematic break (`---`, `***`, `___`) → a full-width text rule.
         if is_hr(raw) {
             let rule = "─".repeat(width.max(1));
@@ -480,6 +489,7 @@ fn render_markdown(
                 rule,
                 mi,
             ));
+            index += 1;
             continue;
         }
         // Block-level prefixes handled before wrapping.
@@ -505,7 +515,178 @@ fn render_markdown(
             let plain = format!("{}{}", lead, wline);
             out.push(RenderedLine::new(Line::from(spans), plain, mi));
         }
+        index += 1;
     }
+}
+
+#[derive(Clone, Copy)]
+enum TableAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+struct MarkdownTable {
+    rows: Vec<Vec<String>>,
+    alignments: Vec<TableAlignment>,
+}
+
+fn split_table_row(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let inner = trimmed
+        .strip_prefix('|')
+        .unwrap_or(trimmed)
+        .strip_suffix('|')
+        .unwrap_or_else(|| trimmed.strip_prefix('|').unwrap_or(trimmed));
+    let cells: Vec<String> = inner
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect();
+    (cells.len() >= 2).then_some(cells)
+}
+
+fn parse_table_separator(line: &str, columns: usize) -> Option<Vec<TableAlignment>> {
+    let cells = split_table_row(line)?;
+    if cells.len() != columns {
+        return None;
+    }
+    cells
+        .into_iter()
+        .map(|cell| {
+            let marker = cell.trim();
+            let left = marker.starts_with(':');
+            let right = marker.ends_with(':');
+            let dashes = marker.trim_matches(':');
+            if dashes.len() < 3 || !dashes.chars().all(|c| c == '-') {
+                return None;
+            }
+            Some(match (left, right) {
+                (true, true) => TableAlignment::Center,
+                (false, true) => TableAlignment::Right,
+                _ => TableAlignment::Left,
+            })
+        })
+        .collect()
+}
+
+fn parse_markdown_table(lines: &[&str]) -> Option<(MarkdownTable, usize)> {
+    if lines.len() < 2 {
+        return None;
+    }
+    let header = split_table_row(lines[0])?;
+    let alignments = parse_table_separator(lines[1], header.len())?;
+    let columns = header.len();
+    let mut rows = vec![header];
+    let mut consumed = 2;
+    while let Some(line) = lines.get(consumed) {
+        let Some(mut row) = split_table_row(line) else {
+            break;
+        };
+        if row.len() > columns {
+            break;
+        }
+        row.resize(columns, String::new());
+        rows.push(row);
+        consumed += 1;
+    }
+    Some((MarkdownTable { rows, alignments }, consumed))
+}
+
+fn render_markdown_table(
+    table: &MarkdownTable,
+    mi: usize,
+    width: usize,
+    theme: &Theme,
+    out: &mut Vec<RenderedLine>,
+) {
+    let columns = table.alignments.len();
+    if columns == 0 {
+        return;
+    }
+    let mut widths = vec![1usize; columns];
+    for row in &table.rows {
+        for (column, cell) in row.iter().enumerate() {
+            widths[column] = widths[column].max(display_width(cell));
+        }
+    }
+    let chrome = columns * 3 + 1;
+    let content_budget = width.saturating_sub(chrome).max(columns);
+    while widths.iter().sum::<usize>() > content_budget {
+        let Some((widest, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w > 1)
+            .max_by_key(|(_, w)| **w)
+        else {
+            break;
+        };
+        widths[widest] -= 1;
+    }
+
+    let border_style = Style::default().fg(theme.muted);
+    let push_border = |left: char, join: char, right: char, out: &mut Vec<RenderedLine>| {
+        let mut plain = String::new();
+        plain.push(left);
+        for (i, cell_width) in widths.iter().enumerate() {
+            plain.push_str(&"─".repeat(cell_width + 2));
+            plain.push(if i + 1 == widths.len() { right } else { join });
+        }
+        out.push(RenderedLine::new(
+            Line::from(Span::styled(plain.clone(), border_style)),
+            plain,
+            mi,
+        ));
+    };
+
+    push_border('┌', '┬', '┐', out);
+    for (row_index, row) in table.rows.iter().enumerate() {
+        let wrapped: Vec<Vec<String>> = row
+            .iter()
+            .enumerate()
+            .map(|(column, cell)| wrap_words(cell, widths[column]))
+            .collect();
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+        for visual_row in 0..height {
+            let mut spans = vec![Span::styled("│".to_string(), border_style)];
+            let mut plain = "│".to_string();
+            for column in 0..columns {
+                let text = wrapped[column]
+                    .get(visual_row)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let text_width = display_width(text);
+                let remaining = widths[column].saturating_sub(text_width);
+                let (left_pad, right_pad) = match table.alignments[column] {
+                    TableAlignment::Left => (0, remaining),
+                    TableAlignment::Center => (remaining / 2, remaining - remaining / 2),
+                    TableAlignment::Right => (remaining, 0),
+                };
+                let left = format!(" {}", " ".repeat(left_pad));
+                let right = format!("{} ", " ".repeat(right_pad));
+                let base = if row_index == 0 {
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                spans.push(Span::styled(left.clone(), base));
+                spans.extend(style_inline(text, base, theme));
+                spans.push(Span::styled(right.clone(), base));
+                spans.push(Span::styled("│".to_string(), border_style));
+                plain.push_str(&left);
+                plain.push_str(text);
+                plain.push_str(&right);
+                plain.push('│');
+            }
+            out.push(RenderedLine::new(Line::from(spans), plain, mi));
+        }
+        if row_index == 0 {
+            push_border('├', '┼', '┤', out);
+        }
+    }
+    push_border('└', '┴', '┘', out);
 }
 
 /// Whether a line is a Markdown thematic break: 3+ of `-`, `*`, or `_` only
@@ -2003,6 +2184,9 @@ fn render_tool_result(
 ) {
     use crate::agent::ToolKind;
     let kind = name.and_then(ToolKind::from_name);
+    let batch_calls = call.and_then(|call| call.expanded_calls().ok().flatten());
+    let is_batch = batch_calls.as_ref().is_some_and(|items| !items.is_empty())
+        || summary.contains(" operations)");
     let display_summary = crate::render::path::abbreviate_home(summary);
     let display_output = crate::render::path::abbreviate_home(output);
 
@@ -2028,9 +2212,27 @@ fn render_tool_result(
         return;
     }
 
+    if is_batch {
+        render_batch_result(
+            ok,
+            kind,
+            &display_summary,
+            output,
+            batch_calls.as_deref().unwrap_or(&[]),
+            mi,
+            bi,
+            width,
+            theme,
+            toggled,
+            show_output,
+            out,
+        );
+        return;
+    }
+
     // Mutating file tools have purpose-built source views backed by the original
     // executed call, rather than reconstructing code from the confirmation text.
-    if matches!(kind, Some(ToolKind::Edit) | Some(ToolKind::Write)) {
+    if !is_batch && matches!(kind, Some(ToolKind::Edit) | Some(ToolKind::Write)) {
         if !ok {
             push_status(
                 "✗",
@@ -2265,6 +2467,7 @@ fn render_tool_result(
             | Some(ToolKind::Move)
             | Some(ToolKind::Copy)
             | Some(ToolKind::Download)
+            | Some(ToolKind::PowerPoint)
     ) {
         let icon = if ok {
             kind.map(|k| k.icon()).unwrap_or("✓")
@@ -2310,7 +2513,7 @@ fn render_tool_result(
     };
     // The shell's command is already shown as a terminal prompt beneath the
     // header — don't repeat the `shell(...)` call wrapper on top.
-    let header_summary = if ok && kind == Some(ToolKind::Shell) {
+    let header_summary = if ok && kind == Some(ToolKind::Shell) && !is_batch {
         crate::render::path::abbreviate_home(shell_command(call, summary))
     } else {
         display_summary.clone()
@@ -2376,6 +2579,7 @@ fn render_tool_result(
             render_search_output(&display_output, pattern.as_deref(), mi, avail, theme, out);
         } else if ok
             && kind == Some(ToolKind::Shell)
+            && !is_batch
             && render_shell_diff(
                 shell_command(call, summary),
                 &display_output,
@@ -2386,7 +2590,7 @@ fn render_tool_result(
             )
         {
             // Shell patches keep their diff renderer beneath the highlighted prompt.
-        } else if ok && kind == Some(ToolKind::Shell) {
+        } else if ok && kind == Some(ToolKind::Shell) && !is_batch {
             render_shell_output(
                 shell_command(call, summary),
                 &display_output,
@@ -2411,6 +2615,243 @@ fn render_tool_result(
         indent_tool_body(&mut out[body_start..], TOOL_BODY_INDENT);
     }
 }
+
+#[derive(Debug)]
+struct BatchResultSection<'a> {
+    summary: &'a str,
+    status: &'a str,
+    body: &'a str,
+}
+
+fn parse_batch_result(output: &str) -> Vec<BatchResultSection<'_>> {
+    let mut sections = Vec::new();
+    let mut current_header: Option<(&str, &str)> = None;
+    let mut body_start = 0usize;
+
+    for (byte, _) in output.match_indices("## ") {
+        if byte > 0 && !output[..byte].ends_with('\n') {
+            continue;
+        }
+        let line_end = output[byte..]
+            .find('\n')
+            .map(|offset| byte + offset)
+            .unwrap_or(output.len());
+        let header = output[byte + 3..line_end].trim();
+        let Some((position, rest)) = header.split_once(" · ") else {
+            continue;
+        };
+        let valid_position = position.split_once('/').is_some_and(|(current, total)| {
+            current.parse::<usize>().is_ok() && total.parse::<usize>().is_ok()
+        });
+        if !valid_position {
+            continue;
+        }
+        let (summary, status) = rest
+            .rsplit_once(" · ")
+            .filter(|(_, status)| matches!(*status, "ok" | "error" | "cancelled"))
+            .unwrap_or(("operation", rest));
+
+        if let Some((previous_summary, previous_status)) = current_header.take() {
+            let body = output[body_start..byte].trim_matches('\n');
+            sections.push(BatchResultSection {
+                summary: previous_summary,
+                status: previous_status,
+                body,
+            });
+        }
+        current_header = Some((summary, status));
+        body_start = line_end.saturating_add(1).min(output.len());
+    }
+
+    if let Some((summary, status)) = current_header {
+        sections.push(BatchResultSection {
+            summary,
+            status,
+            body: output[body_start..].trim_matches('\n'),
+        });
+    }
+    sections
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_batch_result(
+    parent_ok: bool,
+    kind: Option<crate::agent::ToolKind>,
+    summary: &str,
+    output: &str,
+    calls: &[crate::agent::ToolCall],
+    mi: usize,
+    bi: usize,
+    width: usize,
+    theme: &Theme,
+    toggled: &HashSet<(usize, usize)>,
+    show_output: bool,
+    out: &mut Vec<RenderedLine>,
+) {
+    use crate::agent::ToolKind;
+
+    let sections = parse_batch_result(output);
+    if sections.is_empty() {
+        push_status(
+            if parent_ok { "✓" } else { "✗" },
+            summary,
+            if parent_ok {
+                theme.accent
+            } else {
+                theme.danger
+            },
+            mi,
+            out,
+        );
+        return;
+    }
+
+    let failed = sections
+        .iter()
+        .filter(|section| section.status != "ok")
+        .count();
+    let succeeded = sections.len().saturating_sub(failed);
+    let all_ok = parent_ok && failed == 0;
+    let expanded = show_output || toggled.contains(&(mi, bi));
+    let arrow = if expanded { "▾ " } else { "▸ " };
+    let icon = if all_ok { "✓" } else { "✗" };
+    let meta = if failed == 0 {
+        format!("{} completed", succeeded)
+    } else {
+        format!("{} completed · {} failed", succeeded, failed)
+    };
+    out.push(
+        RenderedLine::new(
+            tool_chip_header(
+                kind.map(|tool| tool.name()).unwrap_or("operations"),
+                arrow,
+                icon,
+                summary,
+                Some(&meta),
+                all_ok,
+                theme,
+            ),
+            format!("{} {} ({})", icon, summary, meta),
+            mi,
+        )
+        .with_toggle((mi, bi)),
+    );
+
+    let body_width = width.saturating_sub(4).max(1);
+    for (index, section) in sections.iter().enumerate() {
+        let call = calls.get(index);
+        let child_kind = call.and_then(crate::agent::ToolCall::kind).or(kind);
+        let child_ok = section.status == "ok";
+        let child_icon = if child_ok { "✓" } else { "✗" };
+        let child_color = if child_ok {
+            theme.success
+        } else {
+            theme.danger
+        };
+        let child_summary = call
+            .map(crate::agent::ToolCall::summary)
+            .unwrap_or_else(|| section.summary.to_string());
+        let child_summary = crate::render::path::abbreviate_home(&child_summary);
+        let number = format!("  {:>2}. ", index + 1);
+        let mut spans = vec![
+            Span::styled(number.clone(), Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("{} ", child_icon),
+                Style::default()
+                    .fg(child_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                child_summary.clone(),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if !child_ok {
+            spans.push(Span::styled(
+                format!("  {}", section.status),
+                Style::default().fg(theme.danger),
+            ));
+        }
+        for (row_spans, plain) in wrap_segments(
+            &spans
+                .into_iter()
+                .map(|span| (span.content.into_owned(), span.style))
+                .collect::<Vec<_>>(),
+            width.max(1),
+        ) {
+            out.push(RenderedLine::new(Line::from(row_spans), plain, mi));
+        }
+
+        if !expanded || section.body.is_empty() {
+            continue;
+        }
+        let detail_start = out.len();
+        match (child_kind, call) {
+            (Some(ToolKind::Edit), Some(call)) if child_ok => {
+                let path = call.get_arg("path").unwrap_or("");
+                let old = call
+                    .get_arg("old")
+                    .or_else(|| call.get_arg("old_string"))
+                    .unwrap_or("");
+                let new = call
+                    .get_arg("new")
+                    .or_else(|| call.get_arg("new_string"))
+                    .unwrap_or("");
+                render_edit_comparison(path, old, new, 1, mi, body_width, theme, out);
+            }
+            (Some(ToolKind::Write), Some(call)) if child_ok => {
+                render_source_card(
+                    "CONTENT",
+                    theme.success,
+                    call.get_arg("path").unwrap_or(""),
+                    call.get_arg("content").unwrap_or(""),
+                    1,
+                    mi,
+                    body_width,
+                    theme,
+                    out,
+                );
+            }
+            (Some(ToolKind::Read), Some(call)) if child_ok => {
+                let (start_line, content, notes) = read_file_body(section.body);
+                render_source_card(
+                    "CONTENT",
+                    theme.accent,
+                    call.get_arg("path").unwrap_or(""),
+                    &content,
+                    start_line,
+                    mi,
+                    body_width,
+                    theme,
+                    out,
+                );
+                for note in notes {
+                    push_status("›", &note, theme.muted, mi, out);
+                }
+            }
+            (Some(ToolKind::Shell), Some(call)) if child_ok => {
+                render_shell_output(
+                    call.get_arg("command").unwrap_or(""),
+                    section.body,
+                    mi,
+                    body_width,
+                    theme,
+                    out,
+                );
+            }
+            _ => {
+                let style = Style::default().fg(if child_ok { theme.muted } else { theme.danger });
+                for line in section.body.lines() {
+                    for (spans, plain) in wrap_segments(&[(line.to_string(), style)], body_width) {
+                        out.push(RenderedLine::new(Line::from(spans), plain, mi));
+                    }
+                }
+            }
+        }
+        indent_tool_body(&mut out[detail_start..], 4);
+    }
+}
+
 fn render_compact_diff_output(
     output: &str,
     mi: usize,
@@ -2835,6 +3276,73 @@ mod tests {
             let w = unicode_width::UnicodeWidthStr::width(r.plain.as_str());
             assert!(w <= 9, "row exceeds width 9: {:?} (width={})", r.plain, w);
         }
+    }
+
+    #[test]
+    fn markdown_tables_render_with_borders_rows_and_alignment() {
+        let rows = build(
+            &doc(
+                "assistant",
+                vec![Block::Markdown(
+                    "| Name | Count | Note |\n| :--- | ---: | :---: |\n| Alpha | 12 | ready |\n| Beta | 3 | waiting |".into(),
+                )],
+            ),
+            60,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| row.plain.contains('┌')));
+        assert!(rows.iter().any(|row| row.plain.contains("Alpha")));
+        assert!(rows.iter().any(|row| row.plain.contains("Beta")));
+        assert!(!rows.iter().any(|row| row.plain.contains("---:")));
+        let alpha = rows.iter().find(|row| row.plain.contains("Alpha")).unwrap();
+        let count_start = alpha.plain.find("12").unwrap();
+        let count_cell_start = alpha.plain[..count_start].rfind('│').unwrap();
+        assert!(alpha.plain[count_cell_start + '│'.len_utf8()..count_start].len() > 1);
+    }
+
+    #[test]
+    fn markdown_tables_wrap_to_available_width() {
+        let rows = build(
+            &doc(
+                "assistant",
+                vec![Block::Markdown(
+                    "A | B\n--- | ---\na very long value | another long value".into(),
+                )],
+            ),
+            24,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| row.plain.contains('┌')));
+        for row in rows {
+            assert!(
+                display_width(&row.plain) <= 24,
+                "table row too wide: {:?}",
+                row.plain
+            );
+        }
+    }
+
+    #[test]
+    fn non_table_pipe_text_stays_plain_markdown() {
+        let rows = build(
+            &doc(
+                "assistant",
+                vec![Block::Markdown("a | b\nnot a separator".into())],
+            ),
+            40,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(!rows.iter().any(|row| row.plain.contains('┌')));
+        assert!(rows.iter().any(|row| row.plain.contains("a | b")));
     }
 
     #[test]
@@ -3794,6 +4302,132 @@ mod tests {
         );
         assert!(rows.iter().any(|row| row.plain.contains("+fn new()")));
         assert!(has_keyword_colour(&rows));
+    }
+
+    #[test]
+    fn batched_results_use_operation_summary_rows_instead_of_raw_headers() {
+        let block = Block::ToolFileResult {
+            ok: true,
+            name: Some("shell".into()),
+            summary: "shell(2 operations)".into(),
+            output: "## 1/2 · shell(cargo test) · ok\npassed\n\n## 2/2 · shell(cargo clippy) · error\nwarning".into(),
+            call: crate::agent::ToolCall {
+                name: "shell".into(),
+                args: serde_json::json!({"commands": ["cargo test", "cargo clippy"]}),
+                id: None,
+            },
+        };
+        let rows = build(
+            &doc("tool", vec![block]),
+            80,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("1 completed · 1 failed")));
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("1. ✓ shell(cargo test)")));
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("2. ✗ shell(cargo clippy)")));
+        assert!(!rows.iter().any(|row| row.plain.starts_with("## ")));
+        assert!(!rows.iter().any(|row| row.plain.contains("passed")));
+        assert!(rows.iter().any(|row| row.toggle.is_some()));
+    }
+
+    #[test]
+    fn expanded_batched_shell_results_use_terminal_panels() {
+        let block = Block::ToolFileResult {
+            ok: true,
+            name: Some("shell".into()),
+            summary: "shell(2 operations)".into(),
+            output: "## 1/2 · shell(cargo test) · ok\npassed\n\n## 2/2 · shell(cargo clippy) · ok\nclean".into(),
+            call: crate::agent::ToolCall {
+                name: "shell".into(),
+                args: serde_json::json!({"commands": ["cargo test", "cargo clippy"]}),
+                id: None,
+            },
+        };
+        let mut toggled = HashSet::new();
+        toggled.insert((0, 0));
+        let rows = build(
+            &doc("tool", vec![block]),
+            80,
+            &Theme::default(),
+            &toggled,
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| row.plain.contains("$ cargo test")));
+        assert!(rows.iter().any(|row| row.plain.contains("passed")));
+        assert!(rows.iter().any(|row| row.background == Some(Color::Black)));
+    }
+
+    #[test]
+    fn batched_shell_result_does_not_render_an_empty_terminal_prompt() {
+        let block = Block::ToolFileResult {
+            ok: true,
+            name: Some("shell".into()),
+            summary: "shell(2 operations)".into(),
+            output: "## 1/2 · shell(cargo test) · ok\npassed\n\n## 2/2 · shell(cargo clippy) · ok\nclean".into(),
+            call: crate::agent::ToolCall {
+                name: "shell".into(),
+                args: serde_json::json!({"commands": ["cargo test", "cargo clippy"]}),
+                id: None,
+            },
+        };
+        let rows = build(
+            &doc("tool", vec![block]),
+            80,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("shell(2 operations)")));
+        assert!(rows.iter().any(|row| row.plain.contains("cargo test")));
+        assert!(!rows.iter().any(|row| row.plain.trim() == "$"));
+    }
+
+    #[test]
+    fn batched_edit_result_does_not_render_empty_old_and_new_cards() {
+        let block = Block::ToolFileResult {
+            ok: true,
+            name: Some("edit".into()),
+            summary: "edit(2 operations)".into(),
+            output: "## 1/2 · edit(a.rs) · ok\nEdit a.rs (1 occurrence)\n\n## 2/2 · edit(b.rs) · ok\nEdit b.rs (1 occurrence)".into(),
+            call: crate::agent::ToolCall {
+                name: "file_management".into(),
+                args: serde_json::json!({
+                    "action": "edit",
+                    "batch": [
+                        {"path": "a.rs", "old": "old a", "new": "new a"},
+                        {"path": "b.rs", "old": "old b", "new": "new b"}
+                    ]
+                }),
+                id: None,
+            },
+        };
+        let rows = build(
+            &doc("tool", vec![block]),
+            80,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("edit(2 operations)")));
+        assert!(rows.iter().any(|row| row.plain.contains("edit(a.rs)")));
+        assert!(!rows.iter().any(|row| row.plain.contains("█ OLD")));
+        assert!(!rows.iter().any(|row| row.plain.contains("█ NEW")));
     }
 
     #[test]

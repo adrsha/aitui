@@ -443,12 +443,19 @@ impl App {
         }
 
         if out.len() == 1 {
+            let activity = task
+                .and_then(|task| task.activity.as_deref())
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or("Starting child agent…");
+            let text = format!("◐ {activity}");
             out.push(RenderedLine::new(
                 Line::from(Span::styled(
-                    "No activity captured for this agent yet.",
-                    Style::default().fg(theme.muted),
+                    text.clone(),
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
                 )),
-                "No activity captured for this agent yet.".into(),
+                text,
                 usize::MAX,
             ));
         }
@@ -3186,12 +3193,18 @@ impl App {
         let kind = call.kind();
         let mutates = matches!(
             kind,
-            Some(ToolKind::Write | ToolKind::Edit | ToolKind::Delete)
+            Some(ToolKind::Write | ToolKind::Edit | ToolKind::Delete | ToolKind::PowerPoint)
         );
         if !mutates {
             return;
         }
-        let Some(path) = call.args.get("path").and_then(|v| v.as_str()) else {
+        let path = if kind == Some(ToolKind::PowerPoint) {
+            call.args.get("output_path")
+        } else {
+            call.args.get("path")
+        }
+        .and_then(|v| v.as_str());
+        let Some(path) = path else {
             return;
         };
         let path = path.trim_start_matches("./").to_string();

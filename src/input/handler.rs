@@ -551,12 +551,18 @@ fn handle_command_line(cl: &crate::app::overlay::CommandLine, key: &KeyEvent) ->
     match key.code {
         KeyCode::Esc => vec![Action::PickerCancel],
         KeyCode::Enter => {
-            if cl.has_completions() {
-                return vec![Action::CommandLineAccept];
-            }
             let cmd = cl.input.trim();
             if cmd.is_empty() {
                 return vec![Action::PickerCancel];
+            }
+            // Exact commands should run immediately. In particular, typing `:q`
+            // or `:w` must not first expand the visible completion to `quit ` or
+            // `send ` and require a second Enter press.
+            if crate::app::commands::exact_command_action(cmd).is_some() {
+                return vec![Action::PickerCancel, Action::RunCommand(cmd.to_string())];
+            }
+            if cl.has_completions() {
+                return vec![Action::CommandLineAccept];
             }
             vec![Action::PickerCancel, Action::RunCommand(cmd.to_string())]
         }
@@ -998,6 +1004,33 @@ mod tests {
         assert!(matches!(
             handle_key(&app, key(KeyCode::Char(':'))).as_slice(),
             [Action::OpenCommandLine]
+        ));
+    }
+
+    #[test]
+    fn exact_vim_commands_execute_on_first_enter() {
+        for command in ["q", "w"] {
+            let mut line = crate::app::overlay::CommandLine::new();
+            for c in command.chars() {
+                line.push(c);
+            }
+            assert!(line.has_completions());
+            assert!(matches!(
+                handle_command_line(&line, &key(KeyCode::Enter)).as_slice(),
+                [Action::PickerCancel, Action::RunCommand(cmd)] if cmd == command
+            ));
+        }
+    }
+
+    #[test]
+    fn partial_command_still_accepts_completion() {
+        let mut line = crate::app::overlay::CommandLine::new();
+        line.push('q');
+        line.push('u');
+        assert!(line.has_completions());
+        assert!(matches!(
+            handle_command_line(&line, &key(KeyCode::Enter)).as_slice(),
+            [Action::CommandLineAccept]
         ));
     }
 

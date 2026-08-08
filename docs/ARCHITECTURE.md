@@ -175,16 +175,17 @@ Cancelling the parent aborts unfinished child workers, releases the barrier, mar
 children failed in both UI and transcript, and ignores any already-queued late events.
 
 ### Categorized tool contract
-The model sees five native functions: `file_management`, `shell`, `web`,
-`interaction`, and `workflow`. All except `shell` carry an `action` enum. A
+The model sees six native functions: `file_management`, `shell`, `web`,
+`specialized`, `interaction`, and `workflow`. All except `shell` carry an `action` enum. A
 `ToolCall` resolves `(category, action)` to an operation-level `ToolKind` before
 permission checks, previews, speculative execution, UI interception, and executor
 dispatch. This keeps the model-facing catalogue small while preserving distinct
 risk and permission scopes for operations such as read, edit, and delete.
 
 `file_management` includes read/write/edit/list/search/mkdir/move/copy/delete;
-`web` includes search/fetch/download; `interaction` includes ask/propose/plan; and
-`workflow` includes todo/agent/finish. `todo` is the numbered main checklist (displayed
+`web` includes search/images/reverse_image/fetch/download; `specialized` includes
+PowerPoint generation from validated structured slide specs; `interaction` includes
+ask/propose/plan; and `workflow` includes todo/agent/finish. `todo` is the numbered main checklist (displayed
 as subtasks); `agent` is a parallel child execution context and accepts optional one-based
 `task_index` ownership metadata. The legacy `task` spelling remains parseable for old
 sessions but is no longer advertised. Redundant `append` and `complete_step` operations

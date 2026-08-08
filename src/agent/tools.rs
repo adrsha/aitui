@@ -29,6 +29,8 @@ pub enum ToolKind {
     ReverseImage,
     WebFetch,
     Download,
+    /// Generate a validated animated PowerPoint deck from a structured slide spec.
+    PowerPoint,
     Todo,
     Ask,
     Plan,
@@ -58,6 +60,7 @@ impl ToolKind {
             ToolKind::ReverseImage => "reverse_image",
             ToolKind::WebFetch => "web_fetch",
             ToolKind::Download => "download",
+            ToolKind::PowerPoint => "powerpoint",
             ToolKind::Todo => "todo",
             ToolKind::Ask => "ask",
             ToolKind::Plan => "plan",
@@ -86,6 +89,7 @@ impl ToolKind {
             }
             ToolKind::WebFetch => "Fetch the readable text of a web page",
             ToolKind::Download => "Download a URL to a local file",
+            ToolKind::PowerPoint => "Generate a validated animated PowerPoint deck",
             ToolKind::Todo => "Set the task breakdown shown in the sticky todo panel",
             ToolKind::Ask => "Ask the user for missing information or a decision",
             ToolKind::Plan => "Write a plan file for user review and approval",
@@ -112,6 +116,7 @@ impl ToolKind {
             ToolKind::ReverseImage => "↺",
             ToolKind::WebFetch => "⤓",
             ToolKind::Download => "⇩",
+            ToolKind::PowerPoint => "▤",
             ToolKind::Todo => "☑",
             ToolKind::Ask => "?",
             ToolKind::Plan => "◫",
@@ -137,6 +142,7 @@ impl ToolKind {
             ToolKind::Move => ToolRisk::Medium,
             ToolKind::Copy => ToolRisk::Medium,
             ToolKind::Download => ToolRisk::Medium,
+            ToolKind::PowerPoint => ToolRisk::Medium,
             ToolKind::Todo => ToolRisk::Low,
             ToolKind::Ask => ToolRisk::Low,
             ToolKind::Plan => ToolRisk::Low,
@@ -167,6 +173,7 @@ impl ToolKind {
             "reverse_image" | "reverse_image_search" => Some(ToolKind::ReverseImage),
             "web_fetch" => Some(ToolKind::WebFetch),
             "download" | "download_file" => Some(ToolKind::Download),
+            "powerpoint" | "pptx" | "presentation" => Some(ToolKind::PowerPoint),
             "todo" | "todos" | "todo_write" => Some(ToolKind::Todo),
             "ask" | "decide" => Some(ToolKind::Ask),
             "plan" => Some(ToolKind::Plan),
@@ -194,6 +201,7 @@ impl ToolKind {
             ToolKind::ReverseImage,
             ToolKind::WebFetch,
             ToolKind::Download,
+            ToolKind::PowerPoint,
             ToolKind::Delete,
         ]
     }
@@ -250,6 +258,10 @@ impl ToolCall {
                 "download" => Some(ToolKind::Download),
                 _ => None,
             }),
+            "specialized" => self.category_action().and_then(|action| match action {
+                "powerpoint" | "pptx" | "presentation" => Some(ToolKind::PowerPoint),
+                _ => None,
+            }),
             "interaction" => self.category_action().and_then(|action| match action {
                 "ask" => Some(ToolKind::Ask),
                 "propose" => Some(ToolKind::ProposeStep),
@@ -288,8 +300,12 @@ impl ToolCall {
             Some(ToolKind::Download) => raw_paths.extend(
                 args.get("path")
                     .and_then(|value| value.as_str())
-                    .map(str::to_string)
-                    .into_iter(),
+                    .map(str::to_string),
+            ),
+            Some(ToolKind::PowerPoint) => raw_paths.extend(
+                args.get("output_path")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
             ),
             Some(ToolKind::WebSearch)
             | Some(ToolKind::WebImages)
@@ -299,8 +315,7 @@ impl ToolCall {
                 raw_paths.extend(
                     args.get("path")
                         .and_then(|value| value.as_str())
-                        .map(str::to_string)
-                        .into_iter(),
+                        .map(str::to_string),
                 );
                 raw_paths.extend(
                     args.get("paths")
@@ -357,6 +372,78 @@ impl ToolCall {
         self.permission_directories(cwd)
             .into_iter()
             .any(|directory| !directory.starts_with(&base))
+    }
+
+    /// Expand a batched parent request into the concrete calls it represents.
+    /// Returns `None` for an ordinary single call. Keeping this normalization on
+    /// `ToolCall` lets execution, permission previews, and transcript rendering
+    /// agree on the actual arguments instead of displaying empty top-level fields.
+    pub fn expanded_calls(&self) -> Result<Option<Vec<ToolCall>>, String> {
+        let Some(parent) = self.args.as_object() else {
+            return Ok(None);
+        };
+
+        let make_call = |args: serde_json::Map<String, serde_json::Value>| ToolCall {
+            name: self.name.clone(),
+            args: serde_json::Value::Object(args),
+            id: self.id.clone(),
+        };
+
+        if let Some(batch) = parent.get("batch") {
+            let batch = batch
+                .as_array()
+                .ok_or("'batch' must be an array of argument objects")?;
+            let mut base = parent.clone();
+            base.remove("batch");
+            base.remove("paths");
+            base.remove("commands");
+            let mut calls = Vec::with_capacity(batch.len());
+            for item in batch {
+                let item = item
+                    .as_object()
+                    .ok_or("Every 'batch' item must be an argument object")?;
+                let mut args = base.clone();
+                args.extend(item.clone());
+                calls.push(make_call(args));
+            }
+            return Ok(Some(calls));
+        }
+
+        if let Some(paths) = parent.get("paths") {
+            let paths = paths
+                .as_array()
+                .ok_or("'paths' must be an array of file or directory paths")?;
+            let mut base = parent.clone();
+            base.remove("paths");
+            let mut calls = Vec::with_capacity(paths.len());
+            for path in paths {
+                let path = path.as_str().ok_or("Every 'paths' item must be a string")?;
+                let mut args = base.clone();
+                args.insert("path".into(), serde_json::Value::String(path.into()));
+                calls.push(make_call(args));
+            }
+            return Ok(Some(calls));
+        }
+
+        if let Some(commands) = parent.get("commands") {
+            let commands = commands
+                .as_array()
+                .ok_or("'commands' must be an array of shell command strings")?;
+            let mut base = parent.clone();
+            base.remove("commands");
+            let mut calls = Vec::with_capacity(commands.len());
+            for command in commands {
+                let command = command
+                    .as_str()
+                    .ok_or("Every 'commands' item must be a string")?;
+                let mut args = base.clone();
+                args.insert("command".into(), serde_json::Value::String(command.into()));
+                calls.push(make_call(args));
+            }
+            return Ok(Some(calls));
+        }
+
+        Ok(None)
     }
 
     /// Human-readable summary of what this call will do, rendered function-call
@@ -419,6 +506,20 @@ impl ToolCall {
             Some(ToolKind::WebFetch) => format!("web_fetch({})", s("url").unwrap_or("?")),
             Some(ToolKind::Download) => {
                 format!("download({} → {})", s("url").unwrap_or("?"), path())
+            }
+            Some(ToolKind::PowerPoint) => {
+                let slides = self
+                    .args
+                    .get("slides")
+                    .and_then(|value| value.as_array())
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                format!(
+                    "powerpoint({} · {} slide{})",
+                    s("output_path").unwrap_or("?"),
+                    slides,
+                    if slides == 1 { "" } else { "s" }
+                )
             }
             Some(ToolKind::Todo) => {
                 let n = self
@@ -499,6 +600,7 @@ impl ToolCall {
             Some(ToolKind::ReverseImage) => &["url", "path"],
             Some(ToolKind::WebFetch) => &["url"],
             Some(ToolKind::Download) => &["url", "path"],
+            Some(ToolKind::PowerPoint) => &["output_path"],
             _ => &[],
         }
     }
@@ -895,7 +997,7 @@ pub fn agent_system_prompt(
         r#"You are an agentic coding assistant with filesystem + shell + web access.
 CWD: {}
 
-Use the attached tool schemas (5 categories: file_management, shell, web, interaction, workflow).
+Use the attached tool schemas (6 categories: file_management, shell, web, specialized, interaction, workflow).
 Call them natively; results return directly.
 
 Safety: destructive actions (delete, force-push, rm -rf, reset --hard) require user approval.
@@ -1015,6 +1117,28 @@ fn operation_schemas() -> serde_json::Value {
             ("url", true, "URL to download"),
             ("path", true, "Local destination path"),
         ]),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "powerpoint",
+                "description": "Generate a validated animated .pptx deck from structured slides. Supports positioned text, images, and basic shapes; fixed entrance/exit animations; and fade/push/wipe transitions.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "output_path": {
+                            "type": "string",
+                            "description": "Destination .pptx path, relative to cwd or absolute"
+                        },
+                        "slides": {
+                            "type": "array",
+                            "description": "Ordered slide objects. Each slide accepts elements, animations, and transition. Elements require id/type/x/y/width/height and may include text, image_path, shape_type, fill_color, text_color, font_size. Animation objects require type/target/order and may include duration_ms, delay_ms, trigger. Supported transitions: fade, push_left, wipe_left.",
+                            "items": { "type": "object", "additionalProperties": true }
+                        }
+                    },
+                    "required": ["output_path", "slides"]
+                }
+            }
+        }),
         // `todo` takes an array param, so it's built directly rather than via `f`.
         serde_json::json!({
             "type": "function",
@@ -1228,7 +1352,7 @@ fn operation_schemas() -> serde_json::Value {
     schemas
 }
 
-/// Five model-visible category tools. Each category carries an `action` enum and
+/// Six model-visible category tools. Each category carries an `action` enum and
 /// the union of its action arguments; `ToolCall::kind` resolves the selected action
 /// back to the operation-level type used by permissions, execution, and rendering.
 pub fn tool_schemas() -> serde_json::Value {
@@ -1337,6 +1461,12 @@ fn build_tool_schemas(loop_active: bool) -> serde_json::Value {
         ),
         category(
             &operations,
+            "specialized",
+            "Specialized artifact-generation tools. Choose powerpoint to create a validated animated .pptx deck directly from a structured slide specification.",
+            &[("powerpoint", "powerpoint")],
+        ),
+        category(
+            &operations,
             "interaction",
             "User interaction that requires structured UI. Choose ask for missing information, propose only for genuine alternative paths, or plan for a reviewable markdown plan.",
             &[("ask", "ask"), ("propose", "propose_step"), ("plan", "plan")],
@@ -1429,6 +1559,14 @@ mod tests {
             Some(ToolKind::ReverseImage)
         );
         assert_eq!(
+            call(
+                "specialized",
+                serde_json::json!({"action": "powerpoint", "output_path": "deck.pptx", "slides": []})
+            )
+            .kind(),
+            Some(ToolKind::PowerPoint)
+        );
+        assert_eq!(
             call("interaction", serde_json::json!({"action": "propose"})).kind(),
             Some(ToolKind::ProposeStep)
         );
@@ -1480,7 +1618,7 @@ mod tests {
     }
 
     #[test]
-    fn schemas_expose_five_categories() {
+    fn schemas_expose_specialized_powerpoint_category() {
         let schemas = tool_schemas();
         let names: Vec<&str> = schemas
             .as_array()
@@ -1490,7 +1628,14 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["file_management", "shell", "web", "interaction", "workflow"]
+            [
+                "file_management",
+                "shell",
+                "web",
+                "specialized",
+                "interaction",
+                "workflow"
+            ]
         );
 
         let file = &schemas[0]["function"]["parameters"]["properties"]["action"]["enum"];
@@ -1505,14 +1650,16 @@ mod tests {
             web,
             &serde_json::json!(["search", "images", "reverse_image", "fetch", "download"])
         );
-        let workflow = &schemas[4]["function"]["parameters"]["properties"]["action"]["enum"];
+        let specialized = &schemas[3]["function"]["parameters"]["properties"]["action"]["enum"];
+        assert_eq!(specialized, &serde_json::json!(["powerpoint"]));
+        let workflow = &schemas[5]["function"]["parameters"]["properties"]["action"]["enum"];
         assert_eq!(workflow, &serde_json::json!(["agent"]));
         let loop_schemas = tool_schemas_for_loop(true);
         let loop_workflow =
-            &loop_schemas[4]["function"]["parameters"]["properties"]["action"]["enum"];
+            &loop_schemas[5]["function"]["parameters"]["properties"]["action"]["enum"];
         assert_eq!(loop_workflow, &serde_json::json!(["agent", "finish"]));
         assert!(
-            schemas[4].to_string().contains("\"items\""),
+            schemas[5].to_string().contains("\"items\""),
             "todo args stay in the schema for child agents"
         );
         assert!(!schemas.to_string().contains("complete_step"));
@@ -1520,10 +1667,36 @@ mod tests {
     }
 
     #[test]
+    fn every_advertised_category_action_routes_to_an_executable_kind() {
+        for schemas in [tool_schemas(), tool_schemas_for_loop(true)] {
+            for schema in schemas.as_array().unwrap() {
+                let name = schema["function"]["name"].as_str().unwrap();
+                if name == "shell" {
+                    assert_eq!(
+                        call(name, serde_json::json!({"command": "cargo test"})).kind(),
+                        Some(ToolKind::Shell)
+                    );
+                    continue;
+                }
+                for action in schema["function"]["parameters"]["properties"]["action"]["enum"]
+                    .as_array()
+                    .unwrap()
+                {
+                    let routed = call(name, serde_json::json!({"action": action}));
+                    assert!(
+                        routed.kind().is_some(),
+                        "advertised action has no executor route: {name}/{action}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn agent_prompt_describes_adaptive_steps_and_editable_choices() {
         let prompt = agent_system_prompt(Path::new("/tmp/project"), &Default::default());
         assert!(prompt.contains("CWD: /tmp/project"));
-        assert!(prompt.contains("5 categories"));
+        assert!(prompt.contains("6 categories"));
         assert!(prompt.contains("Safety"));
         assert!(prompt.contains("Workflow"));
         assert!(prompt.contains("Report"));
@@ -1578,11 +1751,11 @@ mod tests {
             .unwrap();
         assert!(old_desc.contains("disambiguate"));
 
-        let interaction = &schemas[3];
+        let interaction = &schemas[4];
         let interaction_desc = interaction["function"]["description"].as_str().unwrap();
         assert!(interaction_desc.contains("genuine alternative paths"));
 
-        let workflow = &schemas[4];
+        let workflow = &schemas[5];
         let workflow_desc = workflow["function"]["description"].as_str().unwrap();
         assert!(workflow_desc.contains("tracker"));
         assert!(workflow_desc.contains("parallel child agent"));
@@ -1727,6 +1900,35 @@ mod tests {
             lifetime: PermissionLifetime::Session,
         });
         assert_eq!(mem.check(&shell, &cwd), Some(PermissionDecision::Deny));
+    }
+
+    #[test]
+    fn expanded_calls_normalize_commands_and_edit_batches() {
+        let shell = call(
+            "shell",
+            serde_json::json!({"commands": ["cargo test", "cargo clippy"]}),
+        );
+        let commands = shell.expanded_calls().unwrap().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].get_arg("command"), Some("cargo test"));
+        assert_eq!(commands[1].get_arg("command"), Some("cargo clippy"));
+
+        let edit = call(
+            "file_management",
+            serde_json::json!({
+                "action": "edit",
+                "batch": [
+                    {"path": "a.rs", "old": "old a", "new": "new a"},
+                    {"path": "b.rs", "old": "old b", "new": "new b"}
+                ]
+            }),
+        );
+        let edits = edit.expanded_calls().unwrap().unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].get_arg("path"), Some("a.rs"));
+        assert_eq!(edits[0].get_arg("old"), Some("old a"));
+        assert_eq!(edits[0].get_arg("new"), Some("new a"));
+        assert_eq!(edits[1].get_arg("path"), Some("b.rs"));
     }
 
     #[test]

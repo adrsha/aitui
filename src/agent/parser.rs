@@ -63,7 +63,7 @@ fn line_anchored(s: &str, pos: usize) -> bool {
 
 fn inside_inline_code_span(s: &str, pos: usize) -> bool {
     let line_start = s[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let bytes = s[line_start..pos].as_bytes();
+    let bytes = &s.as_bytes()[line_start..pos];
     let mut open_run = None;
     let mut i = 0;
     while i < bytes.len() {
@@ -352,14 +352,11 @@ pub fn closed_thinking_calls(text: &str) -> Vec<ToolCall> {
     }
     let mut content = String::new();
     let mut rest = text;
-    loop {
-        let Some((pos, open, close)) = THINK_TAGS
-            .iter()
-            .filter_map(|(open, close)| rest.find(open).map(|pos| (pos, *open, *close)))
-            .min_by_key(|(pos, _, _)| *pos)
-        else {
-            break;
-        };
+    while let Some((pos, open, close)) = THINK_TAGS
+        .iter()
+        .filter_map(|(open, close)| rest.find(open).map(|pos| (pos, *open, *close)))
+        .min_by_key(|(pos, _, _)| *pos)
+    {
         let after = &rest[pos + open.len()..];
         let Some(end) = after.find(close) else {
             break;
@@ -435,7 +432,10 @@ pub fn plan_read_guesses(text: &str) -> Vec<String> {
         let mut rest = line;
         while let Some(idx) = rest.find("read") {
             let after = &rest[idx + 4..];
-            let max = after.len().min(64);
+            let mut max = after.len().min(64);
+            while !after.is_char_boundary(max) {
+                max -= 1;
+            }
             if let Some(path) = quoted_string_in(&after[..max]) {
                 push(path, &mut out);
             }
@@ -938,6 +938,14 @@ Then I will read("src/agent/parser.rs") and read(path = "src/domain/session.rs")
                 "src/backtick.rs",
             ]
         );
+    }
+
+    #[test]
+    fn plan_read_guesses_handles_multibyte_text_at_scan_boundary() {
+        // The 64-byte speculative scan window used to slice directly at byte 64.
+        // A box-drawing character crossing that boundary caused a UTF-8 panic.
+        let text = format!("read{}─ trailing", "a".repeat(63));
+        assert!(plan_read_guesses(&text).is_empty());
     }
 
     #[test]

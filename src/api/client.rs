@@ -491,7 +491,10 @@ fn preparing_tool_label(call: &AccCall) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    if matches!(name, "file_management" | "web" | "interaction" | "workflow") {
+    if matches!(
+        name,
+        "file_management" | "web" | "specialized" | "interaction" | "workflow"
+    ) {
         if let Some(action) = streamed_action(&call.args) {
             return Some(action);
         }

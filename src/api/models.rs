@@ -204,7 +204,8 @@ impl ChatRequest {
         self
     }
 
-    /// Attach native function-calling tool schemas with `tool_choice:"required"`.
+    /// Attach native function-calling tool schemas with automatic selection and
+    /// parallel calls enabled.
     pub fn with_tools(mut self, schemas: serde_json::Value) -> Self {
         self.tools = Some(schemas);
         self.tool_choice = Some(serde_json::Value::String("auto".to_string()));
@@ -352,6 +353,16 @@ mod tests {
         let json = serde_json::to_value(request).unwrap();
         assert_eq!(json["reasoning_effort"], "custom-effort");
         assert_eq!(json["reasoning_mode"], "deep-think");
+    }
+
+    #[test]
+    fn native_tool_request_serializes_auto_choice_and_parallel_calls() {
+        let schemas = serde_json::json!([{"type": "function"}]);
+        let request = ChatRequest::new("model", vec![]).with_tools(schemas.clone());
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["tools"], schemas);
+        assert_eq!(json["tool_choice"], "auto");
+        assert_eq!(json["parallel_tool_calls"], true);
     }
 
     #[test]

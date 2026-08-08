@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{OnceLock, RwLock};
 use std::time::Instant;
 
@@ -130,78 +131,10 @@ fn resolve_path(raw: &str, cwd: &Path) -> PathBuf {
     }
 }
 
-fn batch_items(call: &ToolCall) -> Result<Option<Vec<ToolCall>>, String> {
-    let Some(parent) = call.args.as_object() else {
-        return Ok(None);
-    };
-
-    let make_call = |args: serde_json::Map<String, serde_json::Value>| ToolCall {
-        name: call.name.clone(),
-        args: serde_json::Value::Object(args),
-        id: call.id.clone(),
-    };
-
-    if let Some(batch) = parent.get("batch") {
-        let batch = batch
-            .as_array()
-            .ok_or("'batch' must be an array of argument objects")?;
-        let mut base = parent.clone();
-        base.remove("batch");
-        base.remove("paths");
-        base.remove("commands");
-        let mut calls = Vec::with_capacity(batch.len());
-        for item in batch {
-            let item = item
-                .as_object()
-                .ok_or("Every 'batch' item must be an argument object")?;
-            let mut args = base.clone();
-            args.extend(item.clone());
-            calls.push(make_call(args));
-        }
-        return Ok(Some(calls));
-    }
-
-    if let Some(paths) = parent.get("paths") {
-        let paths = paths
-            .as_array()
-            .ok_or("'paths' must be an array of file or directory paths")?;
-        let mut base = parent.clone();
-        base.remove("paths");
-        let mut calls = Vec::with_capacity(paths.len());
-        for path in paths {
-            let path = path.as_str().ok_or("Every 'paths' item must be a string")?;
-            let mut args = base.clone();
-            args.insert("path".into(), serde_json::Value::String(path.into()));
-            calls.push(make_call(args));
-        }
-        return Ok(Some(calls));
-    }
-
-    if let Some(commands) = parent.get("commands") {
-        let commands = commands
-            .as_array()
-            .ok_or("'commands' must be an array of shell command strings")?;
-        let mut base = parent.clone();
-        base.remove("commands");
-        let mut calls = Vec::with_capacity(commands.len());
-        for command in commands {
-            let command = command
-                .as_str()
-                .ok_or("Every 'commands' item must be a string")?;
-            let mut args = base.clone();
-            args.insert("command".into(), serde_json::Value::String(command.into()));
-            calls.push(make_call(args));
-        }
-        return Ok(Some(calls));
-    }
-
-    Ok(None)
-}
-
 fn run(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String> {
     use super::tools::ToolKind;
 
-    if let Some(items) = batch_items(call)? {
+    if let Some(items) = call.expanded_calls()? {
         if items.is_empty() {
             return Err("Batch must contain at least one operation".into());
         }
@@ -564,6 +497,8 @@ fn run(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String>
             ))
         }
 
+        Some(ToolKind::PowerPoint) => generate_powerpoint(call, cwd),
+
         // These are intercepted by the app layer and never reach the executor;
         // handled here only for match exhaustiveness.
         Some(ToolKind::Todo) => Ok("(todo handled by UI)".into()),
@@ -575,6 +510,86 @@ fn run(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String>
 
         None => Err(format!("Unknown tool: {}", call.name)),
     }
+}
+
+fn generate_powerpoint(call: &ToolCall, cwd: &Path) -> Result<String, String> {
+    let output_path = call
+        .args
+        .get("output_path")
+        .and_then(|value| value.as_str())
+        .ok_or("powerpoint: missing 'output_path'")?;
+    if !output_path.to_ascii_lowercase().ends_with(".pptx") {
+        return Err("powerpoint: output_path must end in .pptx".into());
+    }
+    let slides = call
+        .args
+        .get("slides")
+        .and_then(|value| value.as_array())
+        .ok_or("powerpoint: missing 'slides' array")?;
+    let destination = resolve_path(output_path, cwd);
+    let mut request = call.args.clone();
+    let Some(request) = request.as_object_mut() else {
+        return Err("powerpoint: arguments must be an object".into());
+    };
+    request.remove("action");
+    request.insert(
+        "output_path".into(),
+        serde_json::Value::String(destination.to_string_lossy().to_string()),
+    );
+    let payload = serde_json::to_vec(request)
+        .map_err(|error| format!("powerpoint: cannot serialize request: {error}"))?;
+
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let candidates = [
+        manifest.join(".venv/bin/python"),
+        PathBuf::from("python3"),
+        PathBuf::from("python"),
+    ];
+    let mut last_error = String::new();
+    for python in candidates {
+        let mut command = Command::new(&python);
+        command
+            .arg("-m")
+            .arg("animated_pptx.cli")
+            .current_dir(cwd)
+            .env("PYTHONPATH", manifest)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                last_error = error.to_string();
+                continue;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(&payload)
+                .map_err(|error| format!("powerpoint: cannot send request: {error}"))?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("powerpoint: generator failed to run: {error}"))?;
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if error.is_empty() {
+                "powerpoint: generator exited without an error message".into()
+            } else {
+                format!("powerpoint: {error}")
+            });
+        }
+        crate::agent::file_cache::invalidate(&destination);
+        return Ok(format!(
+            "Generated {} ({} slide{})",
+            destination.display(),
+            slides.len(),
+            if slides.len() == 1 { "" } else { "s" }
+        ));
+    }
+    Err(format!(
+        "powerpoint: Python 3 with python-pptx and lxml is required ({last_error})"
+    ))
 }
 
 /// Resolve the `from`/`to` (aliases `source`/`dest`/`destination`) path args.
@@ -1936,6 +1951,35 @@ mod tests {
         assert!(result
             .text()
             .contains("Tool failed unexpectedly: simulated provider panic"));
+    }
+
+    #[test]
+    fn specialized_powerpoint_generates_a_real_deck() {
+        let dir = std::env::temp_dir().join(format!(
+            "aitui_powerpoint_tool_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let call = make_call(
+            "specialized",
+            serde_json::json!({
+                "action": "powerpoint",
+                "output_path": "deck.pptx",
+                "slides": [{
+                    "elements": [{
+                        "id": "title", "type": "text", "x": 1, "y": 1,
+                        "width": 5, "height": 1, "text": "Generated by AiTUI"
+                    }],
+                    "animations": [],
+                    "transition": null
+                }]
+            }),
+        );
+        let result = execute(call, &dir);
+        assert!(result.is_ok(), "{}", result.text());
+        assert!(dir.join("deck.pptx").is_file());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

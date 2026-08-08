@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "animated-pptx"
+version = "0.1.0"
+description = "Generate validated PowerPoint decks with fixed OOXML animations"
+requires-python = ">=3.11"
+dependencies = [
+  "python-pptx>=1.0.2,<2",
+  "lxml>=5,<7",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[tool.setuptools.packages.find]
+include = ["animated_pptx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

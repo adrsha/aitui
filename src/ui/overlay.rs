@@ -1406,8 +1406,16 @@ fn command_lines(
     width: usize,
     horizontal_scroll: usize,
 ) -> Vec<Line<'static>> {
+    let mut concrete = Vec::new();
+    for call in calls {
+        match call.expanded_calls() {
+            Ok(Some(items)) if !items.is_empty() => concrete.extend(items),
+            _ => concrete.push(call.clone()),
+        }
+    }
+
     let mut out = Vec::new();
-    for (index, call) in calls.iter().enumerate() {
+    for (index, call) in concrete.iter().enumerate() {
         let kind = call.kind();
         let icon = kind.map(|kind| kind.icon()).unwrap_or("tool");
         let risk = kind.map(|kind| kind.risk().label()).unwrap_or("UNKNOWN");
@@ -1546,6 +1554,11 @@ fn permission_card_groups<'a>(
             .collect();
             if !transfer.is_empty() {
                 groups.push(transfer);
+            }
+        }
+        Some(ToolKind::PowerPoint) => {
+            if let Some(path) = card("OUTPUT", "output_path", "", theme.accent) {
+                groups.push(vec![path]);
             }
         }
         Some(ToolKind::WebSearch) | Some(ToolKind::WebImages) => {
@@ -2568,6 +2581,47 @@ mod tests {
                     && span.style.bg == Some(Color::Reset)
             }));
         }
+    }
+
+    #[test]
+    fn access_batch_requests_show_each_concrete_command_and_edit() {
+        let calls = vec![
+            crate::agent::ToolCall {
+                name: "shell".into(),
+                args: serde_json::json!({"commands": ["cargo test", "cargo clippy"]}),
+                id: None,
+            },
+            crate::agent::ToolCall {
+                name: "file_management".into(),
+                args: serde_json::json!({
+                    "action": "edit",
+                    "batch": [
+                        {"path": "a.rs", "old": "old a", "new": "new a"},
+                        {"path": "b.rs", "old": "old b", "new": "new b"}
+                    ]
+                }),
+                id: None,
+            },
+        ];
+        let lines = command_lines(&calls, &Theme::default(), Path::new("."), 80, 0);
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        for expected in [
+            "cargo test",
+            "cargo clippy",
+            "a.rs",
+            "old a",
+            "new a",
+            "b.rs",
+            "old b",
+            "new b",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in {text:?}");
+        }
+        assert!(!text.contains("COMMAND│  │"));
     }
 
     #[test]
