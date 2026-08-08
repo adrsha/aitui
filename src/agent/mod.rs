@@ -3,6 +3,7 @@ pub mod executor;
 mod file_cache;
 mod file_search;
 pub mod parser;
+mod powerpoint;
 pub mod report;
 pub mod subtask;
 pub mod tools;

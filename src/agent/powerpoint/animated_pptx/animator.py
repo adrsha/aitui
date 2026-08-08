@@ -38,6 +38,75 @@ class AnimationTargetError(ValueError):
     """Raised when an animation names no shape on its slide."""
 
 
+def update_timing_targets(
+    pptx_slide,
+    removed_shape_ids: set[int],
+    *,
+    replacements: dict[int, int] | None = None,
+    policy: str = "remove_targeted",
+) -> None:
+    """Retarget or remove only effects that reference removed shapes."""
+    if policy not in ("remove_targeted", "error_if_referenced", "remove_all"):
+        raise ValueError(
+            "animation_policy must be remove_targeted, error_if_referenced, or remove_all"
+        )
+    root = pptx_slide._element
+    timing = root.find("p:timing", NS)
+    if timing is None or not removed_shape_ids:
+        return
+    if policy == "remove_all":
+        root.remove(timing)
+        return
+    replacements = replacements or {}
+    targeted = [
+        target for target in timing.findall(".//p:spTgt", NS)
+        if target.get("spid", "").isdigit()
+        and int(target.get("spid")) in removed_shape_ids
+    ]
+    unresolved = [
+        target for target in targeted
+        if int(target.get("spid")) not in replacements
+    ]
+    if unresolved and policy == "error_if_referenced":
+        shape_ids = sorted({int(target.get("spid")) for target in unresolved})
+        raise AnimationTargetError(
+            f"element mutation would remove animation target shape ID(s): {shape_ids}"
+        )
+    for target in targeted:
+        old_id = int(target.get("spid"))
+        if old_id in replacements:
+            target.set("spid", str(replacements[old_id]))
+    wrappers: list[etree._Element] = []
+    for target in unresolved:
+        wrapper = None
+        for ancestor in target.iterancestors():
+            if ancestor.tag == f"{{{PML_NAMESPACE}}}par":
+                timing_node = ancestor.find("p:cTn", NS)
+                if timing_node is not None and timing_node.get("presetClass") is not None:
+                    wrapper = ancestor
+                    break
+        if wrapper is None:
+            for ancestor in target.iterancestors():
+                if etree.QName(ancestor).localname in (
+                    "anim", "animClr", "animEffect", "animMotion", "animRot", "animScale",
+                    "audio", "cmd", "set", "video",
+                ):
+                    wrapper = ancestor
+                    break
+        if wrapper is None:
+            raise AnimationTargetError(
+                f"cannot safely isolate animation targeting removed shape ID {target.get('spid')}"
+            )
+        if wrapper not in wrappers:
+            wrappers.append(wrapper)
+    for wrapper in wrappers:
+        parent = wrapper.getparent()
+        if parent is not None:
+            parent.remove(wrapper)
+    if not timing.findall(".//p:spTgt", NS):
+        root.remove(timing)
+
+
 def _p(tag: str) -> etree._Element:
     return etree.Element(f"{{{PML_NAMESPACE}}}{tag}")
 
@@ -134,6 +203,50 @@ def _insert_before_extension_list(slide_root: etree._Element, node: etree._Eleme
         extension.addprevious(node)
 
 
+def apply_slide_effects(
+    pptx_slide,
+    slide_spec: Slide,
+    mapping: dict[str, int],
+    slide_number: int,
+    *,
+    replace_animations: bool = True,
+    replace_transition: bool = True,
+) -> None:
+    """Apply or replace animation/transition settings on one slide."""
+    actual_ids = {shape.shape_id for shape in pptx_slide.shapes}
+    resolved: list[tuple[Animation, int]] = []
+    for animation in sorted(slide_spec.animations, key=lambda item: item.order):
+        shape_id = mapping.get(animation.target)
+        if shape_id is None:
+            raise AnimationTargetError(
+                f"slide {slide_number} animation target {animation.target!r} does not exist"
+            )
+        if shape_id not in actual_ids:
+            raise AnimationTargetError(
+                f"slide {slide_number} animation target {animation.target!r} maps to missing "
+                f"shape ID {shape_id}"
+            )
+        resolved.append((animation, shape_id))
+
+    root = pptx_slide._element
+    if replace_animations:
+        existing_timing = root.find("p:timing", NS)
+        if existing_timing is not None:
+            root.remove(existing_timing)
+        if resolved:
+            _insert_before_extension_list(root, _timing_node(resolved))
+    if replace_transition:
+        existing_transition = root.find("p:transition", NS)
+        if existing_transition is not None:
+            root.remove(existing_transition)
+        if slide_spec.transition is not None:
+            child_tag, child_attributes = _TRANSITIONS[slide_spec.transition]
+            transition = _p("transition")
+            transition.set("spd", "med")
+            _sub(transition, child_tag, **child_attributes)
+            _insert_before_extension_list(root, transition)
+
+
 def apply_animations(
     presentation: Presentation,
     slides: Sequence[Slide],
@@ -159,33 +272,4 @@ def apply_animations(
             for name, shape_id in mapping.items()
         ):
             raise TypeError("each shape_ids item must map strings to integer shape IDs")
-        actual_ids = {shape.shape_id for shape in pptx_slide.shapes}
-        resolved: list[tuple[Animation, int]] = []
-        for animation in sorted(slide_spec.animations, key=lambda item: item.order):
-            shape_id = mapping.get(animation.target)
-            if shape_id is None:
-                raise AnimationTargetError(
-                    f"slide {index} animation target {animation.target!r} does not exist"
-                )
-            if shape_id not in actual_ids:
-                raise AnimationTargetError(
-                    f"slide {index} animation target {animation.target!r} maps to missing "
-                    f"shape ID {shape_id}"
-                )
-            resolved.append((animation, shape_id))
-
-        root = pptx_slide._element
-        existing_timing = root.find("p:timing", NS)
-        if existing_timing is not None:
-            root.remove(existing_timing)
-        existing_transition = root.find("p:transition", NS)
-        if existing_transition is not None:
-            root.remove(existing_transition)
-        if slide_spec.transition is not None:
-            child_tag, child_attributes = _TRANSITIONS[slide_spec.transition]
-            transition = _p("transition")
-            transition.set("spd", "med")
-            _sub(transition, child_tag, **child_attributes)
-            _insert_before_extension_list(root, transition)
-        if resolved:
-            _insert_before_extension_list(root, _timing_node(resolved))
+        apply_slide_effects(pptx_slide, slide_spec, mapping, index)

@@ -1557,8 +1557,16 @@ fn permission_card_groups<'a>(
             }
         }
         Some(ToolKind::PowerPoint) => {
-            if let Some(path) = card("OUTPUT", "output_path", "", theme.accent) {
-                groups.push(vec![path]);
+            let details: Vec<_> = [
+                card("OPERATION", "operation", "", theme.link),
+                card("INPUT", "input_path", "", theme.muted),
+                card("OUTPUT", "output_path", "", theme.accent),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if !details.is_empty() {
+                groups.push(details);
             }
         }
         Some(ToolKind::WebSearch) | Some(ToolKind::WebImages) => {

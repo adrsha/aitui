@@ -16,8 +16,10 @@ dependencies = [
 test = ["pytest>=8,<10"]
 
 [tool.setuptools.packages.find]
+where = ["src/agent/powerpoint"]
 include = ["animated_pptx"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src/agent/powerpoint"]
 addopts = "-ra"

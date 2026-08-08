@@ -71,7 +71,7 @@ fn writes_outside_cwd(call: &ToolCall, cwd: &Path) -> bool {
     let keys: &[&str] = match call.kind() {
         Some(ToolKind::Move) | Some(ToolKind::Copy) => &["from", "to"],
         Some(ToolKind::Download) => &["path"],
-        Some(ToolKind::PowerPoint) => &["output_path"],
+        Some(ToolKind::PowerPoint) => &["input_path", "output_path"],
         _ => &["path"],
     };
     keys.iter()

@@ -35,6 +35,7 @@ Scope decisions (see [`DECISIONS.md`](./DECISIONS.md)):
 | [`DECISIONS.md`](./DECISIONS.md) | Why we chose what we chose (ADR-lite). |
 | [`STANDARDS.md`](./STANDARDS.md) | The bar for "very well-written code." Definition of done. |
 | [`CODE_AUDIT.md`](./CODE_AUDIT.md) | Detailed vulnerabilities, bugs, and bad practices, with one-at-a-time fixes. |
+| [`POWERPOINT_TOOL.md`](./POWERPOINT_TOOL.md) | Native `specialized(powerpoint)` contract, implementation, dependencies, validation, and examples. |
 
 ## Status at a glance
 

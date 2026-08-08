@@ -513,38 +513,101 @@ fn run(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String>
 }
 
 fn generate_powerpoint(call: &ToolCall, cwd: &Path) -> Result<String, String> {
+    let operation = call
+        .args
+        .get("operation")
+        .and_then(|value| value.as_str())
+        .unwrap_or("create");
+    if !matches!(
+        operation,
+        "create" | "replace" | "append" | "edit" | "inspect"
+    ) {
+        return Err(
+            "powerpoint: operation must be create, replace, append, edit, or inspect".into(),
+        );
+    }
     let output_path = call
         .args
         .get("output_path")
-        .and_then(|value| value.as_str())
-        .ok_or("powerpoint: missing 'output_path'")?;
-    if !output_path.to_ascii_lowercase().ends_with(".pptx") {
-        return Err("powerpoint: output_path must end in .pptx".into());
+        .and_then(|value| value.as_str());
+    if operation != "inspect" {
+        let output_path = output_path.ok_or("powerpoint: missing 'output_path'")?;
+        if !output_path.to_ascii_lowercase().ends_with(".pptx") {
+            return Err("powerpoint: output_path must end in .pptx".into());
+        }
     }
-    let slides = call
-        .args
-        .get("slides")
-        .and_then(|value| value.as_array())
-        .ok_or("powerpoint: missing 'slides' array")?;
-    let destination = resolve_path(output_path, cwd);
+    if operation == "inspect" {
+        let input_path = call
+            .args
+            .get("input_path")
+            .and_then(|value| value.as_str())
+            .ok_or("powerpoint: inspect requires 'input_path'")?;
+        if !input_path.to_ascii_lowercase().ends_with(".pptx") {
+            return Err("powerpoint: input_path must end in .pptx".into());
+        }
+    }
+    if matches!(operation, "create" | "replace" | "append")
+        && !call
+            .args
+            .get("slides")
+            .is_some_and(|value| value.is_array())
+    {
+        return Err(format!("powerpoint: {operation} requires a 'slides' array"));
+    }
+    if operation == "edit" {
+        let has_modifiers = call
+            .args
+            .get("modifiers")
+            .is_some_and(|value| value.is_array());
+        let has_package_modifiers = call
+            .args
+            .get("package_modifiers")
+            .is_some_and(|value| value.is_array());
+        if !has_modifiers && !has_package_modifiers {
+            return Err(
+                "powerpoint: edit requires a 'modifiers' or 'package_modifiers' array".into(),
+            );
+        }
+    }
+    let destination = output_path.map(|path| resolve_path(path, cwd));
     let mut request = call.args.clone();
     let Some(request) = request.as_object_mut() else {
         return Err("powerpoint: arguments must be an object".into());
     };
     request.remove("action");
-    request.insert(
-        "output_path".into(),
-        serde_json::Value::String(destination.to_string_lossy().to_string()),
-    );
+    if let Some(input_path) = request
+        .get("input_path")
+        .and_then(|value| value.as_str())
+        .map(|path| resolve_path(path, cwd))
+    {
+        request.insert(
+            "input_path".into(),
+            serde_json::Value::String(input_path.to_string_lossy().to_string()),
+        );
+    }
+    if let Some(destination) = destination.as_ref() {
+        request.insert(
+            "output_path".into(),
+            serde_json::Value::String(destination.to_string_lossy().to_string()),
+        );
+    }
     let payload = serde_json::to_vec(request)
         .map_err(|error| format!("powerpoint: cannot serialize request: {error}"))?;
 
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let candidates = [
-        manifest.join(".venv/bin/python"),
-        PathBuf::from("python3"),
-        PathBuf::from("python"),
-    ];
+    let embedded_package = crate::agent::powerpoint::materialize_embedded_package()
+        .map_err(|error| format!("powerpoint: {error}"))?;
+    let mut candidates = Vec::new();
+    if let Some(configured) = std::env::var_os("AITUI_POWERPOINT_PYTHON") {
+        candidates.push(PathBuf::from(configured));
+    }
+    candidates.push(cwd.join(".venv/bin/python"));
+    if let Ok(launch_directory) = std::env::current_dir() {
+        let launch_python = launch_directory.join(".venv/bin/python");
+        if !candidates.contains(&launch_python) {
+            candidates.push(launch_python);
+        }
+    }
+    candidates.extend([PathBuf::from("python3"), PathBuf::from("python")]);
     let mut last_error = String::new();
     for python in candidates {
         let mut command = Command::new(&python);
@@ -552,7 +615,7 @@ fn generate_powerpoint(call: &ToolCall, cwd: &Path) -> Result<String, String> {
             .arg("-m")
             .arg("animated_pptx.cli")
             .current_dir(cwd)
-            .env("PYTHONPATH", manifest)
+            .env("PYTHONPATH", &embedded_package)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -573,18 +636,41 @@ fn generate_powerpoint(call: &ToolCall, cwd: &Path) -> Result<String, String> {
             .map_err(|error| format!("powerpoint: generator failed to run: {error}"))?;
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if error.contains("No module named 'pptx'")
+                || error.contains("No module named 'lxml'")
+                || error.contains("No module named animated_pptx")
+            {
+                last_error = format!("{}: {error}", python.display());
+                continue;
+            }
             return Err(if error.is_empty() {
                 "powerpoint: generator exited without an error message".into()
             } else {
                 format!("powerpoint: {error}")
             });
         }
-        crate::agent::file_cache::invalidate(&destination);
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("powerpoint: invalid generator response: {error}"))?;
+        if operation == "inspect" {
+            let inspection = response
+                .get("inspection")
+                .ok_or("powerpoint: inspector response omitted inspection data")?;
+            return serde_json::to_string_pretty(inspection)
+                .map_err(|error| format!("powerpoint: cannot format inspection: {error}"));
+        }
+        let slide_count = response
+            .get("slides")
+            .and_then(|value| value.as_u64())
+            .ok_or("powerpoint: generator response omitted slide count")?;
+        let destination = destination
+            .as_ref()
+            .ok_or("powerpoint: generator response has no destination")?;
+        crate::agent::file_cache::invalidate(destination);
         return Ok(format!(
-            "Generated {} ({} slide{})",
+            "PowerPoint {operation} completed: {} ({} slide{})",
             destination.display(),
-            slides.len(),
-            if slides.len() == 1 { "" } else { "s" }
+            slide_count,
+            if slide_count == 1 { "" } else { "s" }
         ));
     }
     Err(format!(
@@ -1979,6 +2065,101 @@ mod tests {
         let result = execute(call, &dir);
         assert!(result.is_ok(), "{}", result.text());
         assert!(dir.join("deck.pptx").is_file());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn specialized_powerpoint_inspects_without_mutating_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "aitui_powerpoint_inspect_tool_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let create = make_call(
+            "specialized",
+            serde_json::json!({
+                "action": "powerpoint", "operation": "create",
+                "output_path": "inspect.pptx",
+                "slides": [{"elements": [{
+                    "id": "title", "type": "text", "x": 1, "y": 1,
+                    "width": 5, "height": 1, "text": "Inspectable"
+                }]}]
+            }),
+        );
+        let created = execute(create, &dir);
+        assert!(created.is_ok(), "{}", created.text());
+        let path = dir.join("inspect.pptx");
+        let before = std::fs::read(&path).unwrap();
+
+        let inspect = make_call(
+            "specialized",
+            serde_json::json!({
+                "action": "powerpoint", "operation": "inspect",
+                "input_path": "inspect.pptx"
+            }),
+        );
+        let inspected = execute(inspect, &dir);
+        assert!(inspected.is_ok(), "{}", inspected.text());
+        let result: serde_json::Value = serde_json::from_str(inspected.text()).unwrap();
+        assert_eq!(result["presentation"]["slide_count"], 1);
+        assert_eq!(result["slides"][0]["shapes"][0]["text"], "Inspectable");
+        assert_eq!(result["preservation"]["source_mutated"], false);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn specialized_powerpoint_appends_and_edits_with_json_modifiers() {
+        let dir = std::env::temp_dir().join(format!(
+            "aitui_powerpoint_edit_tool_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let create = make_call(
+            "specialized",
+            serde_json::json!({
+                "action": "powerpoint", "operation": "create",
+                "output_path": "editable.pptx",
+                "slides": [{"elements": [{
+                    "id": "title", "type": "text", "x": 1, "y": 1,
+                    "width": 5, "height": 1, "text": "Original"
+                }]}]
+            }),
+        );
+        let created = execute(create, &dir);
+        assert!(created.is_ok(), "{}", created.text());
+
+        let append = make_call(
+            "specialized",
+            serde_json::json!({
+                "action": "powerpoint", "operation": "append",
+                "output_path": "editable.pptx",
+                "slides": [{"elements": []}]
+            }),
+        );
+        let appended = execute(append, &dir);
+        assert!(appended.is_ok(), "{}", appended.text());
+        assert!(appended.text().contains("2 slides"));
+
+        let edit = make_call(
+            "specialized",
+            serde_json::json!({
+                "action": "powerpoint", "operation": "edit",
+                "output_path": "editable.pptx",
+                "modifiers": [{
+                    "operation": "update_element", "slide_index": 0,
+                    "element_id": "title", "changes": {"text": "Updated"}
+                }, {
+                    "operation": "set_transition", "slide_index": 1,
+                    "transition": "fade"
+                }]
+            }),
+        );
+        let edited = execute(edit, &dir);
+        assert!(edited.is_ok(), "{}", edited.text());
+        assert!(edited.text().contains("PowerPoint edit completed"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

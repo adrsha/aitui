@@ -30,7 +30,7 @@ class BuiltPresentation:
     shape_ids: tuple[dict[str, int], ...]
 
 
-def _add_element(slide, element: Element):
+def add_element(slide, element: Element):
     left, top = Inches(element.x), Inches(element.y)
     width, height = Inches(element.width), Inches(element.height)
     if element.type == "text":
@@ -75,7 +75,7 @@ def build_presentation(slides: Sequence[Slide]) -> BuiltPresentation:
         pptx_slide = presentation.slides.add_slide(blank_layout)
         mapping: dict[str, int] = {}
         for element in slide_spec.elements:
-            shape = _add_element(pptx_slide, element)
+            shape = add_element(pptx_slide, element)
             mapping[element.id] = shape.shape_id
         mappings.append(mapping)
     return BuiltPresentation(presentation, tuple(mappings))

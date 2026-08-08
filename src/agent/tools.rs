@@ -302,11 +302,14 @@ impl ToolCall {
                     .and_then(|value| value.as_str())
                     .map(str::to_string),
             ),
-            Some(ToolKind::PowerPoint) => raw_paths.extend(
-                args.get("output_path")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string),
-            ),
+            Some(ToolKind::PowerPoint) => {
+                raw_paths.extend(
+                    ["input_path", "output_path"]
+                        .into_iter()
+                        .filter_map(|key| args.get(key).and_then(|value| value.as_str()))
+                        .map(str::to_string),
+                );
+            }
             Some(ToolKind::WebSearch)
             | Some(ToolKind::WebImages)
             | Some(ToolKind::ReverseImage)
@@ -514,8 +517,10 @@ impl ToolCall {
                     .and_then(|value| value.as_array())
                     .map(Vec::len)
                     .unwrap_or(0);
+                let operation = s("operation").unwrap_or("create");
                 format!(
-                    "powerpoint({} · {} slide{})",
+                    "powerpoint({} · {} · {} slide{})",
+                    operation,
                     s("output_path").unwrap_or("?"),
                     slides,
                     if slides == 1 { "" } else { "s" }
@@ -600,7 +605,7 @@ impl ToolCall {
             Some(ToolKind::ReverseImage) => &["url", "path"],
             Some(ToolKind::WebFetch) => &["url"],
             Some(ToolKind::Download) => &["url", "path"],
-            Some(ToolKind::PowerPoint) => &["output_path"],
+            Some(ToolKind::PowerPoint) => &["operation", "input_path", "output_path"],
             _ => &[],
         }
     }
@@ -1121,21 +1126,167 @@ fn operation_schemas() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "powerpoint",
-                "description": "Generate a validated animated .pptx deck from structured slides. Supports positioned text, images, and basic shapes; fixed entrance/exit animations; and fade/push/wipe transitions.",
+                "description": "Create, replace, append to, edit, or inspect a validated .pptx deck from structured JSON. Inspection is read-only and returns native OOXML identities, metadata, capabilities, and preservation warnings.",
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "operation": {
+                            "type": "string",
+                            "enum": ["create", "replace", "append", "edit", "inspect"],
+                            "default": "create",
+                            "description": "create/replace writes slides as a whole deck; append adds slides; edit applies modifiers; inspect returns native IDs and metadata without mutation"
+                        },
+                        "input_path": {
+                            "type": "string",
+                            "description": "Existing .pptx to inspect, append to, or edit; defaults to output_path only for append/edit"
+                        },
                         "output_path": {
                             "type": "string",
                             "description": "Destination .pptx path, relative to cwd or absolute"
                         },
                         "slides": {
                             "type": "array",
-                            "description": "Ordered slide objects. Each slide accepts elements, animations, and transition. Elements require id/type/x/y/width/height and may include text, image_path, shape_type, fill_color, text_color, font_size. Animation objects require type/target/order and may include duration_ms, delay_ms, trigger. Supported transitions: fade, push_left, wipe_left.",
-                            "items": { "type": "object", "additionalProperties": true }
+                            "description": "Ordered slides. Empty arrays and slides with no elements are valid.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "elements": {
+                                        "type": "array",
+                                        "default": [],
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "id": { "type": "string", "description": "Unique element ID within this slide; animations target this ID" },
+                                                "type": { "type": "string", "enum": ["text", "image", "shape"] },
+                                                "x": { "type": "number", "minimum": 0, "description": "Left position in inches" },
+                                                "y": { "type": "number", "minimum": 0, "description": "Top position in inches" },
+                                                "width": { "type": "number", "exclusiveMinimum": 0, "description": "Width in inches" },
+                                                "height": { "type": "number", "exclusiveMinimum": 0, "description": "Height in inches" },
+                                                "text": { "type": "string" },
+                                                "image_path": { "type": "string", "description": "Existing local image path" },
+                                                "shape_type": { "type": "string", "enum": ["rectangle", "ellipse", "rounded_rectangle"], "default": "rectangle" },
+                                                "fill_color": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$", "default": "4472C4" },
+                                                "text_color": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$", "default": "FFFFFF" },
+                                                "font_size": { "type": "number", "exclusiveMinimum": 0, "default": 24 }
+                                            },
+                                            "required": ["id", "type", "x", "y", "width", "height"]
+                                        }
+                                    },
+                                    "animations": {
+                                        "type": "array",
+                                        "default": [],
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "type": { "type": "string", "enum": ["fade_in", "fly_in_left", "fly_in_right", "fly_in_bottom", "wipe", "zoom", "fade_out"] },
+                                                "target": { "type": "string", "description": "ID of an element on this slide" },
+                                                "order": { "type": "integer", "minimum": 0, "description": "Unique sequence order within this slide" },
+                                                "duration_ms": { "type": "integer", "minimum": 1, "maximum": 60000, "default": 500 },
+                                                "delay_ms": { "type": "integer", "minimum": 0, "maximum": 60000, "default": 0 },
+                                                "trigger": { "type": "string", "enum": ["on_click", "with_previous", "after_previous"], "default": "on_click" }
+                                            },
+                                            "required": ["type", "target", "order"]
+                                        }
+                                    },
+                                    "transition": { "type": ["string", "null"], "enum": ["fade", "push_left", "wipe_left", null] }
+                                }
+                            }
+                        },
+                        "modifiers": {
+                            "type": "array",
+                            "description": "Ordered atomic high-level edits for operation=edit. Slide indices are zero-based.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "operation": { "type": "string", "enum": ["append_slides", "insert_slides", "replace_slide", "delete_slides", "move_slide", "clear_slide", "add_elements", "update_element", "duplicate_elements", "reorder_elements", "align_elements", "distribute_elements", "replace_element", "delete_elements", "set_animations", "set_transition"] },
+                                    "slide_index": { "type": "integer", "minimum": 0, "description": "Legacy zero-based slide selector; prefer selector.slide_id" },
+                                    "selector": {
+                                        "type": "object",
+                                        "description": "Native inspect selector. Slide operations use slide_id; singular element operations use slide_id plus shape_id.",
+                                        "properties": {
+                                            "slide_id": { "type": "integer", "minimum": 1 },
+                                            "shape_id": { "type": "integer", "minimum": 1 }
+                                        },
+                                        "required": ["slide_id"],
+                                        "additionalProperties": false
+                                    },
+                                    "selectors": {
+                                        "type": "array",
+                                        "description": "Native selectors for multi-slide or multi-element operations",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "slide_id": { "type": "integer", "minimum": 1 },
+                                                "shape_id": { "type": "integer", "minimum": 1 }
+                                            },
+                                            "required": ["slide_id"],
+                                            "additionalProperties": false
+                                        }
+                                    },
+                                    "index": { "type": "integer", "minimum": 0, "description": "Insertion or z-order index" },
+                                    "from_index": { "type": "integer", "minimum": 0 },
+                                    "from_selector": {
+                                        "type": "object",
+                                        "description": "Native slide selector for move_slide",
+                                        "properties": { "slide_id": { "type": "integer", "minimum": 1 } },
+                                        "required": ["slide_id"],
+                                        "additionalProperties": false
+                                    },
+                                    "to_index": { "type": "integer", "minimum": 0 },
+                                    "indices": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+                                    "element_id": { "type": "string", "description": "Legacy shape-name selector; rejected when the name is ambiguous" },
+                                    "element_ids": { "type": "array", "description": "Legacy shape-name selectors; rejected when any name is ambiguous", "items": { "type": "string" } },
+                                    "new_ids": { "type": "array", "items": { "type": "string" } },
+                                    "offset_x": { "type": "number" },
+                                    "offset_y": { "type": "number" },
+                                    "position": { "type": "string", "enum": ["front", "back"] },
+                                    "alignment": { "type": "string", "enum": ["left", "center", "right", "top", "middle", "bottom"] },
+                                    "direction": { "type": "string", "enum": ["horizontal", "vertical"] },
+                                    "animation_policy": { "type": "string", "enum": ["remove_targeted", "error_if_referenced", "remove_all"], "default": "remove_targeted", "description": "Animation handling for replace_element/delete_elements" },
+                                    "changes": { "type": "object", "description": "Element fields to change: text, x, y, width, height, rotation, flip_horizontal, flip_vertical, fill_color, text_color, font_size" },
+                                    "slide": { "type": "object", "description": "Full replacement slide using the same shape as slides[] items" },
+                                    "slides": { "type": "array", "description": "Slides to append or insert, using the same shape as top-level slides[]" },
+                                    "element": { "type": "object", "description": "Full replacement element using the same shape as slides[].elements[]" },
+                                    "elements": { "type": "array", "description": "Elements to add using the same shape as slides[].elements[]" },
+                                    "animations": { "type": "array", "description": "Complete replacement animation list using the same shape as slides[].animations[]" },
+                                    "transition": { "type": ["string", "null"], "enum": ["fade", "push_left", "wipe_left", null] }
+                                },
+                                "required": ["operation"]
+                            }
+                        },
+                        "package_modifiers": {
+                            "type": "array",
+                            "description": "Advanced ordered atomic OPC/OOXML escape-hatch operations. Use typed modifiers when possible.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "operation": { "type": "string", "enum": ["patch_xml", "put_part", "delete_part", "put_relationship", "delete_relationship", "set_content_type", "delete_content_type"] },
+                                    "part": { "type": "string", "description": "Package-relative part path; a leading slash is accepted" },
+                                    "source_part": { "type": ["string", "null"], "description": "Relationship source part; null, empty, or / selects package root" },
+                                    "xpath": { "type": "string" },
+                                    "namespaces": { "type": "object", "additionalProperties": { "type": "string" } },
+                                    "action": { "type": "string", "enum": ["set_attributes", "remove_attributes", "set_text", "append_xml", "prepend_xml", "replace_xml", "remove"] },
+                                    "allow_multiple": { "type": "boolean", "default": false },
+                                    "attributes": { "description": "Scalar object for set_attributes or string array for remove_attributes" },
+                                    "text": { "type": "string" },
+                                    "xml": { "type": "string" },
+                                    "base64": { "type": "string" },
+                                    "id": { "type": "string", "description": "Relationship ID" },
+                                    "relationship_type": { "type": "string" },
+                                    "target": { "type": "string" },
+                                    "target_mode": { "type": "string", "enum": ["Internal", "External"] },
+                                    "replace": { "type": "boolean", "default": false },
+                                    "content_type": { "type": "string" },
+                                    "extension": { "type": "string", "description": "File extension without a dot" }
+                                },
+                                "required": ["operation"]
+                            }
                         }
                     },
-                    "required": ["output_path", "slides"]
+                    "anyOf": [
+                        {"required": ["output_path"]},
+                        {"required": ["input_path"]}
+                    ]
                 }
             }
         }),
@@ -1462,7 +1613,7 @@ fn build_tool_schemas(loop_active: bool) -> serde_json::Value {
         category(
             &operations,
             "specialized",
-            "Specialized artifact-generation tools. Choose powerpoint to create a validated animated .pptx deck directly from a structured slide specification.",
+            "Specialized artifact-generation tools owned and executed by AiTUI (not shell commands). Choose powerpoint to create an atomically saved, structurally validated animated .pptx deck directly from a structured slide specification.",
             &[("powerpoint", "powerpoint")],
         ),
         category(
@@ -1652,6 +1803,35 @@ mod tests {
         );
         let specialized = &schemas[3]["function"]["parameters"]["properties"]["action"]["enum"];
         assert_eq!(specialized, &serde_json::json!(["powerpoint"]));
+        assert!(schemas[3]["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("not shell commands"));
+        let operations = &schemas[3]["function"]["parameters"]["properties"]["operation"]["enum"];
+        assert_eq!(
+            operations,
+            &serde_json::json!(["create", "replace", "append", "edit", "inspect"])
+        );
+        let modifier_operations = &schemas[3]["function"]["parameters"]["properties"]["modifiers"]
+            ["items"]["properties"]["operation"]["enum"];
+        assert!(modifier_operations
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("update_element")));
+        let animation_types = &schemas[3]["function"]["parameters"]["properties"]["slides"]
+            ["items"]["properties"]["animations"]["items"]["properties"]["type"]["enum"];
+        assert_eq!(
+            animation_types,
+            &serde_json::json!([
+                "fade_in",
+                "fly_in_left",
+                "fly_in_right",
+                "fly_in_bottom",
+                "wipe",
+                "zoom",
+                "fade_out"
+            ])
+        );
         let workflow = &schemas[5]["function"]["parameters"]["properties"]["action"]["enum"];
         assert_eq!(workflow, &serde_json::json!(["agent"]));
         let loop_schemas = tool_schemas_for_loop(true);
