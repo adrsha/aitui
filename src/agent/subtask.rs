@@ -137,9 +137,16 @@ async fn run_verified(spec: &SubtaskSpec) -> Result<String, String> {
     while let Some((replica, output)) = replicas.next().await {
         match output {
             Ok(text) => {
-                match crate::agent::report::parse_and_validate(&text, &spec.checks, &spec.cwd) {
-                    Ok(report) => {
-                        diagnostics.push(format!("replica {}: valid report", replica));
+                match crate::agent::report::parse_and_validate_detailed(
+                    &text,
+                    &spec.checks,
+                    &spec.cwd,
+                ) {
+                    Ok((report, warnings)) => {
+                        diagnostics.push(validation_diagnostic(
+                            &format!("replica {}", replica),
+                            &warnings,
+                        ));
                         reports.push(report);
                     }
                     Err(error) => {
@@ -157,9 +164,13 @@ async fn run_verified(spec: &SubtaskSpec) -> Result<String, String> {
         let third = replica_spec(spec, 3, false);
         match run_inner(&third, 0, None).await {
             Ok(text) => {
-                match crate::agent::report::parse_and_validate(&text, &spec.checks, &spec.cwd) {
-                    Ok(report) => {
-                        diagnostics.push("replica 3: valid report".into());
+                match crate::agent::report::parse_and_validate_detailed(
+                    &text,
+                    &spec.checks,
+                    &spec.cwd,
+                ) {
+                    Ok((report, warnings)) => {
+                        diagnostics.push(validation_diagnostic("replica 3", &warnings));
                         reports.push(report);
                         summary = crate::agent::report::reconcile(&reports, &spec.checks);
                     }
@@ -173,9 +184,13 @@ async fn run_verified(spec: &SubtaskSpec) -> Result<String, String> {
         let verifier = verifier_spec(spec, &summary.unresolved, &reports);
         match run_inner(&verifier, 0, None).await {
             Ok(text) => {
-                match crate::agent::report::parse_and_validate(&text, &spec.checks, &spec.cwd) {
-                    Ok(report) => {
-                        diagnostics.push("independent verifier: valid report".into());
+                match crate::agent::report::parse_and_validate_detailed(
+                    &text,
+                    &spec.checks,
+                    &spec.cwd,
+                ) {
+                    Ok((report, warnings)) => {
+                        diagnostics.push(validation_diagnostic("independent verifier", &warnings));
                         reports.push(report);
                         summary = crate::agent::report::reconcile(&reports, &spec.checks);
                     }
@@ -191,6 +206,18 @@ async fn run_verified(spec: &SubtaskSpec) -> Result<String, String> {
     }
     summary.diagnostics = diagnostics;
     serde_json::to_string(&summary).map_err(|error| error.to_string())
+}
+
+fn validation_diagnostic(source: &str, warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        format!("{}: valid report", source)
+    } else {
+        format!(
+            "{}: usable report; discarded invalid evidence: {}",
+            source,
+            warnings.join("; ")
+        )
+    }
 }
 
 fn replica_spec(spec: &SubtaskSpec, replica: usize, verifier: bool) -> SubtaskSpec {
@@ -1334,6 +1361,20 @@ mod tests {
     };
     use crate::agent::ToolCall;
     use crate::api::StreamEvent;
+
+    #[test]
+    fn validation_diagnostics_distinguish_salvaged_reports() {
+        assert_eq!(
+            super::validation_diagnostic("replica 1", &[]),
+            "replica 1: valid report"
+        );
+        let diagnostic = super::validation_diagnostic(
+            "replica 2",
+            &["check 'scope': evidence quote is stale for 'docs/design.md'".into()],
+        );
+        assert!(diagnostic.starts_with("replica 2: usable report"));
+        assert!(diagnostic.contains("check 'scope'"));
+    }
 
     #[test]
     fn subtask_shell_allows_verification_but_rejects_mutation_chains() {

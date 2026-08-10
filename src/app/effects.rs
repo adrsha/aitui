@@ -2167,6 +2167,8 @@ impl App {
             _ => return None,
         };
         self.overlay = Overlay::None;
+        self.notification_generation = self.notification_generation.wrapping_add(1);
+        crate::app::notify::dismiss();
         let output = if req.free_form() {
             req.answer
         } else {
@@ -2237,6 +2239,8 @@ impl App {
             _ => return None,
         };
         self.overlay = Overlay::None;
+        self.notification_generation = self.notification_generation.wrapping_add(1);
+        crate::app::notify::dismiss();
         let output = if approved {
             match std::fs::read_to_string(&req.path) {
                 Ok(body) => format!("APPROVED\n{}", body),

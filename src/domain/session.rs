@@ -1,7 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::api::models::{ContentPart, MessageContent};
@@ -816,65 +818,7 @@ impl SessionManager {
             next_id: self.next_id,
             deleted_ids: self.deleted_ids.clone(),
         };
-        let write = move || {
-            let lock = match SessionFileLock::acquire(&path) {
-                Ok(lock) => lock,
-                Err(error) => {
-                    eprintln!(
-                        "Failed to acquire session storage lock {}: {}",
-                        path.display(),
-                        error
-                    );
-                    return;
-                }
-            };
-            let mut merged = fs::read_to_string(&path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<SavedState>(&raw).ok())
-                .unwrap_or_else(|| state.clone());
-            for id in &state.deleted_ids {
-                if !merged.deleted_ids.contains(id) {
-                    merged.deleted_ids.push(*id);
-                }
-            }
-            merged
-                .sessions
-                .retain(|session| !merged.deleted_ids.contains(&session.id));
-            for local in state.sessions.iter().cloned() {
-                if merged.deleted_ids.contains(&local.id) {
-                    continue;
-                }
-                if let Some(existing) = merged.sessions.iter_mut().find(|s| s.id == local.id) {
-                    *existing = local;
-                } else {
-                    merged.sessions.push(local);
-                }
-            }
-            merged.sessions.sort_by_key(|session| session.id);
-            merged.next_id = merged.next_id.max(state.next_id);
-            merged.active_idx = state
-                .active_idx
-                .min(merged.sessions.len().saturating_sub(1));
-            match serde_json::to_string_pretty(&merged) {
-                Ok(json) => {
-                    if let Err(error) = atomic_write(&path, json.as_bytes()) {
-                        eprintln!(
-                            "Failed to write session storage {}: {}",
-                            path.display(),
-                            error
-                        );
-                    }
-                }
-                Err(error) => eprintln!("Failed to serialize session storage: {}", error),
-            }
-            drop(lock);
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(_) => {
-                tokio::task::spawn_blocking(write);
-            }
-            Err(_) => write(),
-        }
+        queue_session_save(path, state);
     }
 
     /// Reconcile sessions changed by another AiTUI process. Existing local sessions
@@ -1141,36 +1085,165 @@ fn sessions_path() -> PathBuf {
     base.join("aitui").join("sessions.json")
 }
 
+#[derive(Default)]
+struct SaveQueueEntry {
+    running: bool,
+    pending: Option<SavedState>,
+}
+
+fn save_queue() -> &'static Mutex<HashMap<PathBuf, SaveQueueEntry>> {
+    static QUEUE: OnceLock<Mutex<HashMap<PathBuf, SaveQueueEntry>>> = OnceLock::new();
+    QUEUE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Keep at most one disk writer per session path in this process. If another save
+/// arrives while a large snapshot is being serialized or flushed, retain only
+/// the newest snapshot and let the current worker write it next. This prevents a
+/// burst of background tasks from contending with each other for the same file.
+fn queue_session_save(path: PathBuf, state: SavedState) {
+    let should_start = {
+        let mut queue = save_queue().lock().unwrap();
+        let entry = queue.entry(path.clone()).or_default();
+        entry.pending = Some(state);
+        if entry.running {
+            false
+        } else {
+            entry.running = true;
+            true
+        }
+    };
+    if !should_start {
+        return;
+    }
+    let worker = move || run_save_queue(path);
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => {
+            tokio::task::spawn_blocking(worker);
+        }
+        Err(_) => worker(),
+    }
+}
+
+fn run_save_queue(path: PathBuf) {
+    loop {
+        let state = {
+            let mut queue = save_queue().lock().unwrap();
+            let Some(entry) = queue.get_mut(&path) else {
+                return;
+            };
+            match entry.pending.take() {
+                Some(state) => state,
+                None => {
+                    queue.remove(&path);
+                    return;
+                }
+            }
+        };
+        persist_session_state(&path, state);
+    }
+}
+
+fn persist_session_state(path: &std::path::Path, state: SavedState) {
+    let _lock = match SessionFileLock::acquire(path) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!(
+                "Failed to acquire session storage lock {}: {}",
+                path.display(),
+                error
+            );
+            return;
+        }
+    };
+    let mut merged = fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<SavedState>(&raw).ok())
+        .unwrap_or_else(|| state.clone());
+    for id in &state.deleted_ids {
+        if !merged.deleted_ids.contains(id) {
+            merged.deleted_ids.push(*id);
+        }
+    }
+    merged
+        .sessions
+        .retain(|session| !merged.deleted_ids.contains(&session.id));
+    for local in state.sessions.iter().cloned() {
+        if merged.deleted_ids.contains(&local.id) {
+            continue;
+        }
+        if let Some(existing) = merged.sessions.iter_mut().find(|s| s.id == local.id) {
+            *existing = local;
+        } else {
+            merged.sessions.push(local);
+        }
+    }
+    merged.sessions.sort_by_key(|session| session.id);
+    merged.next_id = merged.next_id.max(state.next_id);
+    merged.active_idx = state
+        .active_idx
+        .min(merged.sessions.len().saturating_sub(1));
+    match serde_json::to_string_pretty(&merged) {
+        Ok(json) => {
+            if let Err(error) = atomic_write(path, json.as_bytes()) {
+                eprintln!(
+                    "Failed to write session storage {}: {}",
+                    path.display(),
+                    error
+                );
+            }
+        }
+        Err(error) => eprintln!("Failed to serialize session storage: {}", error),
+    }
+}
+
+const SESSION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const SESSION_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
 struct SessionFileLock {
-    path: PathBuf,
+    file: fs::File,
 }
 
 impl SessionFileLock {
     fn acquire(sessions: &std::path::Path) -> std::io::Result<Self> {
+        Self::acquire_with_timeout(sessions, SESSION_LOCK_WAIT)
+    }
+
+    fn acquire_with_timeout(
+        sessions: &std::path::Path,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<Self> {
         let path = sessions.with_extension("json.lock");
-        for _ in 0..100 {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(Self { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        let started = std::time::Instant::now();
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { file }),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() >= timeout {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            format!(
+                                "timed out after {:.1}s waiting for session lock",
+                                timeout.as_secs_f64()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(SESSION_LOCK_POLL.min(timeout));
                 }
                 Err(error) => return Err(error),
             }
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "timed out waiting for session lock",
-        ))
     }
 }
 
 impl Drop for SessionFileLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = self.file.unlock();
     }
 }
 
@@ -1252,6 +1325,53 @@ mod tests {
         session.last_prompt_at = Some(42);
         session.push_message(ChatMessage::assistant("hello"));
         assert_eq!(session.last_prompt_at, Some(42));
+    }
+
+    #[test]
+    fn abandoned_legacy_session_lock_file_does_not_block_acquisition() {
+        let dir = std::env::temp_dir().join(format!(
+            "aitui_session_lock_legacy_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let sessions = dir.join("sessions.json");
+        let lock_path = sessions.with_extension("json.lock");
+        fs::write(&lock_path, b"").unwrap();
+
+        let lock =
+            SessionFileLock::acquire_with_timeout(&sessions, std::time::Duration::from_millis(100))
+                .expect("an unlocked legacy sentinel must not block an advisory lock");
+        drop(lock);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_lock_waits_for_an_active_writer() {
+        let dir = std::env::temp_dir().join(format!(
+            "aitui_session_lock_wait_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let sessions = dir.join("sessions.json");
+        let first = SessionFileLock::acquire(&sessions).unwrap();
+        let contender_path = sessions.clone();
+        let contender = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let lock = SessionFileLock::acquire_with_timeout(
+                &contender_path,
+                std::time::Duration::from_secs(2),
+            )
+            .expect("contender should acquire after the writer releases");
+            (lock, started.elapsed())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(first);
+        let (second, waited) = contender.join().unwrap();
+        assert!(waited >= std::time::Duration::from_millis(75));
+        drop(second);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

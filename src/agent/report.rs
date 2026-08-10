@@ -95,13 +95,21 @@ pub fn parse_and_validate(
     checks: &[CheckSpec],
     cwd: &Path,
 ) -> Result<ChildReport, String> {
+    parse_and_validate_detailed(text, checks, cwd).map(|(report, _)| report)
+}
+
+pub fn parse_and_validate_detailed(
+    text: &str,
+    checks: &[CheckSpec],
+    cwd: &Path,
+) -> Result<(ChildReport, Vec<String>), String> {
     if text.len() > MAX_REPORT_BYTES {
         return Err("report exceeds size limit".into());
     }
     let start = text
         .find('{')
         .ok_or_else(|| "report does not contain a JSON object".to_string())?;
-    let report: ChildReport = serde_json::from_str(&text[start..])
+    let mut report: ChildReport = serde_json::from_str(&text[start..])
         .map_err(|error| format!("invalid structured report: {}", error))?;
     if report.schema != "aitui.child-report.v1" {
         return Err("unsupported report schema".into());
@@ -121,17 +129,37 @@ pub fn parse_and_validate(
         if finding.evidence.len() > MAX_EVIDENCE_PER_FINDING {
             return Err(format!("too much evidence for '{}'", finding.check_id));
         }
-        if !matches!(finding.answer, FindingAnswer::Unknown) && finding.evidence.is_empty() {
-            return Err(format!("finding '{}' has no evidence", finding.check_id));
-        }
-        for evidence in &finding.evidence {
-            validate_evidence(evidence, cwd)?;
-        }
     }
-    Ok(report)
+
+    let mut warnings = Vec::new();
+    report.findings.retain_mut(|finding| {
+        let mut evidence_errors = Vec::new();
+        finding
+            .evidence
+            .retain_mut(|evidence| match validate_evidence(evidence, cwd) {
+                Ok(()) => true,
+                Err(error) => {
+                    evidence_errors.push(error);
+                    false
+                }
+            });
+        for error in evidence_errors {
+            warnings.push(format!("check '{}': {}", finding.check_id, error));
+        }
+        if !matches!(finding.answer, FindingAnswer::Unknown) && finding.evidence.is_empty() {
+            warnings.push(format!(
+                "check '{}': finding omitted because no valid evidence remained",
+                finding.check_id
+            ));
+            false
+        } else {
+            true
+        }
+    });
+    Ok((report, warnings))
 }
 
-fn validate_evidence(evidence: &EvidenceRef, cwd: &Path) -> Result<(), String> {
+fn validate_evidence(evidence: &mut EvidenceRef, cwd: &Path) -> Result<(), String> {
     let EvidenceRef::File {
         path,
         line_start,
@@ -145,9 +173,9 @@ fn validate_evidence(evidence: &EvidenceRef, cwd: &Path) -> Result<(), String> {
         return Err(format!("invalid line range for '{}'", path));
     }
     let joined = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
+        PathBuf::from(path.as_str())
     } else {
-        cwd.join(path)
+        cwd.join(path.as_str())
     };
     let canonical_cwd = cwd
         .canonicalize()
@@ -161,14 +189,74 @@ fn validate_evidence(evidence: &EvidenceRef, cwd: &Path) -> Result<(), String> {
     let content = std::fs::read_to_string(&canonical_path)
         .map_err(|error| format!("cannot read evidence '{}': {}", path, error))?;
     let lines: Vec<_> = content.lines().collect();
-    if *line_end > lines.len() {
-        return Err(format!("evidence line range exceeds '{}'", path));
+    let quote = quote.trim().to_string();
+    if quote.is_empty() {
+        return Err(format!("evidence quote is empty for '{}'", path));
     }
-    let excerpt = lines[*line_start - 1..*line_end].join("\n");
-    if !excerpt.contains(quote.trim()) {
-        return Err(format!("evidence quote is stale for '{}'", path));
+    if *line_start > 0 && *line_end >= *line_start && *line_end <= lines.len() {
+        let excerpt = lines[*line_start - 1..*line_end].join("\n");
+        if quote_matches(&excerpt, &quote) {
+            return Ok(());
+        }
     }
-    Ok(())
+
+    // Models frequently retain the correct verbatim text but report a nearby
+    // line range after a document changes, or collapse Markdown wrapping into
+    // spaces. Relocate only a unique, substantive quote so evidence remains
+    // anchored to current file contents rather than accepting paraphrases.
+    if normalize_whitespace(&quote).chars().count() >= 16 {
+        if let Some((start, end)) = find_unique_quote_range(&lines, &quote)? {
+            *line_start = start;
+            *line_end = end;
+            return Ok(());
+        }
+    }
+    Err(format!("evidence quote is stale for '{}'", path))
+}
+
+fn find_unique_quote_range(lines: &[&str], quote: &str) -> Result<Option<(usize, usize)>, String> {
+    let mut best: Option<(usize, usize)> = None;
+    let mut ambiguous = false;
+    for start in 0..lines.len() {
+        let max_end = (start + 12).min(lines.len());
+        for end in start + 1..=max_end {
+            if !quote_matches(&lines[start..end].join("\n"), quote) {
+                continue;
+            }
+            let span = end - start;
+            match best {
+                None => {
+                    best = Some((start + 1, end));
+                    ambiguous = false;
+                }
+                Some((best_start, best_end)) if span < best_end - best_start + 1 => {
+                    best = Some((start + 1, end));
+                    ambiguous = false;
+                }
+                Some((best_start, best_end))
+                    if span == best_end - best_start + 1
+                        && (best_start, best_end) != (start + 1, end) =>
+                {
+                    ambiguous = true;
+                }
+                _ => {}
+            }
+            break;
+        }
+    }
+    if ambiguous {
+        Err("evidence quote occurs more than once".into())
+    } else {
+        Ok(best)
+    }
+}
+
+fn quote_matches(source: &str, quote: &str) -> bool {
+    source.contains(quote) || normalize_whitespace(source).contains(&normalize_whitespace(quote))
+}
+
+fn normalize_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub fn reconcile(reports: &[ChildReport], checks: &[CheckSpec]) -> VerificationSummary {
@@ -255,7 +343,10 @@ pub fn report_instructions(checks: &[CheckSpec]) -> String {
          Shape: {{\"schema\":\"aitui.child-report.v1\",\"status\":\"complete|partial|blocked\",\
          \"findings\":[{{\"check_id\":string,\"answer\":\"yes|no|mixed|unknown\",\"statement\":string,\
          \"evidence\":[{{\"kind\":\"file\",\"path\":string,\"line_start\":integer,\"line_end\":integer,\"quote\":string}}]}}],\
-         \"uncertainties\":[]}}. Every non-unknown answer needs evidence. Checks: {}",
+         \"uncertainties\":[]}}. Every non-unknown answer needs evidence. For file evidence, quote a short \
+         verbatim excerpt copied from the current file: no paraphrasing, ellipses, line-number prefixes, \
+         or Markdown reformatting. The line range must contain the quote; if exact evidence is unavailable, \
+         answer unknown. Checks: {}",
         checks
     )
 }
@@ -285,7 +376,74 @@ mod tests {
             )
         };
         assert!(parse_and_validate(&report("verified fact"), &checks, &root).is_ok());
-        assert!(parse_and_validate(&report("stale claim"), &checks, &root).is_err());
+        let (stale, warnings) =
+            parse_and_validate_detailed(&report("stale claim"), &checks, &root).unwrap();
+        assert!(stale.findings.is_empty());
+        assert!(warnings.iter().any(|warning| warning.contains("stale")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn relocates_unique_quotes_and_normalizes_wrapped_whitespace() {
+        let root = std::env::temp_dir().join(format!(
+            "aitui-report-relocate-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("evidence.md"),
+            "heading\nnew prefix\nThe ownership contract is\nexplicit and testable.\n",
+        )
+        .unwrap();
+        let checks = vec![CheckSpec {
+            id: "contract".into(),
+            question: "is the contract explicit?".into(),
+        }];
+        let text = r#"{"schema":"aitui.child-report.v1","status":"complete","findings":[{"check_id":"contract","answer":"yes","statement":"checked","evidence":[{"kind":"file","path":"evidence.md","line_start":1,"line_end":1,"quote":"The ownership contract is explicit and testable."}]}],"uncertainties":[]}"#;
+        let report = parse_and_validate(text, &checks, &root).unwrap();
+        let EvidenceRef::File {
+            line_start,
+            line_end,
+            ..
+        } = &report.findings[0].evidence[0]
+        else {
+            panic!("expected file evidence");
+        };
+        assert_eq!((*line_start, *line_end), (3, 4));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_evidence_does_not_discard_other_findings() {
+        let root = std::env::temp_dir().join(format!(
+            "aitui-report-partial-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("evidence.txt"),
+            "a sufficiently specific valid fact\n",
+        )
+        .unwrap();
+        let checks = vec![
+            CheckSpec {
+                id: "valid".into(),
+                question: "valid?".into(),
+            },
+            CheckSpec {
+                id: "stale".into(),
+                question: "stale?".into(),
+            },
+        ];
+        let text = r#"{"schema":"aitui.child-report.v1","status":"complete","findings":[{"check_id":"valid","answer":"yes","statement":"valid","evidence":[{"kind":"file","path":"evidence.txt","line_start":1,"line_end":1,"quote":"a sufficiently specific valid fact"}]},{"check_id":"stale","answer":"no","statement":"stale","evidence":[{"kind":"file","path":"evidence.txt","line_start":1,"line_end":1,"quote":"a fabricated stale quotation"}]}],"uncertainties":[]}"#;
+        let (report, warnings) = parse_and_validate_detailed(text, &checks, &root).unwrap();
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].check_id, "valid");
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("check 'stale'")));
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -43,6 +43,7 @@ lsp-server = "0.7"
 lsp-types  = "0.97"
 
 regex      = "1"
+fs2        = "0.4"
 
 # Native PowerPoint engine (pure Rust OOXML package + high-level presentation model).
 pptx       = "0.1"
