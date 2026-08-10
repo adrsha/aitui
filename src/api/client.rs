@@ -108,8 +108,7 @@ impl ApiClient {
                         attempt += 1;
                         if fail.retryable && !fail.emitted && attempt < MAX_ATTEMPTS {
                             // 0.5s, 1s, 2s exponential backoff.
-                            let backoff = std::time::Duration::from_millis(500u64 << (attempt - 1));
-                            tokio::time::sleep(backoff).await;
+                            tokio::time::sleep(retry_backoff(attempt)).await;
                             continue;
                         }
                         // If the receiver is gone we don't care about the send error.
@@ -158,35 +157,66 @@ impl ApiClient {
     /// which needs a single short reply rather than a token stream. Returns the
     /// assistant message text (empty string if the endpoint returns no content).
     pub async fn complete(&self, request: ChatRequest) -> anyhow::Result<String> {
+        const MAX_ATTEMPTS: u32 = 4;
+
         let url = format!("{}/v1/chat/completions", self.endpoint);
         let headers = self.auth_headers()?;
+        let mut attempt = 0u32;
 
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Completion request failed: {}", e))?;
+        loop {
+            attempt += 1;
+            let response = self
+                .client
+                .post(&url)
+                .headers(headers.clone())
+                .json(&request)
+                .send()
+                .await;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!("Completion API error {}: {}", status, body));
+            let response = match response {
+                Ok(response) => response,
+                Err(_error) if attempt < MAX_ATTEMPTS => {
+                    tokio::time::sleep(retry_backoff(attempt)).await;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "Completion request failed after {} attempts: {}",
+                        attempt,
+                        error
+                    ));
+                }
+            };
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                let retryable = is_transient_status(status);
+                if retryable && attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(retry_backoff(attempt)).await;
+                    continue;
+                }
+                return Err(anyhow::anyhow!(
+                    "Completion API error {} after {} attempt{}: {}",
+                    status,
+                    attempt,
+                    if attempt == 1 { "" } else { "s" },
+                    body
+                ));
+            }
+
+            let parsed: super::models::ChatResponse = response
+                .json()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to parse completion response: {}", e))?;
+
+            return Ok(parsed
+                .choices
+                .into_iter()
+                .next()
+                .and_then(|c| c.message.content)
+                .unwrap_or_default());
         }
-
-        let parsed: super::models::ChatResponse = response
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse completion response: {}", e))?;
-
-        Ok(parsed
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|c| c.message.content)
-            .unwrap_or_default())
     }
 
     /// Fetch available models from the /v1/models endpoint.
@@ -334,6 +364,15 @@ struct StreamFail {
 /// this is almost certainly a dropped gateway connection.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error()
+}
+
+fn retry_backoff(attempt: u32) -> std::time::Duration {
+    // Called after attempts 1..3: 0.5s, 1s, 2s.
+    std::time::Duration::from_millis(500u64 << attempt.saturating_sub(1).min(2))
+}
+
 async fn stream_inner(
     client: reqwest::Client,
     url: String,
@@ -374,9 +413,10 @@ async fn stream_inner(
         let body = response.text().await.unwrap_or_default();
         // 408/429/5xx are transient (server busy / rate limited); 4xx is a hard
         // client error (bad key, bad request) that will fail identically on retry.
-        let retryable =
-            status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error();
-        fail!(retryable, anyhow::anyhow!("API error {}: {}", status, body));
+        fail!(
+            is_transient_status(status),
+            anyhow::anyhow!("API error {}: {}", status, body)
+        );
     }
 
     let mut stream = response.bytes_stream();
@@ -471,10 +511,14 @@ async fn stream_inner(
         }
     }
 
-    // Stream ended without [DONE]; treat as done.
-    flush_tool_calls(&tool_acc, &tx).await;
-    let _ = tx.send(StreamEvent::Done).await;
-    Ok(())
+    // A transport EOF is not a completion signal. Treating it as Done silently
+    // commits truncated text/tool JSON and can make the orchestration loop act on
+    // an incomplete response. Before any emission the outer loop may replay the
+    // request; after emission it surfaces a clear error without duplicating text.
+    fail!(
+        true,
+        anyhow::anyhow!("Stream closed before completion marker ([DONE] or finish_reason)")
+    )
 }
 
 /// One accumulating native tool call being assembled from streamed fragments.
@@ -908,6 +952,81 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
+    /// Server that closes a successful SSE response after a content delta but
+    /// before either `[DONE]` or a finish reason.
+    fn premature_eof_server() -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            let payload = "data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            let mut stream = reader.into_inner();
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Server that returns 408 once, then a valid non-streaming completion.
+    fn completion_retry_server() -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            for attempt in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                }
+                let body = if attempt == 0 {
+                    "request timed out"
+                } else {
+                    r#"{"choices":[{"message":{"content":"tracker ok"}}]}"#
+                };
+                let status = if attempt == 0 {
+                    "408 Request Timeout"
+                } else {
+                    "200 OK"
+                };
+                let response = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let mut stream = reader.into_inner();
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     #[tokio::test]
     async fn stream_retries_transient_500_with_backoff_before_emission() {
         let (url, server) = retry_server();
@@ -933,6 +1052,61 @@ mod tests {
             first
         );
         drop(server);
+    }
+
+    #[tokio::test]
+    async fn premature_stream_eof_is_an_error_after_partial_output() {
+        let (url, server) = premature_eof_server();
+        let client = reqwest::Client::builder().http1_only().build().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let task = tokio::spawn(stream_inner(
+            client,
+            format!("{}/v1/chat/completions", url),
+            HeaderMap::new(),
+            ChatRequest {
+                model: String::new(),
+                messages: Vec::new(),
+                stream: true,
+                max_tokens: None,
+                stream_options: None,
+                reasoning_effort: None,
+                reasoning_mode: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+            },
+            tx,
+            std::time::Duration::from_secs(5),
+        ));
+        assert!(matches!(rx.recv().await, Some(StreamEvent::Token(text)) if text == "partial"));
+        let failure = task.await.unwrap().unwrap_err();
+        assert!(failure.emitted);
+        assert!(failure.retryable);
+        assert!(failure.err.to_string().contains("closed before completion"));
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn completion_retries_408_then_succeeds() {
+        let (url, server) = completion_retry_server();
+        let client = ApiClient::new(&url, "test-key").unwrap();
+        let reply = client
+            .complete(ChatRequest {
+                model: String::new(),
+                messages: Vec::new(),
+                stream: false,
+                max_tokens: None,
+                stream_options: None,
+                reasoning_effort: None,
+                reasoning_mode: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply, "tracker ok");
+        server.join().unwrap();
     }
 
     #[tokio::test]
