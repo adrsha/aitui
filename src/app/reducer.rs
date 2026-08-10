@@ -638,15 +638,20 @@ impl App {
             Action::ChatScroll(d) => {
                 self.chat.scroll_by(d, self.chat_h());
             }
-            Action::SidebarTaskScroll(delta) => {
+            Action::SidebarListScroll(delta) => {
+                let scroll = match self.sidebar_tab {
+                    crate::app::state::SidebarTab::Tasks => &mut self.sidebar_task_scroll,
+                    crate::app::state::SidebarTab::Agents => &mut self.sidebar_agent_scroll,
+                };
                 if delta < 0 {
-                    self.sidebar_task_scroll = self
-                        .sidebar_task_scroll
-                        .saturating_sub(delta.unsigned_abs() as usize);
+                    *scroll = scroll.saturating_sub(delta.unsigned_abs() as usize);
                 } else {
-                    self.sidebar_task_scroll =
-                        self.sidebar_task_scroll.saturating_add(delta as usize);
+                    *scroll = scroll.saturating_add(delta as usize);
                 }
+                self.touch();
+            }
+            Action::SelectSidebarTab(tab) => {
+                self.sidebar_tab = tab;
                 self.touch();
             }
             Action::ToggleOutput => {
@@ -703,6 +708,26 @@ impl App {
                     self.show_last_prompt = !self.show_last_prompt;
                     self.touch();
                     return None;
+                }
+                if self.layout.sidebar_tasks_tab.is_some_and(|area| {
+                    col >= area.x
+                        && col < area.x + area.width
+                        && row >= area.y
+                        && row < area.y + area.height
+                }) {
+                    return Some(Action::SelectSidebarTab(
+                        crate::app::state::SidebarTab::Tasks,
+                    ));
+                }
+                if self.layout.sidebar_agents_tab.is_some_and(|area| {
+                    col >= area.x
+                        && col < area.x + area.width
+                        && row >= area.y
+                        && row < area.y + area.height
+                }) {
+                    return Some(Action::SelectSidebarTab(
+                        crate::app::state::SidebarTab::Agents,
+                    ));
                 }
                 if self.layout.access.is_some_and(|access| {
                     col >= access.area.x
@@ -852,14 +877,21 @@ impl App {
                         let r0 =
                             (sel.anchor_row.saturating_sub(area.y)) as usize + self.chat.scroll;
                         let r1 = (sel.drag_row.saturating_sub(area.y)) as usize + self.chat.scroll;
-                        let start = r0.min(r1);
-                        let end = r1.max(r0);
-                        let text: Vec<&str> = self.chat.doc()[start..=end]
-                            .iter()
-                            .map(|r| r.plain.as_str())
-                            .collect();
-                        if !text.is_empty() {
-                            self.pending_clipboard = Some(text.join("\n"));
+                        let requested_start = r0.min(r1);
+                        let requested_end = r1.max(r0);
+                        let doc = self.chat.doc();
+                        // The viewport can contain blank rows below a short or
+                        // empty rendered response. Intersect the drag range with
+                        // the actual document instead of indexing those blanks.
+                        let start = requested_start.min(doc.len());
+                        let end_exclusive = requested_end.saturating_add(1).min(doc.len());
+                        if start < end_exclusive {
+                            let text = doc[start..end_exclusive]
+                                .iter()
+                                .map(|row| row.plain.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            self.pending_clipboard = Some(text);
                         }
                     }
                 }
@@ -2593,6 +2625,8 @@ mod tests {
             help_selected: 0,
             help_scroll: 0,
             sidebar_task_scroll: 0,
+            sidebar_agent_scroll: 0,
+            sidebar_tab: crate::app::state::SidebarTab::Tasks,
             should_quit: false,
             yank: None,
             last_insert: None,
@@ -2656,6 +2690,25 @@ mod tests {
             layout: PanelLayout::default(),
             api: None,
         }
+    }
+
+    #[test]
+    fn sidebar_tabs_preserve_independent_scroll_positions() {
+        let mut app = test_app();
+        app.sidebar_task_scroll = 4;
+        app.sidebar_agent_scroll = 7;
+        app.apply(Action::SelectSidebarTab(
+            crate::app::state::SidebarTab::Agents,
+        ));
+        app.apply(Action::SidebarListScroll(1));
+        assert_eq!(app.sidebar_task_scroll, 4);
+        assert_eq!(app.sidebar_agent_scroll, 8);
+        app.apply(Action::SelectSidebarTab(
+            crate::app::state::SidebarTab::Tasks,
+        ));
+        app.apply(Action::SidebarListScroll(-1));
+        assert_eq!(app.sidebar_task_scroll, 3);
+        assert_eq!(app.sidebar_agent_scroll, 8);
     }
 
     #[test]
@@ -2751,6 +2804,108 @@ mod tests {
         assert!(app.layout.chat.width > 0);
         assert!(app.layout.session_tabs.is_empty());
         assert!(!app.chat.doc().is_empty());
+    }
+
+    #[test]
+    fn sidebar_tabs_keep_tasks_and_agents_independently_viewable() {
+        use crate::app::state::{SidebarTab, SubtaskStatus};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = test_app();
+        let sid = app.sessions.active_id();
+        app.sessions.active_mut().todos = vec![crate::app::state::TodoItem {
+            text: "Verify sidebar tabs".into(),
+            status: crate::app::state::TodoStatus::InProgress,
+            percent: Some(50),
+        }];
+        app.subtasks.push(Subtask {
+            id: 42,
+            session_id: sid,
+            parent_id: None,
+            call: tool_call(
+                "workflow",
+                serde_json::json!({"action": "agent", "description": "review UI", "prompt": "check"}),
+            ),
+            description: "review UI".into(),
+            todo_index: Some(1),
+            prompt: "check".into(),
+            cwd: PathBuf::from("."),
+            status: SubtaskStatus::Running,
+            activity: Some("checking side panel".into()),
+            log: Vec::new(),
+            transcript: Vec::new(),
+            output: None,
+            message_index: usize::MAX,
+            started_at: std::time::Instant::now(),
+            duration_ms: None,
+            abort: None,
+            agent: Some("reviewer".into()),
+        });
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.sidebar_tab, SidebarTab::Tasks);
+        assert!(app.layout.sidebar_tasks.is_some());
+        assert!(app.layout.sidebar_agents.is_empty());
+        let agents_tab = app.layout.sidebar_agents_tab.expect("agents tab");
+
+        let action = app
+            .apply(Action::ChatClick(agents_tab.x, agents_tab.y))
+            .expect("tab click action");
+        app.apply(action);
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.sidebar_tab, SidebarTab::Agents);
+        assert!(app.layout.sidebar_tasks.is_some());
+        assert_eq!(app.layout.sidebar_agents.len(), 1);
+        assert_eq!(app.layout.sidebar_agents[0].task_id, 42);
+
+        let tasks_tab = app.layout.sidebar_tasks_tab.expect("tasks tab");
+        let action = app
+            .apply(Action::ChatClick(tasks_tab.x, tasks_tab.y))
+            .expect("tab click action");
+        app.apply(action);
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.sidebar_tab, SidebarTab::Tasks);
+        assert!(app.layout.sidebar_tasks.is_some());
+        assert!(app.layout.sidebar_agents.is_empty());
+    }
+
+    #[test]
+    fn drag_selection_below_empty_agent_response_does_not_panic() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = test_app();
+        app.config.ui.auto_copy_selection = true;
+        app.sessions
+            .active_mut()
+            .push_message(crate::api::ChatMessage::user("Run the agent"));
+        app.sessions
+            .active_mut()
+            .push_message(crate::api::ChatMessage::assistant(""));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+
+        let area = app.layout.chat;
+        assert!(app.chat.doc().len() < area.height as usize);
+        let blank_row = area.y + app.chat.doc().len() as u16;
+        app.apply(Action::ChatClick(area.x, blank_row));
+        app.apply(Action::ChatDrag(area.x + 1, blank_row));
+        app.apply(Action::ChatRelease);
+
+        assert!(app.pending_clipboard.is_none());
     }
 
     #[test]
@@ -4072,6 +4227,64 @@ mod tests {
         assert_eq!(reports.len(), 2);
         assert!(reports[0].contains("first report"));
         assert!(reports[1].contains("second report"));
+    }
+
+    #[test]
+    fn native_tool_preparation_stays_transient_in_inline_subtask_message() {
+        use crate::app::state::{SubtaskEvent, SubtaskLogEntry, SubtaskProgress, SubtaskStatus};
+
+        let mut app = test_app();
+        let sid = app.sessions.active_id();
+        app.subtasks.push(Subtask {
+            id: 7,
+            session_id: sid,
+            parent_id: None,
+            call: tool_call(
+                "workflow",
+                serde_json::json!({"action": "agent", "description": "inspect", "prompt": "check"}),
+            ),
+            description: "inspect".into(),
+            todo_index: None,
+            prompt: "check".into(),
+            cwd: PathBuf::from("."),
+            status: SubtaskStatus::Running,
+            activity: None,
+            log: Vec::new(),
+            transcript: Vec::new(),
+            output: None,
+            message_index: usize::MAX,
+            started_at: std::time::Instant::now(),
+            duration_ms: None,
+            abort: None,
+            agent: None,
+        });
+
+        for _ in 0..128 {
+            app.handle_subtask_event(SubtaskEvent::Progress {
+                id: 7,
+                progress: SubtaskProgress::Phase("Preparing tool: shell".into()),
+            });
+        }
+        assert_eq!(
+            app.subtasks[0].activity.as_deref(),
+            Some("Preparing tool: shell")
+        );
+        assert!(app.subtasks[0].log.is_empty());
+        assert_eq!(
+            tool_msg_text(&app).matches("Preparing tool: shell").count(),
+            1,
+            "the current activity remains visible once, but no phase history is stored"
+        );
+
+        app.handle_subtask_event(SubtaskEvent::Progress {
+            id: 7,
+            progress: SubtaskProgress::Phase("Reviewing results".into()),
+        });
+        assert!(matches!(
+            app.subtasks[0].log.as_slice(),
+            [SubtaskLogEntry::Phase { text }] if text == "Reviewing results"
+        ));
+        assert!(tool_msg_text(&app).contains("Reviewing results"));
     }
 
     #[test]

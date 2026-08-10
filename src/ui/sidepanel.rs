@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::state::{AccessHitbox, App, SubtaskHitbox, TodoStatus};
+use crate::app::state::{AccessHitbox, App, SidebarTab, SubtaskHitbox, TodoStatus};
 use crate::render::path::display_path;
 use crate::render::theme::{fg_guard, Theme};
 use crate::render::wrap::wrap_words;
@@ -19,6 +19,8 @@ pub struct SidebarHitboxes {
     pub agents: Vec<SubtaskHitbox>,
     pub access: Vec<AccessHitbox>,
     pub tasks: Option<Rect>,
+    pub tasks_tab: Option<Rect>,
+    pub agents_tab: Option<Rect>,
 }
 
 /// Render the sidebar. Returns click targets for the child-agent rows.
@@ -205,73 +207,129 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) -> SidebarHit
         .iter()
         .filter(|task| task.session_id == session.id)
         .collect();
-    if !sid_agents.is_empty() && y < content_bottom {
-        use crate::app::state::SubtaskStatus;
-        let running = sid_agents
-            .iter()
-            .filter(|task| task.status == SubtaskStatus::Running)
-            .count();
-        let done = sid_agents.len().saturating_sub(running);
-        y = y.saturating_add(1);
-        y = render_section(
-            f,
-            inner_x,
-            y,
-            inner_w,
-            content_bottom,
-            &format!("Agents  {} running · {} done", running, done),
-            theme,
-        );
-        y = y.saturating_add(1);
-        let ms = crate::ui::statusbar::now_ms();
-        let mut hitboxes: Vec<SubtaskHitbox> = Vec::new();
-        for task in &sid_agents {
-            if y >= content_bottom {
-                break;
-            }
-            let depth = tree_depth(app, task);
-            let entered = app.view_node == Some(task.id);
-            let lines = agent_lines(task, ms, inner_w, theme);
-            let lines = indent_lines(lines, depth, entered);
-            let remaining = content_bottom.saturating_sub(y) as usize;
-            if lines.len() > remaining {
-                break;
-            }
-            let rows = Rect {
-                x: inner_x,
-                y,
-                width: inner_w as u16,
-                height: lines.len() as u16,
-            };
-            hitboxes.push(SubtaskHitbox {
-                task_id: task.id,
-                area: rows,
-            });
-            y = render_lines(
-                f,
-                inner_x,
-                y,
-                inner_w,
-                content_bottom,
-                lines,
-                theme.surface(),
-            );
-        }
-        return SidebarHitboxes {
-            agents: hitboxes,
-            access: access_hitboxes,
-            tasks: None,
-        };
-    }
-
-    if session.todos.is_empty() || y >= content_bottom {
+    if y >= content_bottom {
         return SidebarHitboxes {
             access: access_hitboxes,
             ..SidebarHitboxes::default()
         };
     }
 
+    // Tasks and agents share the remaining sidebar space, but neither hides the
+    // other permanently: the tab strip is always present and exposes both views.
     y = y.saturating_add(1);
+    let tab_width = (inner_w as u16 / 2).max(1);
+    let tasks_tab = Rect {
+        x: inner_x,
+        y,
+        width: tab_width,
+        height: 1,
+    };
+    let agents_tab = Rect {
+        x: inner_x.saturating_add(tab_width),
+        y,
+        width: (inner_w as u16).saturating_sub(tab_width),
+        height: 1,
+    };
+    render_sidebar_tab(
+        f,
+        tasks_tab,
+        &format!("Tasks {}", session.todos.len()),
+        app.sidebar_tab == SidebarTab::Tasks,
+        theme,
+    );
+    render_sidebar_tab(
+        f,
+        agents_tab,
+        &format!("Agents {}", sid_agents.len()),
+        app.sidebar_tab == SidebarTab::Agents,
+        theme,
+    );
+    y = y.saturating_add(2);
+
+    if app.sidebar_tab == SidebarTab::Agents {
+        use crate::app::state::SubtaskStatus;
+        let running = sid_agents
+            .iter()
+            .filter(|task| task.status == SubtaskStatus::Running)
+            .count();
+        let done = sid_agents.len().saturating_sub(running);
+        y = render_section(
+            f,
+            inner_x,
+            y,
+            inner_w,
+            content_bottom,
+            &format!("{} running · {} done", running, done),
+            theme,
+        );
+        y = y.saturating_add(1);
+        let ms = crate::ui::statusbar::now_ms();
+        let list_area = Rect {
+            x: inner_x,
+            y,
+            width: inner_w as u16,
+            height: content_bottom.saturating_sub(y),
+        };
+        let mut agent_rows = Vec::new();
+        for task in &sid_agents {
+            let depth = tree_depth(app, task);
+            let entered = app.view_node == Some(task.id);
+            agent_rows.extend(
+                indent_lines(agent_lines(task, ms, inner_w, theme), depth, entered)
+                    .into_iter()
+                    .map(|line| (task.id, line)),
+            );
+        }
+        if agent_rows.is_empty() {
+            agent_rows.push((0, Line::from(Span::styled("No agents yet", theme.subtle()))));
+        }
+        let (start, end) = sidebar_window(
+            agent_rows.len(),
+            list_area.height as usize,
+            app.sidebar_agent_scroll,
+        );
+        let visible = &agent_rows[start..end];
+        if list_area.height > 0 {
+            f.render_widget(
+                Paragraph::new(
+                    visible
+                        .iter()
+                        .map(|(_, line)| line.clone())
+                        .collect::<Vec<_>>(),
+                )
+                .style(surface),
+                list_area,
+            );
+            render_scroll_hints(f, list_area, start, end, agent_rows.len(), theme);
+        }
+        let mut hitboxes: Vec<SubtaskHitbox> = Vec::new();
+        for (row, (task_id, _)) in visible.iter().enumerate() {
+            if *task_id == 0 {
+                continue;
+            }
+            if let Some(last) = hitboxes.last_mut().filter(|last| last.task_id == *task_id) {
+                last.area.height = last.area.height.saturating_add(1);
+            } else {
+                hitboxes.push(SubtaskHitbox {
+                    task_id: *task_id,
+                    area: Rect {
+                        x: list_area.x,
+                        y: list_area.y.saturating_add(row as u16),
+                        width: list_area.width,
+                        height: 1,
+                    },
+                });
+            }
+        }
+        return SidebarHitboxes {
+            agents: hitboxes,
+            access: access_hitboxes,
+            tasks: Some(list_area),
+            tasks_tab: Some(tasks_tab),
+            agents_tab: Some(agents_tab),
+        };
+    }
+
     let done = session
         .todos
         .iter()
@@ -279,8 +337,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) -> SidebarHit
         .count();
     let overall = session.todo_overall_percent;
     let header = match overall {
-        Some(percent) => format!("Tasks  {}/{} · {}%", done, session.todos.len(), percent),
-        None => format!("Tasks  {}/{}", done, session.todos.len()),
+        Some(percent) => format!("{}/{} done · {}%", done, session.todos.len(), percent),
+        None => format!("{}/{} done", done, session.todos.len()),
     };
     y = render_section(f, inner_x, y, inner_w, content_bottom, &header, theme);
     y = y.saturating_add(1);
@@ -301,12 +359,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) -> SidebarHit
     );
     y = y.saturating_add(1);
 
-    let task_top = y;
     let task_area = Rect {
         x: inner_x,
-        y: task_top,
+        y,
         width: inner_w as u16,
-        height: content_bottom.saturating_sub(task_top),
+        height: content_bottom.saturating_sub(y),
     };
     let mut task_lines = Vec::new();
     for todo in &session.todos {
@@ -324,42 +381,65 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) -> SidebarHit
             theme,
         ));
     }
+    if task_lines.is_empty() {
+        task_lines.push(Line::from(Span::styled("No tasks yet", theme.subtle())));
+    }
     let visible_h = task_area.height as usize;
-    let max_scroll = task_lines.len().saturating_sub(visible_h);
-    let start = app.sidebar_task_scroll.min(max_scroll);
-    let end = (start + visible_h).min(task_lines.len());
+    let (start, end) = sidebar_window(task_lines.len(), visible_h, app.sidebar_task_scroll);
     if task_area.height > 0 {
         f.render_widget(
             Paragraph::new(task_lines[start..end].to_vec()).style(surface),
             task_area,
         );
-        if start > 0 {
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled("▲", theme.subtle()))),
-                Rect {
-                    x: task_area.x + task_area.width.saturating_sub(1),
-                    y: task_area.y,
-                    width: 1,
-                    height: 1,
-                },
-            );
-        }
-        if end < task_lines.len() {
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled("▼", theme.subtle()))),
-                Rect {
-                    x: task_area.x + task_area.width.saturating_sub(1),
-                    y: task_area.y + task_area.height.saturating_sub(1),
-                    width: 1,
-                    height: 1,
-                },
-            );
-        }
+        render_scroll_hints(f, task_area, start, end, task_lines.len(), theme);
     }
     SidebarHitboxes {
         access: access_hitboxes,
         tasks: Some(task_area),
+        tasks_tab: Some(tasks_tab),
+        agents_tab: Some(agents_tab),
         ..SidebarHitboxes::default()
+    }
+}
+
+fn sidebar_window(total: usize, height: usize, requested: usize) -> (usize, usize) {
+    let start = requested.min(total.saturating_sub(height));
+    (start, (start + height).min(total))
+}
+
+fn render_scroll_hints(
+    f: &mut Frame,
+    area: Rect,
+    start: usize,
+    end: usize,
+    total: usize,
+    theme: &Theme,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let x = area.x + area.width.saturating_sub(1);
+    if start > 0 {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled("▲", theme.subtle()))),
+            Rect {
+                x,
+                y: area.y,
+                width: 1,
+                height: 1,
+            },
+        );
+    }
+    if end < total {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled("▼", theme.subtle()))),
+            Rect {
+                x,
+                y: area.y + area.height.saturating_sub(1),
+                width: 1,
+                height: 1,
+            },
+        );
     }
 }
 
@@ -491,6 +571,31 @@ fn brand_lines(width: usize, focused: bool, theme: &Theme) -> Vec<Line<'static>>
         Span::raw(gap),
         Span::styled(meta, Style::default().fg(fg_guard(theme.muted))),
     ])]
+}
+
+fn render_sidebar_tab(f: &mut Frame, area: Rect, label: &str, active: bool, theme: &Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let style = if active {
+        Style::default()
+            .bg(theme.accent)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .bg(theme.subtle_pill)
+            .fg(fg_guard(theme.muted))
+    };
+    let max = area.width as usize;
+    let label = crate::render::wrap::hard_chunks(label, max.saturating_sub(2).max(1))
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(format!(" {} ", label), style))).style(style),
+        area,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -785,7 +890,7 @@ fn render_context(
 mod tests {
     use super::{
         agent_display_name, agent_lines, brand_lines, directory_lines, labeled_lines,
-        prefixed_lines, progress_meter_line, task_item_lines,
+        prefixed_lines, progress_meter_line, sidebar_window, task_item_lines,
     };
     use crate::agent::ToolCall;
     use crate::app::state::{Subtask, SubtaskStatus};
@@ -828,6 +933,14 @@ mod tests {
             abort: None,
             agent: agent.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn sidebar_window_scrolls_one_row_and_clamps_at_the_end() {
+        assert_eq!(sidebar_window(20, 5, 0), (0, 5));
+        assert_eq!(sidebar_window(20, 5, 1), (1, 6));
+        assert_eq!(sidebar_window(20, 5, usize::MAX), (15, 20));
+        assert_eq!(sidebar_window(3, 5, 4), (0, 3));
     }
 
     #[test]

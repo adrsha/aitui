@@ -1415,13 +1415,13 @@ fn render_diff_columns(
 
     let ctx = Style::default().fg(theme.muted);
     let mut plan: Vec<(
-        Option<(usize, Option<Color>, Option<&[Segment]>, Style)>,
-        Option<(usize, Option<Color>, Option<&[Segment]>, Style)>,
+        Option<(usize, Option<Color>, &str, Option<&[Segment]>, Style)>,
+        Option<(usize, Option<Color>, &str, Option<&[Segment]>, Style)>,
     )> = Vec::new();
     for i in 0..p {
         plan.push((
-            Some((start_line + i, None, old_seg(i), ctx)),
-            Some((start_line + i, None, new_seg(i), ctx)),
+            Some((start_line + i, None, o[i], old_seg(i), ctx)),
+            Some((start_line + i, None, n[i], new_seg(i), ctx)),
         ));
     }
     let removed_count = removed_end.saturating_sub(p);
@@ -1432,6 +1432,7 @@ fn render_diff_columns(
             (
                 start_line + i,
                 Some(theme.danger),
+                o[i],
                 old_seg(i),
                 Style::default().bg(Color::DarkGray),
             )
@@ -1441,6 +1442,7 @@ fn render_diff_columns(
             (
                 start_line + i,
                 Some(theme.success),
+                n[i],
                 new_seg(i),
                 Style::default().bg(Color::DarkGray),
             )
@@ -1450,14 +1452,20 @@ fn render_diff_columns(
     for i in removed_end..o.len() {
         let new_index = added_end + (i - removed_end);
         plan.push((
-            Some((start_line + i, None, old_seg(i), ctx)),
-            Some((start_line + new_index, None, new_seg(new_index), ctx)),
+            Some((start_line + i, None, o[i], old_seg(i), ctx)),
+            Some((
+                start_line + new_index,
+                None,
+                n[new_index],
+                new_seg(new_index),
+                ctx,
+            )),
         ));
     }
 
     for (left, right) in plan {
-        let left_bar = left.as_ref().and_then(|(_, bar, _, _)| *bar);
-        let right_bar = right.as_ref().and_then(|(_, bar, _, _)| *bar);
+        let left_bar = left.as_ref().and_then(|(_, bar, _, _, _)| *bar);
+        let right_bar = right.as_ref().and_then(|(_, bar, _, _, _)| *bar);
         let left_rows = diff_column_rows(left, num_width, code_w);
         let right_rows = diff_column_rows(right, num_width, code_w);
         let rows = left_rows.len().max(right_rows.len()).max(1);
@@ -1508,11 +1516,11 @@ fn render_diff_columns(
 
 /// One column of a side-by-side diff row: optional bar, line number, content.
 fn diff_column_rows(
-    cell: Option<(usize, Option<Color>, Option<&[Segment]>, Style)>,
+    cell: Option<(usize, Option<Color>, &str, Option<&[Segment]>, Style)>,
     num_width: usize,
     code_w: usize,
 ) -> Vec<(Vec<Span<'static>>, String)> {
-    let Some((num, bar, segments, style)) = cell else {
+    let Some((num, bar, source, segments, style)) = cell else {
         return Vec::new();
     };
     let bar_text = "█ ";
@@ -1527,7 +1535,7 @@ fn diff_column_rows(
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
     ];
     let gutter_plain = format!("{}{} │ ", bar_text, num_text);
-    let fallback = vec![(String::new(), style)];
+    let fallback = vec![(source.to_string(), style)];
     let segments: &[(String, Style)] = if segments.is_some_and(|s| !s.is_empty()) {
         segments.unwrap()
     } else {
@@ -4158,6 +4166,32 @@ mod tests {
                 span.content.as_ref() == "█ " && span.style.fg == Some(theme.success)
             })
         }));
+    }
+
+    #[test]
+    fn side_by_side_diff_falls_back_to_source_text_without_a_highlighter() {
+        let theme = Theme::default();
+        let mut rows = Vec::new();
+        render_diff_columns(
+            &["old text remains visible"],
+            &["new text remains visible"],
+            0,
+            1,
+            1,
+            "README",
+            1,
+            0,
+            120,
+            &theme,
+            &mut rows,
+        );
+
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("old text remains visible")));
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("new text remains visible")));
     }
 
     #[test]

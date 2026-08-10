@@ -47,6 +47,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
         session_tabs: Vec::new(),
         access: None,
         sidebar_tasks: None,
+        sidebar_tasks_tab: None,
+        sidebar_agents_tab: None,
         access_rows: Vec::new(),
         sidebar_agents: Vec::new(),
         panel_agents: Vec::new(),
@@ -63,6 +65,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.sidebar_agents = sidebar_hitboxes.agents;
     app.layout.access = sidebar_hitboxes.access.first().copied();
     app.layout.sidebar_tasks = sidebar_hitboxes.tasks;
+    app.layout.sidebar_tasks_tab = sidebar_hitboxes.tasks_tab;
+    app.layout.sidebar_agents_tab = sidebar_hitboxes.agents_tab;
     app.layout.access_rows.clear();
 
     // Main content area

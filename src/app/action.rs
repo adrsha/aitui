@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use crate::api::StreamEvent;
+use crate::app::state::SidebarTab;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
@@ -116,8 +117,10 @@ pub enum Action {
     ChatHalfDown,
     ChatHalfUp,
     ChatScroll(i32),
-    /// Scroll the task list in the sidebar when the pointer is over it.
-    SidebarTaskScroll(i32),
+    /// Scroll the active task/agent list in the sidebar when the pointer is over it.
+    SidebarListScroll(i32),
+    /// Switch the tabbed lower sidebar between checklist tasks and child agents.
+    SelectSidebarTab(SidebarTab),
     /// Expand / collapse the full output of executed tools.
     ToggleOutput,
     /// A left-click in the transcript at (column, row) — toggles the individual

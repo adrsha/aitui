@@ -2813,7 +2813,13 @@ impl App {
                     match progress {
                         SubtaskProgress::Phase(text) => {
                             task.activity = Some(text.clone());
-                            task.log.push(SubtaskLogEntry::Phase { text });
+                            // Native stream adapters may emit ToolCallStarted repeatedly while
+                            // assembling one call. Keep that useful live status transient instead
+                            // of permanently flooding the inline child-agent history with
+                            // hundreds of identical `PHASE Preparing tool: …` rows.
+                            if !text.starts_with("Preparing tool:") {
+                                task.log.push(SubtaskLogEntry::Phase { text });
+                            }
                         }
                         SubtaskProgress::Checklist {
                             done,

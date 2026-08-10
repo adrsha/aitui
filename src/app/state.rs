@@ -41,6 +41,13 @@ pub struct SubtaskHitbox {
     pub area: ratatui::layout::Rect,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SidebarTab {
+    #[default]
+    Tasks,
+    Agents,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PanelLayout {
     /// The transcript rect, cached so the reducer can compute page heights.
@@ -51,6 +58,9 @@ pub struct PanelLayout {
     pub access: Option<AccessHitbox>,
     /// Visible viewport for the scrollable sidebar task list.
     pub sidebar_tasks: Option<ratatui::layout::Rect>,
+    /// Click targets for switching between task and agent sidebar views.
+    pub sidebar_tasks_tab: Option<ratatui::layout::Rect>,
+    pub sidebar_agents_tab: Option<ratatui::layout::Rect>,
     /// Click targets for individual access rules in the sidebar.
     pub access_rows: Vec<AccessHitbox>,
     /// Click targets for child-agent rows in the sidebar.
@@ -362,6 +372,10 @@ pub struct App {
     pub help_scroll: usize,
     /// First rendered row in the sidebar task list.
     pub sidebar_task_scroll: usize,
+    /// First rendered row in the sidebar agent list.
+    pub sidebar_agent_scroll: usize,
+    /// Content currently shown in the tabbed lower sidebar.
+    pub sidebar_tab: SidebarTab,
     pub should_quit: bool,
     pub yank: Option<String>,
     /// The character just typed in insert mode (for the `jk`-style escape chord).
@@ -636,6 +650,8 @@ impl App {
             help_selected: 0,
             help_scroll: 0,
             sidebar_task_scroll: 0,
+            sidebar_agent_scroll: 0,
+            sidebar_tab: SidebarTab::Tasks,
             should_quit: false,
             yank: None,
             last_insert: None,

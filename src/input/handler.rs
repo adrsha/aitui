@@ -842,7 +842,7 @@ fn handle_mouse(app: &App, mouse: MouseEvent) -> Vec<Action> {
     // While a scrollable overlay is open the wheel belongs to that overlay.
     let perm_open = matches!(app.overlay, Overlay::Permission(_));
     let subtask_open = matches!(app.overlay, Overlay::SubtaskDetail { .. });
-    let over_sidebar_tasks = app.layout.sidebar_tasks.is_some_and(|area| {
+    let over_sidebar_list = app.layout.sidebar_tasks.is_some_and(|area| {
         mouse.column >= area.x
             && mouse.column < area.x + area.width
             && mouse.row >= area.y
@@ -853,8 +853,8 @@ fn handle_mouse(app: &App, mouse: MouseEvent) -> Vec<Action> {
         MouseEventKind::ScrollDown if perm_open => vec![Action::AgentPermScrollDown],
         MouseEventKind::ScrollUp if subtask_open => vec![Action::SubtaskDetailUp],
         MouseEventKind::ScrollDown if subtask_open => vec![Action::SubtaskDetailDown],
-        MouseEventKind::ScrollUp if over_sidebar_tasks => vec![Action::SidebarTaskScroll(-3)],
-        MouseEventKind::ScrollDown if over_sidebar_tasks => vec![Action::SidebarTaskScroll(3)],
+        MouseEventKind::ScrollUp if over_sidebar_list => vec![Action::SidebarListScroll(-1)],
+        MouseEventKind::ScrollDown if over_sidebar_list => vec![Action::SidebarListScroll(1)],
         MouseEventKind::ScrollUp => vec![Action::ChatScroll(3)],
         MouseEventKind::ScrollDown => vec![Action::ChatScroll(-3)],
         MouseEventKind::Down(MouseButton::Left) => {
@@ -901,6 +901,29 @@ mod tests {
         app.overlay = Overlay::None;
         app.vim = VimMode::Insert;
         app
+    }
+
+    #[test]
+    fn sidebar_wheel_scrolls_the_active_list_one_row_at_a_time() {
+        let mut app = test_app();
+        app.layout.sidebar_tasks = Some(ratatui::layout::Rect::new(10, 5, 20, 8));
+        let event = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 12,
+                row: 7,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        assert!(matches!(
+            handle_event(&app, event(MouseEventKind::ScrollDown)).as_slice(),
+            [Action::SidebarListScroll(1)]
+        ));
+        app.sidebar_tab = crate::app::state::SidebarTab::Agents;
+        assert!(matches!(
+            handle_event(&app, event(MouseEventKind::ScrollUp)).as_slice(),
+            [Action::SidebarListScroll(-1)]
+        ));
     }
 
     #[test]
