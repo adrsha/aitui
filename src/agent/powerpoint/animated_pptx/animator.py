@@ -195,12 +195,19 @@ def _timing_node(animations: Sequence[tuple[Animation, int]]) -> etree._Element:
     return timing
 
 
-def _insert_before_extension_list(slide_root: etree._Element, node: etree._Element) -> None:
-    extension = slide_root.find("p:extLst", NS)
-    if extension is None:
+def _insert_slide_effect(slide_root: etree._Element, node: etree._Element) -> None:
+    """Insert transition/timing in the order required by CT_Slide."""
+    local_name = etree.QName(node).localname
+    if local_name == "transition":
+        following = slide_root.find("p:timing", NS) or slide_root.find("p:extLst", NS)
+    elif local_name == "timing":
+        following = slide_root.find("p:extLst", NS)
+    else:  # Internal invariant: this helper is only for CT_Slide effect children.
+        raise ValueError(f"unsupported slide effect node: {local_name}")
+    if following is None:
         slide_root.append(node)
     else:
-        extension.addprevious(node)
+        following.addprevious(node)
 
 
 def apply_slide_effects(
@@ -234,7 +241,7 @@ def apply_slide_effects(
         if existing_timing is not None:
             root.remove(existing_timing)
         if resolved:
-            _insert_before_extension_list(root, _timing_node(resolved))
+            _insert_slide_effect(root, _timing_node(resolved))
     if replace_transition:
         existing_transition = root.find("p:transition", NS)
         if existing_transition is not None:
@@ -244,7 +251,7 @@ def apply_slide_effects(
             transition = _p("transition")
             transition.set("spd", "med")
             _sub(transition, child_tag, **child_attributes)
-            _insert_before_extension_list(root, transition)
+            _insert_slide_effect(root, transition)
 
 
 def apply_animations(

@@ -497,7 +497,7 @@ fn run(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String>
             ))
         }
 
-        Some(ToolKind::PowerPoint) => generate_powerpoint(call, cwd),
+        Some(ToolKind::PowerPoint) => generate_powerpoint(call, cwd, abort),
 
         // These are intercepted by the app layer and never reach the executor;
         // handled here only for match exhaustiveness.
@@ -512,7 +512,9 @@ fn run(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String>
     }
 }
 
-fn generate_powerpoint(call: &ToolCall, cwd: &Path) -> Result<String, String> {
+const POWERPOINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+fn generate_powerpoint(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String> {
     let operation = call
         .args
         .get("operation")
@@ -532,6 +534,9 @@ fn generate_powerpoint(call: &ToolCall, cwd: &Path) -> Result<String, String> {
         .and_then(|value| value.as_str());
     if operation != "inspect" {
         let output_path = output_path.ok_or("powerpoint: missing 'output_path'")?;
+        if output_path.trim().is_empty() {
+            return Err("powerpoint: output_path must be a non-empty string".into());
+        }
         if !output_path.to_ascii_lowercase().ends_with(".pptx") {
             return Err("powerpoint: output_path must end in .pptx".into());
         }
@@ -542,6 +547,9 @@ fn generate_powerpoint(call: &ToolCall, cwd: &Path) -> Result<String, String> {
             .get("input_path")
             .and_then(|value| value.as_str())
             .ok_or("powerpoint: inspect requires 'input_path'")?;
+        if input_path.trim().is_empty() {
+            return Err("powerpoint: input_path must be a non-empty string".into());
+        }
         if !input_path.to_ascii_lowercase().ends_with(".pptx") {
             return Err("powerpoint: input_path must end in .pptx".into());
         }
@@ -591,6 +599,64 @@ fn generate_powerpoint(call: &ToolCall, cwd: &Path) -> Result<String, String> {
             serde_json::Value::String(destination.to_string_lossy().to_string()),
         );
     }
+    let use_native_engine = request
+        .remove("engine")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .is_some_and(|engine| engine == "native")
+        || std::env::var("AITUI_POWERPOINT_ENGINE").as_deref() == Ok("native");
+    if use_native_engine {
+        if operation == "inspect" {
+            let input_path = request
+                .get("input_path")
+                .and_then(|value| value.as_str())
+                .ok_or("powerpoint: inspect requires 'input_path'")?;
+            let inspection = crate::agent::powerpoint::inspect_native(Path::new(input_path))
+                .map_err(|error| format!("powerpoint: native inspect failed: {error}"))?;
+            return serde_json::to_string_pretty(&inspection)
+                .map_err(|error| format!("powerpoint: cannot format inspection: {error}"));
+        }
+        let empty_modifiers = request
+            .get("modifiers")
+            .and_then(|value| value.as_array())
+            .is_some_and(Vec::is_empty)
+            && request
+                .get("package_modifiers")
+                .and_then(|value| value.as_array())
+                .is_none_or(Vec::is_empty);
+        if operation == "edit" && empty_modifiers {
+            let output_path = request
+                .get("output_path")
+                .and_then(|value| value.as_str())
+                .ok_or("powerpoint: edit requires 'output_path'")?;
+            let input_path = request
+                .get("input_path")
+                .and_then(|value| value.as_str())
+                .unwrap_or(output_path);
+            let result = crate::agent::powerpoint::open_save_native(
+                Path::new(input_path),
+                Path::new(output_path),
+            )
+            .map_err(|error| format!("powerpoint: native open-save failed: {error}"))?;
+            let slide_count = result
+                .get("slides")
+                .and_then(|value| value.as_u64())
+                .ok_or("powerpoint: native open-save omitted slide count")?;
+            let destination = destination
+                .as_ref()
+                .ok_or("powerpoint: native open-save has no destination")?;
+            crate::agent::file_cache::invalidate(destination);
+            return Ok(format!(
+                "PowerPoint edit completed: {} ({} slide{}, native preservation-checked open-save)",
+                destination.display(),
+                slide_count,
+                if slide_count == 1 { "" } else { "s" }
+            ));
+        }
+        return Err(format!(
+            "powerpoint: native Rust engine does not yet support '{operation}' with the requested changes; omit engine=native to use the compatibility fallback"
+        ));
+    }
+
     let payload = serde_json::to_vec(request)
         .map_err(|error| format!("powerpoint: cannot serialize request: {error}"))?;
 
@@ -619,6 +685,11 @@ fn generate_powerpoint(call: &ToolCall, cwd: &Path) -> Result<String, String> {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -631,9 +702,7 @@ fn generate_powerpoint(call: &ToolCall, cwd: &Path) -> Result<String, String> {
                 .write_all(&payload)
                 .map_err(|error| format!("powerpoint: cannot send request: {error}"))?;
         }
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("powerpoint: generator failed to run: {error}"))?;
+        let output = wait_for_powerpoint(child, abort, POWERPOINT_TIMEOUT)?;
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if error.contains("No module named 'pptx'")
@@ -651,6 +720,12 @@ fn generate_powerpoint(call: &ToolCall, cwd: &Path) -> Result<String, String> {
         }
         let response: serde_json::Value = serde_json::from_slice(&output.stdout)
             .map_err(|error| format!("powerpoint: invalid generator response: {error}"))?;
+        if response.get("ok").and_then(|value| value.as_bool()) != Some(true) {
+            return Err(format!(
+                "powerpoint: generator returned an unsuccessful response: {}",
+                truncate(response.to_string(), 1000)
+            ));
+        }
         if operation == "inspect" {
             let inspection = response
                 .get("inspection")
@@ -665,6 +740,29 @@ fn generate_powerpoint(call: &ToolCall, cwd: &Path) -> Result<String, String> {
         let destination = destination
             .as_ref()
             .ok_or("powerpoint: generator response has no destination")?;
+        let metadata = fs::metadata(destination).map_err(|error| {
+            format!(
+                "powerpoint: generator reported success but {} is unavailable: {error}",
+                destination.display()
+            )
+        })?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(format!(
+                "powerpoint: generator reported success but {} is not a non-empty file",
+                destination.display()
+            ));
+        }
+        let reported_path = response
+            .get("path")
+            .and_then(|value| value.as_str())
+            .ok_or("powerpoint: generator response omitted output path")?;
+        if Path::new(reported_path) != destination {
+            return Err(format!(
+                "powerpoint: generator response path mismatch (expected {}, got {})",
+                destination.display(),
+                reported_path
+            ));
+        }
         crate::agent::file_cache::invalidate(destination);
         return Ok(format!(
             "PowerPoint {operation} completed: {} ({} slide{})",
@@ -676,6 +774,55 @@ fn generate_powerpoint(call: &ToolCall, cwd: &Path) -> Result<String, String> {
     Err(format!(
         "powerpoint: Python 3 with python-pptx and lxml is required ({last_error})"
     ))
+}
+
+fn wait_for_powerpoint(
+    child: std::process::Child,
+    abort: &ToolAbort,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let kill = || {
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .arg("-9")
+                .arg(format!("-{pid}"))
+                .output();
+        }
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if abort.load(Ordering::Relaxed) {
+            kill();
+            return Err("Cancelled by user".into());
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(result) => {
+                return result
+                    .map_err(|error| format!("powerpoint: generator failed to run: {error}"))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() >= deadline => {
+                kill();
+                return Err(format!(
+                    "powerpoint: generator timed out after {}s and was killed",
+                    timeout.as_secs()
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("powerpoint: generator waiter thread died".into())
+            }
+        }
+    }
 }
 
 /// Resolve the `from`/`to` (aliases `source`/`dest`/`destination`) path args.
@@ -2106,6 +2253,59 @@ mod tests {
         assert_eq!(result["slides"][0]["shapes"][0]["text"], "Inspectable");
         assert_eq!(result["preservation"]["source_mutated"], false);
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn specialized_powerpoint_native_open_save_preserves_imported_deck() {
+        let dir = std::env::temp_dir().join(format!(
+            "aitui_powerpoint_native_open_save_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let create = make_call(
+            "specialized",
+            serde_json::json!({
+                "action": "powerpoint", "operation": "create",
+                "output_path": "source.pptx",
+                "slides": [{
+                    "elements": [{
+                        "id": "animated", "type": "text", "x": 1, "y": 1,
+                        "width": 5, "height": 1, "text": "Imported animation"
+                    }],
+                    "animations": [{
+                        "type": "fade_in", "target": "animated", "order": 0
+                    }],
+                    "transition": "fade"
+                }]
+            }),
+        );
+        let created = execute(create, &dir);
+        assert!(created.is_ok(), "{}", created.text());
+        let source = dir.join("source.pptx");
+        let source_bytes = std::fs::read(&source).unwrap();
+        let before = crate::agent::powerpoint::inspect_native(&source).unwrap();
+        assert_eq!(before["slides"][0]["animations"]["present"], true);
+        assert_eq!(before["slides"][0]["transition"]["present"], true);
+
+        let edit = make_call(
+            "specialized",
+            serde_json::json!({
+                "action": "powerpoint", "operation": "edit", "engine": "native",
+                "input_path": "source.pptx", "output_path": "saved.pptx",
+                "modifiers": []
+            }),
+        );
+        let edited = execute(edit, &dir);
+        assert!(edited.is_ok(), "{}", edited.text());
+        assert!(edited
+            .text()
+            .contains("native preservation-checked open-save"));
+        let after = crate::agent::powerpoint::inspect_native(&dir.join("saved.pptx")).unwrap();
+        assert_eq!(after["presentation"], before["presentation"]);
+        assert_eq!(after["slides"], before["slides"]);
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
         let _ = std::fs::remove_dir_all(dir);
     }
 

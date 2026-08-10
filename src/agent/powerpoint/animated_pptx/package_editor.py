@@ -24,7 +24,9 @@ PACKAGE_OPERATIONS = frozenset({
     "put_relationship", "delete_relationship",
     "set_content_type", "delete_content_type",
 })
-_XML_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
+_XML_PARSER = etree.XMLParser(
+    resolve_entities=False, no_network=True, load_dtd=False, recover=False, huge_tree=False
+)
 
 
 def _part_name(value: Any, *, allow_root: bool = False) -> str:

@@ -135,8 +135,8 @@ such as charts, diagrams, OLE objects, and media produce structured warnings.
 Inspection validates the OPC package and relationship graph, opens the deck only
 for reading, never calls `save`, and does not invalidate the source file cache.
 Its preservation result explicitly reports that no source rewrite occurred.
-Stable-selector edits are intentionally reported as unavailable until the next
-increment wires these selectors into edit modifiers.
+Stable native slide and shape selectors are supported by high-level edit modifiers;
+legacy zero-based indices and shape names remain available for compatibility.
 
 ## Advanced OPC/OOXML escape hatch
 

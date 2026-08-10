@@ -44,6 +44,10 @@ lsp-types  = "0.97"
 
 regex      = "1"
 
+# Native PowerPoint engine (pure Rust OOXML package + high-level presentation model).
+pptx       = "0.1"
+quick-xml  = "0.39"
+
 # Syntax highlighting for code / file previews (tree-sitter grammars).
 tree-sitter            = "0.25"
 tree-sitter-highlight  = "0.25"

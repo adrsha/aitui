@@ -17,7 +17,13 @@ PML_NAMESPACE = "http://schemas.openxmlformats.org/presentationml/2006/main"
 RELATIONSHIPS_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/relationships"
 CONTENT_TYPES_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/content-types"
 NS = {"p": PML_NAMESPACE}
-_XML_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
+_XML_PARSER = etree.XMLParser(
+    resolve_entities=False, no_network=True, load_dtd=False, recover=False, huge_tree=False
+)
+MAX_PACKAGE_MEMBERS = 20_000
+MAX_MEMBER_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+MAX_PACKAGE_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
+MAX_XML_BYTES = 64 * 1024 * 1024
 
 
 class PresentationValidationError(ValueError):
@@ -25,6 +31,10 @@ class PresentationValidationError(ValueError):
 
 
 def _parse_xml(data: bytes, member: str) -> etree._Element:
+    if len(data) > MAX_XML_BYTES:
+        raise PresentationValidationError(
+            f"package XML member is too large to validate safely: {member}"
+        )
     try:
         return etree.fromstring(data, parser=_XML_PARSER)
     except etree.XMLSyntaxError as error:
@@ -159,6 +169,23 @@ def validate_package(path: str | Path, expected_slide_count: int | None = None) 
     try:
         with ZipFile(file_path) as archive:
             infos = archive.infolist()
+            if len(infos) > MAX_PACKAGE_MEMBERS:
+                raise PresentationValidationError(
+                    f"presentation contains too many ZIP members: {len(infos)}"
+                )
+            total_uncompressed = sum(info.file_size for info in infos)
+            if total_uncompressed > MAX_PACKAGE_UNCOMPRESSED_BYTES:
+                raise PresentationValidationError(
+                    "presentation is too large to validate safely"
+                )
+            oversized = next(
+                (info.filename for info in infos if info.file_size > MAX_MEMBER_UNCOMPRESSED_BYTES),
+                None,
+            )
+            if oversized is not None:
+                raise PresentationValidationError(
+                    f"presentation ZIP member is too large to validate safely: {oversized}"
+                )
             names = [info.filename for info in infos]
             if len(names) != len(set(names)):
                 raise PresentationValidationError("presentation contains duplicate ZIP members")
@@ -228,11 +255,26 @@ def validate_presentation(path: str | Path, slides: Sequence[Slide]) -> None:
                 raise PresentationValidationError(
                     f"slide {index} XML is missing: {error}"
                 ) from error
-            if slide.animations and root.find("p:timing", NS) is None:
+            timing = root.find("p:timing", NS)
+            transition = root.find("p:transition", NS)
+            if slide.animations and timing is None:
                 raise PresentationValidationError(
                     f"slide {index} is missing required p:timing animation XML"
                 )
-            if slide.transition and root.find("p:transition", NS) is None:
+            if slide.transition and transition is None:
                 raise PresentationValidationError(
                     f"slide {index} is missing required p:transition XML"
                 )
+            if timing is not None:
+                targets = timing.findall(".//p:spTgt", NS)
+                if len(targets) != len(slide.animations):
+                    raise PresentationValidationError(
+                        f"slide {index} animation target count mismatch: expected "
+                        f"{len(slide.animations)}, got {len(targets)}"
+                    )
+            if transition is not None and timing is not None:
+                children = list(root)
+                if children.index(transition) > children.index(timing):
+                    raise PresentationValidationError(
+                        f"slide {index} transition must precede timing in CT_Slide"
+                    )

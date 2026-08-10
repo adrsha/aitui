@@ -10,6 +10,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+mod native;
+
+pub use native::{inspect as inspect_native, open_save as open_save_native};
+
 static MATERIALIZE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 const PACKAGE_FILES: &[(&str, &str)] = &[
