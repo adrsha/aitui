@@ -85,6 +85,9 @@ pub struct VerificationSummary {
     pub status: &'static str,
     pub findings: Vec<ConsensusFinding>,
     pub unresolved: Vec<String>,
+    /// Per-attempt transport, parsing, and evidence-validation outcomes. Empty
+    /// when reconciliation is used directly without running replicas.
+    pub diagnostics: Vec<String>,
 }
 
 pub fn parse_and_validate(
@@ -191,9 +194,14 @@ pub fn reconcile(reports: &[ChildReport], checks: &[CheckSpec]) -> VerificationS
             };
             *counts.entry(key).or_default() += 1;
         }
-        let accepted = [("yes", FindingAnswer::Yes), ("no", FindingAnswer::No)]
-            .into_iter()
-            .find(|(key, _)| counts.get(key).copied().unwrap_or(0) >= 2);
+        let accepted = [
+            ("yes", FindingAnswer::Yes),
+            ("no", FindingAnswer::No),
+            ("mixed", FindingAnswer::Mixed),
+            ("unknown", FindingAnswer::Unknown),
+        ]
+        .into_iter()
+        .find(|(key, _)| counts.get(key).copied().unwrap_or(0) >= 2);
         if let Some((key, answer)) = accepted {
             if let Some(source) = candidates.iter().find(|finding| finding.answer == answer) {
                 findings.push(ConsensusFinding {
@@ -219,6 +227,7 @@ pub fn reconcile(reports: &[ChildReport], checks: &[CheckSpec]) -> VerificationS
         },
         findings,
         unresolved,
+        diagnostics: Vec::new(),
     }
 }
 
@@ -307,6 +316,34 @@ mod tests {
         );
         assert_eq!(summary.status, "unresolved");
         assert_eq!(summary.unresolved, vec!["x"]);
+    }
+
+    #[test]
+    fn matching_mixed_and_unknown_answers_are_consensus() {
+        let checks = vec![CheckSpec {
+            id: "x".into(),
+            question: "is x true?".into(),
+        }];
+        let report = |answer| ChildReport {
+            schema: "aitui.child-report.v1".into(),
+            status: ReportStatus::Complete,
+            findings: vec![Finding {
+                check_id: "x".into(),
+                answer,
+                statement: "checked".into(),
+                evidence: vec![EvidenceRef::Command {
+                    command: "cargo test".into(),
+                    exit_code: 0,
+                    output_excerpt: "ok".into(),
+                }],
+            }],
+            uncertainties: Vec::new(),
+        };
+        for answer in [FindingAnswer::Mixed, FindingAnswer::Unknown] {
+            let summary = reconcile(&[report(answer.clone()), report(answer.clone())], &checks);
+            assert_eq!(summary.status, "verified");
+            assert_eq!(summary.findings[0].answer, answer);
+        }
     }
 
     #[test]

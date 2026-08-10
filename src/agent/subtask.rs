@@ -130,41 +130,66 @@ async fn run_verified(spec: &SubtaskSpec) -> Result<String, String> {
     let mut replicas = FuturesUnordered::new();
     for replica in 1..=2 {
         let child = replica_spec(spec, replica, false);
-        replicas.push(async move { run_inner(&child, 0, None).await });
+        replicas.push(async move { (replica, run_inner(&child, 0, None).await) });
     }
+    let mut diagnostics = Vec::new();
     let mut reports = Vec::new();
-    while let Some(output) = replicas.next().await {
-        if let Ok(text) = output {
-            if let Ok(report) =
-                crate::agent::report::parse_and_validate(&text, &spec.checks, &spec.cwd)
-            {
-                reports.push(report);
+    while let Some((replica, output)) = replicas.next().await {
+        match output {
+            Ok(text) => {
+                match crate::agent::report::parse_and_validate(&text, &spec.checks, &spec.cwd) {
+                    Ok(report) => {
+                        diagnostics.push(format!("replica {}: valid report", replica));
+                        reports.push(report);
+                    }
+                    Err(error) => {
+                        diagnostics.push(format!("replica {}: invalid report: {}", replica, error))
+                    }
+                }
+            }
+            Err(error) => {
+                diagnostics.push(format!("replica {}: execution failed: {}", replica, error))
             }
         }
     }
     let mut summary = crate::agent::report::reconcile(&reports, &spec.checks);
     if !summary.unresolved.is_empty() {
         let third = replica_spec(spec, 3, false);
-        if let Ok(text) = run_inner(&third, 0, None).await {
-            if let Ok(report) =
-                crate::agent::report::parse_and_validate(&text, &spec.checks, &spec.cwd)
-            {
-                reports.push(report);
-                summary = crate::agent::report::reconcile(&reports, &spec.checks);
+        match run_inner(&third, 0, None).await {
+            Ok(text) => {
+                match crate::agent::report::parse_and_validate(&text, &spec.checks, &spec.cwd) {
+                    Ok(report) => {
+                        diagnostics.push("replica 3: valid report".into());
+                        reports.push(report);
+                        summary = crate::agent::report::reconcile(&reports, &spec.checks);
+                    }
+                    Err(error) => diagnostics.push(format!("replica 3: invalid report: {}", error)),
+                }
             }
+            Err(error) => diagnostics.push(format!("replica 3: execution failed: {}", error)),
         }
     }
     if !summary.unresolved.is_empty() {
         let verifier = verifier_spec(spec, &summary.unresolved, &reports);
-        if let Ok(text) = run_inner(&verifier, 0, None).await {
-            if let Ok(report) =
-                crate::agent::report::parse_and_validate(&text, &spec.checks, &spec.cwd)
-            {
-                reports.push(report);
-                summary = crate::agent::report::reconcile(&reports, &spec.checks);
+        match run_inner(&verifier, 0, None).await {
+            Ok(text) => {
+                match crate::agent::report::parse_and_validate(&text, &spec.checks, &spec.cwd) {
+                    Ok(report) => {
+                        diagnostics.push("independent verifier: valid report".into());
+                        reports.push(report);
+                        summary = crate::agent::report::reconcile(&reports, &spec.checks);
+                    }
+                    Err(error) => {
+                        diagnostics.push(format!("independent verifier: invalid report: {}", error))
+                    }
+                }
+            }
+            Err(error) => {
+                diagnostics.push(format!("independent verifier: execution failed: {}", error))
             }
         }
     }
+    summary.diagnostics = diagnostics;
     serde_json::to_string(&summary).map_err(|error| error.to_string())
 }
 
