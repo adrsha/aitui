@@ -268,7 +268,7 @@ fn render_message_separator(
         _ => theme.gutter_assistant,
     };
     let duration = msg.duration_ms.map(fmt_duration_ms);
-    let time_str = msg.created_at.and_then(|ts| fmt_time(ts));
+    let time_str = msg.created_at.and_then(fmt_time);
     let label = match (role, duration.as_deref(), time_str) {
         ("user", _, Some(ref t)) => {
             format!(" {} {} {} ", symbol, t, duration.as_deref().unwrap_or(""))
@@ -310,7 +310,7 @@ fn fmt_time(unix_secs: u64) -> Option<String> {
     let hours_24 = total_minutes / 60;
     let minutes = total_minutes % 60;
     let period = if hours_24 < 12 { "am" } else { "pm" };
-    let hours_12 = if hours_24 % 12 == 0 {
+    let hours_12 = if hours_24.is_multiple_of(12) {
         12
     } else {
         hours_24 % 12
@@ -450,17 +450,199 @@ fn render_text_segment(
 ) {
     let indent = "  ";
     let mut rows = Vec::new();
-    render_markdown(
-        text,
-        mi,
-        width.saturating_sub(indent.len()).max(1),
-        theme,
-        &mut rows,
-    );
+    let reports = crate::agent::report::verification_reports(text);
+    if reports.is_empty() {
+        render_markdown(
+            text,
+            mi,
+            width.saturating_sub(indent.len()).max(1),
+            theme,
+            &mut rows,
+        );
+    } else {
+        let mut cursor = 0;
+        for matched in reports {
+            let before = &text[cursor..matched.start];
+            let (prose, label) = verification_report_label(before);
+            if !prose.trim().is_empty() {
+                render_markdown(
+                    prose.trim_end(),
+                    mi,
+                    width.saturating_sub(indent.len()).max(1),
+                    theme,
+                    &mut rows,
+                );
+            }
+            render_verification_report(
+                label.as_deref(),
+                &matched.report,
+                mi,
+                width.saturating_sub(indent.len()).max(1),
+                theme,
+                &mut rows,
+            );
+            cursor = matched.end;
+        }
+        if !text[cursor..].trim().is_empty() {
+            render_markdown(
+                text[cursor..].trim_start(),
+                mi,
+                width.saturating_sub(indent.len()).max(1),
+                theme,
+                &mut rows,
+            );
+        }
+    }
     for mut row in rows {
         row.line.spans.insert(0, Span::raw(indent));
         row.plain = format!("{}{}", indent, row.plain);
         out.push(row);
+    }
+}
+
+fn verification_report_label(text: &str) -> (&str, Option<String>) {
+    let trimmed = text.trim_end();
+    let line_start = trimmed.rfind('\n').map_or(0, |index| index + 1);
+    let candidate = trimmed[line_start..].trim();
+    let lower = candidate.to_ascii_lowercase();
+    let is_agent_label = lower.starts_with("agent ")
+        && (lower.ends_with("(completed):")
+            || lower.ends_with("(unresolved):")
+            || lower.ends_with("(failed):"));
+    if is_agent_label {
+        (
+            &trimmed[..line_start],
+            Some(candidate.trim_end_matches(':').to_string()),
+        )
+    } else {
+        (text, None)
+    }
+}
+
+fn render_verification_report(
+    label: Option<&str>,
+    report: &crate::agent::report::VerificationDisplayReport,
+    mi: usize,
+    width: usize,
+    theme: &Theme,
+    out: &mut Vec<RenderedLine>,
+) {
+    use crate::agent::report::FindingAnswer;
+
+    let (icon, title, color) = match report.status.as_str() {
+        "verified" => ("✓", "VERIFIED", theme.success),
+        "partially_verified" => ("!", "PARTIALLY VERIFIED", theme.warning),
+        "unresolved" => ("?", "UNRESOLVED", theme.warning),
+        "failed" => ("×", "FAILED", theme.danger),
+        _ => ("?", "UNKNOWN", theme.muted),
+    };
+    let subject = label.unwrap_or("Verification report");
+    let header = format!(" {} {}  {} ", icon, title, subject);
+    out.push(RenderedLine::new(
+        Line::from(vec![
+            Span::styled(
+                format!(" {} {} ", icon, title),
+                Style::default()
+                    .bg(color)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {} ", subject),
+                Style::default()
+                    .fg(theme.text)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        header,
+        mi,
+    ));
+
+    for finding in &report.findings {
+        let (glyph, answer, answer_color) = match finding.answer {
+            FindingAnswer::Yes => ("✓", "YES", theme.success),
+            FindingAnswer::No => ("×", "NO", theme.danger),
+            FindingAnswer::Mixed => ("◐", "MIXED", theme.warning),
+            FindingAnswer::Unknown => ("?", "UNKNOWN", theme.muted),
+        };
+        let heading = format!("{} {}  {}", glyph, answer, finding.check_id);
+        out.push(RenderedLine::new(
+            Line::from(vec![
+                Span::styled(
+                    format!(" {} {} ", glyph, answer),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(answer_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {}", finding.check_id),
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", finding.support),
+                    Style::default().fg(theme.muted),
+                ),
+            ]),
+            heading,
+            mi,
+        ));
+        for line in wrap_words(&finding.statement, width.saturating_sub(4).max(1)) {
+            out.push(RenderedLine::new(
+                Line::from(vec![
+                    Span::styled("  │ ", Style::default().fg(answer_color)),
+                    Span::styled(line.clone(), Style::default().fg(theme.text)),
+                ]),
+                format!("  │ {}", line),
+                mi,
+            ));
+        }
+        if !finding.evidence.is_empty() {
+            let evidence = format!("Evidence: {}", finding.evidence.join(" · "));
+            for line in wrap_words(&evidence, width.saturating_sub(4).max(1)) {
+                out.push(RenderedLine::new(
+                    Line::from(vec![
+                        Span::styled("  └ ", Style::default().fg(answer_color)),
+                        Span::styled(line.clone(), Style::default().fg(theme.muted)),
+                    ]),
+                    format!("  └ {}", line),
+                    mi,
+                ));
+            }
+        }
+    }
+
+    if !report.unresolved.is_empty() {
+        let text = format!("Unresolved checks: {}", report.unresolved.join(", "));
+        out.push(RenderedLine::new(
+            Line::from(vec![
+                Span::styled(
+                    " ? UNRESOLVED ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {}", report.unresolved.join(", ")),
+                    Style::default().fg(theme.warning),
+                ),
+            ]),
+            text,
+            mi,
+        ));
+    }
+    if !report.diagnostics.is_empty() {
+        let text = format!("{} diagnostic note(s)", report.diagnostics.len());
+        out.push(RenderedLine::new(
+            Line::from(Span::styled(
+                format!("  ⚑ {}", text),
+                Style::default().fg(theme.muted),
+            )),
+            text,
+            mi,
+        ));
     }
 }
 
@@ -1195,17 +1377,28 @@ fn render_write_preview(
     }
 }
 
-fn render_source_card(
-    label: &str,
+struct SourceCard<'a> {
+    label: &'a str,
     rail_color: Color,
-    path: &str,
-    code: &str,
+    path: &'a str,
+    code: &'a str,
     start_line: usize,
+}
+
+fn render_source_card(
+    card: SourceCard<'_>,
     mi: usize,
     width: usize,
     theme: &Theme,
     out: &mut Vec<RenderedLine>,
 ) {
+    let SourceCard {
+        label,
+        rail_color,
+        path,
+        code,
+        start_line,
+    } = card;
     let header_plain = format!("█ {}", label);
     out.push(RenderedLine::new(
         Line::from(vec![
@@ -1312,16 +1505,26 @@ fn display_width(text: &str) -> usize {
 /// Below this width the old/new comparison falls back to stacked cards.
 const SIDE_BY_SIDE_MIN_WIDTH: usize = 110;
 
-fn render_edit_comparison(
-    path: &str,
-    old: &str,
-    new: &str,
+struct EditComparison<'a> {
+    path: &'a str,
+    old: &'a str,
+    new: &'a str,
     start_line: usize,
+}
+
+fn render_edit_comparison(
+    comparison: EditComparison<'_>,
     mi: usize,
     width: usize,
     theme: &Theme,
     out: &mut Vec<RenderedLine>,
 ) {
+    let EditComparison {
+        path,
+        old,
+        new,
+        start_line,
+    } = comparison;
     if width >= SIDE_BY_SIDE_MIN_WIDTH {
         let o: Vec<&str> = old.lines().collect();
         let n: Vec<&str> = new.lines().collect();
@@ -1342,11 +1545,13 @@ fn render_edit_comparison(
         return;
     }
     render_source_card(
-        "OLD",
-        theme.danger,
-        path,
-        old,
-        start_line,
+        SourceCard {
+            label: "OLD",
+            rail_color: theme.danger,
+            path,
+            code: old,
+            start_line,
+        },
         mi,
         width,
         theme,
@@ -1354,11 +1559,13 @@ fn render_edit_comparison(
     );
     out.push(RenderedLine::new(Line::default(), String::new(), mi));
     render_source_card(
-        "NEW",
-        theme.success,
-        path,
-        new,
-        start_line,
+        SourceCard {
+            label: "NEW",
+            rail_color: theme.success,
+            path,
+            code: new,
+            start_line,
+        },
         mi,
         width,
         theme,
@@ -1383,6 +1590,9 @@ fn diff_alignment(o: &[&str], n: &[&str]) -> (usize, usize, usize) {
     }
     (p, o.len() - s, n.len() - s)
 }
+
+type DiffCell<'a> = Option<(usize, Option<Color>, &'a str, Option<&'a [Segment]>, Style)>;
+type DiffPlanRow<'a> = (DiffCell<'a>, DiffCell<'a>);
 
 /// Side-by-side old | new diff. Every line has a block and at least one
 /// separating space before its line number: red = removed, green = added,
@@ -1414,10 +1624,7 @@ fn render_diff_columns(
     let new_seg = |i: usize| new_hl.as_ref().and_then(|l| l.get(i).map(Vec::as_slice));
 
     let ctx = Style::default().fg(theme.muted);
-    let mut plan: Vec<(
-        Option<(usize, Option<Color>, &str, Option<&[Segment]>, Style)>,
-        Option<(usize, Option<Color>, &str, Option<&[Segment]>, Style)>,
-    )> = Vec::new();
+    let mut plan: Vec<DiffPlanRow<'_>> = Vec::new();
     for i in 0..p {
         plan.push((
             Some((start_line + i, None, o[i], old_seg(i), ctx)),
@@ -1449,10 +1656,10 @@ fn render_diff_columns(
         });
         plan.push((left, right));
     }
-    for i in removed_end..o.len() {
+    for (i, source) in o.iter().enumerate().skip(removed_end) {
         let new_index = added_end + (i - removed_end);
         plan.push((
-            Some((start_line + i, None, o[i], old_seg(i), ctx)),
+            Some((start_line + i, None, source, old_seg(i), ctx)),
             Some((
                 start_line + new_index,
                 None,
@@ -1516,7 +1723,7 @@ fn render_diff_columns(
 
 /// One column of a side-by-side diff row: optional bar, line number, content.
 fn diff_column_rows(
-    cell: Option<(usize, Option<Color>, &str, Option<&[Segment]>, Style)>,
+    cell: DiffCell<'_>,
     num_width: usize,
     code_w: usize,
 ) -> Vec<(Vec<Span<'static>>, String)> {
@@ -1955,6 +2162,7 @@ fn render_agent_result(
     let icon = match state {
         "running" => "◐",
         "completed" => "●",
+        "unresolved" => "?",
         _ => "×",
     };
     let expanded = show_output || toggled.contains(&(mi, bi));
@@ -1982,7 +2190,7 @@ fn render_agent_result(
     }
 
     let status_color = match state {
-        "running" => theme.warning,
+        "running" | "unresolved" => theme.warning,
         "completed" => theme.success,
         _ => theme.danger,
     };
@@ -2160,18 +2368,39 @@ fn render_agent_result(
     }
 
     if !report.trim().is_empty() {
+        let unresolved =
+            state == "unresolved" || crate::agent::subtask::is_unresolved_report(report.trim());
+        let label = if unresolved {
+            " REVIEW UNRESOLVED "
+        } else {
+            " REVIEW "
+        };
+        let color = if unresolved {
+            theme.warning
+        } else {
+            theme.accent
+        };
         out.push(RenderedLine::new(
             Line::from(Span::styled(
-                " REPORT ",
+                label,
                 Style::default()
-                    .bg(theme.accent)
+                    .bg(color)
                     .fg(Color::Black)
                     .add_modifier(Modifier::BOLD),
             )),
-            "REPORT".into(),
+            label.trim().into(),
             mi,
         ));
-        render_markdown(report.trim(), mi, width.max(1), theme, out);
+        let report = report
+            .trim()
+            .strip_prefix("[agent-outcome:unresolved]")
+            .unwrap_or(report.trim())
+            .trim();
+        if let Some(structured) = crate::agent::report::verification_report(report) {
+            render_verification_report(None, &structured, mi, width.max(1), theme, out);
+        } else {
+            render_markdown(report, mi, width.max(1), theme, out);
+        }
     }
 }
 
@@ -2342,10 +2571,12 @@ fn render_tool_result(
                             .and_then(|value| value.as_u64())
                             .unwrap_or(1) as usize;
                         render_edit_comparison(
-                            path,
-                            old,
-                            new,
-                            start_line,
+                            EditComparison {
+                                path,
+                                old,
+                                new,
+                                start_line,
+                            },
                             mi,
                             width.saturating_sub(TOOL_BODY_INDENT).max(1),
                             theme,
@@ -2359,11 +2590,13 @@ fn render_tool_result(
                             .and_then(|value| value.as_str())
                             .unwrap_or("");
                         render_source_card(
-                            "CONTENT",
-                            theme.success,
-                            path,
-                            content,
-                            1,
+                            SourceCard {
+                                label: "CONTENT",
+                                rail_color: theme.success,
+                                path,
+                                code: content,
+                                start_line: 1,
+                            },
                             mi,
                             width.saturating_sub(TOOL_BODY_INDENT).max(1),
                             theme,
@@ -2445,11 +2678,13 @@ fn render_tool_result(
         if expanded {
             let body_start = out.len();
             render_source_card(
-                "CONTENT",
-                theme.accent,
-                &path,
-                &content,
-                start_line,
+                SourceCard {
+                    label: "CONTENT",
+                    rail_color: theme.accent,
+                    path: &path,
+                    code: &content,
+                    start_line,
+                },
                 mi,
                 width.saturating_sub(TOOL_BODY_INDENT).max(1),
                 theme,
@@ -2805,15 +3040,28 @@ fn render_batch_result(
                     .get_arg("new")
                     .or_else(|| call.get_arg("new_string"))
                     .unwrap_or("");
-                render_edit_comparison(path, old, new, 1, mi, body_width, theme, out);
+                render_edit_comparison(
+                    EditComparison {
+                        path,
+                        old,
+                        new,
+                        start_line: 1,
+                    },
+                    mi,
+                    body_width,
+                    theme,
+                    out,
+                );
             }
             (Some(ToolKind::Write), Some(call)) if child_ok => {
                 render_source_card(
-                    "CONTENT",
-                    theme.success,
-                    call.get_arg("path").unwrap_or(""),
-                    call.get_arg("content").unwrap_or(""),
-                    1,
+                    SourceCard {
+                        label: "CONTENT",
+                        rail_color: theme.success,
+                        path: call.get_arg("path").unwrap_or(""),
+                        code: call.get_arg("content").unwrap_or(""),
+                        start_line: 1,
+                    },
                     mi,
                     body_width,
                     theme,
@@ -2823,11 +3071,13 @@ fn render_batch_result(
             (Some(ToolKind::Read), Some(call)) if child_ok => {
                 let (start_line, content, notes) = read_file_body(section.body);
                 render_source_card(
-                    "CONTENT",
-                    theme.accent,
-                    call.get_arg("path").unwrap_or(""),
-                    &content,
-                    start_line,
+                    SourceCard {
+                        label: "CONTENT",
+                        rail_color: theme.accent,
+                        path: call.get_arg("path").unwrap_or(""),
+                        code: &content,
+                        start_line,
+                    },
                     mi,
                     body_width,
                     theme,
@@ -3674,6 +3924,120 @@ mod tests {
         );
         assert!(rows.iter().any(|row| row.plain.contains("completed 2.3s")));
         assert!(rows.iter().any(|row| row.plain.contains("Done.")));
+    }
+
+    #[test]
+    fn unresolved_agent_card_is_polished_and_hides_internal_marker() {
+        let output = concat!(
+            "[agent-id:9]\n",
+            "[agent-meta] {\"status\":\"unresolved\",\"activity\":\"review unavailable\",\"cwd\":\".\",\"elapsed_ms\":900}\n",
+            "[agent-events]\n",
+            "[agent-report]\n",
+            "[agent-outcome:unresolved]\n## Review unresolved\n\n**Reason:** The provider rejected the child request."
+        );
+        let block = Block::ToolResult {
+            ok: true,
+            name: Some("agent".into()),
+            summary: "agent 7 (\"review\")".into(),
+            output: output.into(),
+        };
+        let mut toggled = HashSet::new();
+        toggled.insert((0, 0));
+        let rows = build(
+            &doc("tool", vec![block]),
+            90,
+            &Theme::default(),
+            &toggled,
+            false,
+            false,
+        );
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("REVIEW UNRESOLVED")));
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("provider rejected")));
+        assert!(!rows.iter().any(|row| row.plain.contains("agent-outcome")));
+        assert!(!rows.iter().any(|row| row.plain.contains("(failed):")));
+    }
+
+    #[test]
+    fn embedded_verification_reports_render_as_status_cards_without_raw_json() {
+        let text = concat!(
+            "All delegated child agents have completed. Reports:\n\n",
+            "agent 1 (completed):\n",
+            "{\"schema\":\"aitui.verification-summary.v1\",\"status\":\"verified\",",
+            "\"findings\":[{\"check_id\":\"latency\",\"answer\":\"yes\",",
+            "\"statement\":\"Avoidable waits were found.\",\"support\":\"2/2 replicas\",",
+            "\"evidence\":[\"src/agent/subtask.rs:201-207\"]}],",
+            "\"unresolved\":[],\"diagnostics\":[]}\n\n---\n\n",
+            "agent 2 (unresolved):\n",
+            "{\"schema\":\"aitui.verification-summary.v1\",\"status\":\"unresolved\",",
+            "\"findings\":[],\"unresolved\":[\"access\"],",
+            "\"diagnostics\":[\"invalid report\"]}"
+        );
+        let rows = build(
+            &doc("user", vec![Block::Markdown(text.into())]),
+            100,
+            &Theme::default(),
+            &HashSet::new(),
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| {
+            row.plain.contains("✓ VERIFIED") && row.plain.contains("agent 1 (completed)")
+        }));
+        assert!(rows.iter().any(|row| row.plain.contains("✓ YES  latency")));
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("Evidence: src/agent/subtask.rs:201-207")));
+        assert!(rows.iter().any(|row| {
+            row.plain.contains("? UNRESOLVED") && row.plain.contains("agent 2 (unresolved)")
+        }));
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("Unresolved checks: access")));
+        assert!(rows
+            .iter()
+            .any(|row| row.plain.contains("1 diagnostic note(s)")));
+        assert!(!rows.iter().any(|row| {
+            row.plain.contains("aitui.verification-summary.v1")
+                || row.plain.contains("\"findings\"")
+        }));
+    }
+
+    #[test]
+    fn agent_report_json_uses_structured_finding_icons() {
+        let output = concat!(
+            "[agent-id:10]\n",
+            "[agent-meta] {\"status\":\"completed\",\"activity\":\"verified\",\"cwd\":\".\",\"elapsed_ms\":500}\n",
+            "[agent-events]\n[agent-report]\n",
+            "{\"schema\":\"aitui.verification-summary.v1\",\"status\":\"verified\",",
+            "\"findings\":[{\"check_id\":\"access\",\"answer\":\"mixed\",",
+            "\"statement\":\"Some paths still need review.\",\"support\":\"2/3 replicas\",",
+            "\"evidence\":[]}],\"unresolved\":[],\"diagnostics\":[]}"
+        );
+        let block = Block::ToolResult {
+            ok: true,
+            name: Some("agent".into()),
+            summary: "agent 3 (\"review\")".into(),
+            output: output.into(),
+        };
+        let mut toggled = HashSet::new();
+        toggled.insert((0, 0));
+        let rows = build(
+            &doc("tool", vec![block]),
+            90,
+            &Theme::default(),
+            &toggled,
+            false,
+            false,
+        );
+        assert!(rows.iter().any(|row| row.plain.contains("✓ VERIFIED")));
+        assert!(rows.iter().any(|row| row.plain.contains("◐ MIXED  access")));
+        assert!(!rows
+            .iter()
+            .any(|row| row.plain.contains("aitui.verification-summary.v1")));
     }
 
     #[test]

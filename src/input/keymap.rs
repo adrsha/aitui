@@ -173,6 +173,7 @@ pub struct Keymap {
     pub scroll_half_down: KeySpec,
     pub scroll_half_up: KeySpec,
     pub toggle_output: KeySpec,
+    pub paste_clipboard: KeySpec,
     // Normal mode
     pub insert: KeySpec,
     pub command: KeySpec,
@@ -220,6 +221,7 @@ impl Keymap {
             scroll_half_down: p(&k.scroll_half_down, &d.scroll_half_down),
             scroll_half_up: p(&k.scroll_half_up, &d.scroll_half_up),
             toggle_output: p(&k.toggle_output, &d.toggle_output),
+            paste_clipboard: p(&k.paste_clipboard, &d.paste_clipboard),
             insert: p(&k.insert, &d.insert),
             command: p(&k.command, &d.command),
             palette: p(&k.palette, &d.palette),

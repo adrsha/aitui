@@ -1,9 +1,9 @@
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{self, ToolCall, ToolKind};
 use crate::api::models::ApiToolCall;
@@ -15,11 +15,82 @@ const MAX_AGENT_DEPTH: usize = 2;
 const MAX_CHILDREN_PER_BATCH: usize = 12;
 /// Retry transient model-stream failures twice before failing the child.
 const MAX_STREAM_ATTEMPTS: usize = 3;
+static CHILD_ACCESS_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 type PendingChild<'a> = (ToolCall, ApiToolCall, BoxFuture<'a, Result<String, String>>);
 
 fn result_text(result: &Result<String, String>) -> String {
     result.clone().unwrap_or_else(|error| error)
+}
+
+const UNRESOLVED_MARKER: &str = "[agent-outcome:unresolved]";
+
+/// Turn provider, stream, timeout, and harness failures into a stable child
+/// outcome. Raw provider payloads must never become the child review shown to
+/// the user or injected into the parent model's synthesis prompt.
+pub(crate) fn unresolved_report(error: &str) -> String {
+    let reason = unresolved_reason(error);
+    format!(
+        "{UNRESOLVED_MARKER}\n## Review unresolved\n\nThe child agent could not produce a trustworthy review.\n\n**Reason:** {reason}"
+    )
+}
+
+pub(crate) fn is_unresolved_report(text: &str) -> bool {
+    text.trim_start().starts_with(UNRESOLVED_MARKER)
+}
+
+fn unresolved_reason(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("no tool output found for function call") {
+        return "The provider rejected the child continuation because a required tool result was missing.".into();
+    }
+    if lower.contains("hard request limit") {
+        return "The child exhausted its request budget before it could synthesize a final review."
+            .into();
+    }
+    if lower.contains("absolute deadline") || lower.contains("duration limit") {
+        return "The child reached its time limit before final synthesis completed.".into();
+    }
+    if lower.contains("progress lease") || lower.contains("leaseexpired") {
+        return "The child stopped making progress before it could finish the review.".into();
+    }
+    if lower.contains("without any output") || lower.contains("returned no report") {
+        return "The model returned no usable review content.".into();
+    }
+    if lower.contains("depth limit") {
+        return "The delegated review exceeded the child-agent depth limit.".into();
+    }
+    if lower.contains("missing 'prompt'") {
+        return "The delegated review did not include a prompt.".into();
+    }
+    if lower.contains("cancelled") || lower.contains("canceled") {
+        return "The review was cancelled before completion.".into();
+    }
+
+    let compact = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first = compact
+        .split("{\"error\"")
+        .next()
+        .unwrap_or(&compact)
+        .trim()
+        .trim_end_matches(':')
+        .trim();
+    let bounded: String = first.chars().take(240).collect();
+    if bounded.is_empty() || lower.contains("api error 400 bad request") {
+        "The provider rejected the child request before a review could be produced.".into()
+    } else {
+        bounded
+    }
+}
+
+fn normalize_child_output(output: Result<String, String>) -> Result<String, String> {
+    match output {
+        Ok(text) if text.trim().is_empty() => Ok(unresolved_report(
+            "Child agent stream ended without any output",
+        )),
+        Ok(text) => Ok(text),
+        Err(error) => Ok(unresolved_report(&error)),
+    }
 }
 
 /// Per-agent tool policy (named agents in `[agents]` config).
@@ -72,6 +143,8 @@ pub struct SubtaskSpec {
     pub prompt: String,
     pub checks: Vec<crate::agent::report::CheckSpec>,
     pub verification: String,
+    /// User-selected response priority. This guides thoroughness; it never sets a deadline.
+    pub urgency: String,
     pub cwd: PathBuf,
     pub model: String,
     pub reasoning_effort: Option<String>,
@@ -90,32 +163,29 @@ pub struct SubtaskSpec {
     pub abort: Option<crate::agent::executor::ToolAbort>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FinalizeReason {
-    SoftRoundLimit,
-    ProgressLeaseExpired,
-    DurationLimit,
-    OperationTimeout,
-}
-
-impl FinalizeReason {
-    fn instruction(self) -> &'static str {
-        match self {
-            Self::SoftRoundLimit => "The soft tool-round budget is exhausted.",
-            Self::ProgressLeaseExpired => "The progress lease expired without new output.",
-            Self::DurationLimit => "The absolute child-agent duration limit was reached.",
-            Self::OperationTimeout => "The latest tool or nested-agent operation timed out.",
+fn urgency_instruction(urgency: &str) -> &'static str {
+    match urgency {
+        "very_urgent" => {
+            "Urgency: very urgent. Prioritize the shortest trustworthy path, avoid optional exploration, and report as soon as the required evidence is sufficient."
+        }
+        "time_sensitive" => {
+            "Urgency: time-sensitive. Be efficient and focused, but perform the checks needed for a reliable answer."
+        }
+        _ => {
+            "Urgency: best quality. Take as much time as needed to investigate thoroughly, verify important claims, and produce the strongest supported answer."
         }
     }
 }
 
 pub async fn run(spec: SubtaskSpec) {
     let started = Instant::now();
-    let output = if spec.checks.is_empty() || spec.verification == "none" || spec.mock {
-        run_inner(&spec, 0, None).await
-    } else {
-        run_verified(&spec).await
-    };
+    let output = normalize_child_output(
+        if spec.checks.is_empty() || spec.verification == "none" || spec.mock {
+            run_inner(&spec, 0).await
+        } else {
+            run_verified(&spec).await
+        },
+    );
     let _ = spec
         .tx
         .send(SubtaskEvent::Finished {
@@ -130,7 +200,7 @@ async fn run_verified(spec: &SubtaskSpec) -> Result<String, String> {
     let mut replicas = FuturesUnordered::new();
     for replica in 1..=2 {
         let child = replica_spec(spec, replica, false);
-        replicas.push(async move { (replica, run_inner(&child, 0, None).await) });
+        replicas.push(async move { (replica, run_inner(&child, 0).await) });
     }
     let mut diagnostics = Vec::new();
     let mut reports = Vec::new();
@@ -149,20 +219,24 @@ async fn run_verified(spec: &SubtaskSpec) -> Result<String, String> {
                         ));
                         reports.push(report);
                     }
-                    Err(error) => {
-                        diagnostics.push(format!("replica {}: invalid report: {}", replica, error))
-                    }
+                    Err(error) => diagnostics.push(format!(
+                        "replica {}: invalid report: {}",
+                        replica,
+                        unresolved_reason(&error)
+                    )),
                 }
             }
-            Err(error) => {
-                diagnostics.push(format!("replica {}: execution failed: {}", replica, error))
-            }
+            Err(error) => diagnostics.push(format!(
+                "replica {}: unresolved: {}",
+                replica,
+                unresolved_reason(&error)
+            )),
         }
     }
     let mut summary = crate::agent::report::reconcile(&reports, &spec.checks);
     if !summary.unresolved.is_empty() {
         let third = replica_spec(spec, 3, false);
-        match run_inner(&third, 0, None).await {
+        match run_inner(&third, 0).await {
             Ok(text) => {
                 match crate::agent::report::parse_and_validate_detailed(
                     &text,
@@ -174,15 +248,21 @@ async fn run_verified(spec: &SubtaskSpec) -> Result<String, String> {
                         reports.push(report);
                         summary = crate::agent::report::reconcile(&reports, &spec.checks);
                     }
-                    Err(error) => diagnostics.push(format!("replica 3: invalid report: {}", error)),
+                    Err(error) => diagnostics.push(format!(
+                        "replica 3: invalid report: {}",
+                        unresolved_reason(&error)
+                    )),
                 }
             }
-            Err(error) => diagnostics.push(format!("replica 3: execution failed: {}", error)),
+            Err(error) => diagnostics.push(format!(
+                "replica 3: unresolved: {}",
+                unresolved_reason(&error)
+            )),
         }
     }
     if !summary.unresolved.is_empty() {
         let verifier = verifier_spec(spec, &summary.unresolved, &reports);
-        match run_inner(&verifier, 0, None).await {
+        match run_inner(&verifier, 0).await {
             Ok(text) => {
                 match crate::agent::report::parse_and_validate_detailed(
                     &text,
@@ -194,14 +274,16 @@ async fn run_verified(spec: &SubtaskSpec) -> Result<String, String> {
                         reports.push(report);
                         summary = crate::agent::report::reconcile(&reports, &spec.checks);
                     }
-                    Err(error) => {
-                        diagnostics.push(format!("independent verifier: invalid report: {}", error))
-                    }
+                    Err(error) => diagnostics.push(format!(
+                        "independent verifier: invalid report: {}",
+                        unresolved_reason(&error)
+                    )),
                 }
             }
-            Err(error) => {
-                diagnostics.push(format!("independent verifier: execution failed: {}", error))
-            }
+            Err(error) => diagnostics.push(format!(
+                "independent verifier: unresolved: {}",
+                unresolved_reason(&error)
+            )),
         }
     }
     summary.diagnostics = diagnostics;
@@ -239,6 +321,7 @@ fn replica_spec(spec: &SubtaskSpec, replica: usize, verifier: bool) -> SubtaskSp
         ),
         checks: Vec::new(),
         verification: "none".into(),
+        urgency: spec.urgency.clone(),
         cwd: spec.cwd.clone(),
         model: spec.model.clone(),
         reasoning_effort: spec.reasoning_effort.clone(),
@@ -271,24 +354,9 @@ fn verifier_spec(
     verifier
 }
 
-fn run_inner(
-    spec: &SubtaskSpec,
-    depth: usize,
-    inherited_deadline: Option<Instant>,
-) -> BoxFuture<'_, Result<String, String>> {
+fn run_inner(spec: &SubtaskSpec, depth: usize) -> BoxFuture<'_, Result<String, String>> {
     Box::pin(async move {
         let budget = spec.budget.clone().normalized();
-        let started = Instant::now();
-        let max_duration = Duration::from_secs(budget.subagent_max_duration_secs);
-        let final_report_reserve =
-            Duration::from_secs(budget.subagent_operation_timeout_secs).min(max_duration / 2);
-        let own_deadline = started + max_duration;
-        let absolute_deadline = inherited_deadline
-            .map(|deadline| deadline.min(own_deadline))
-            .unwrap_or(own_deadline);
-        let work_deadline = absolute_deadline
-            .checked_sub(final_report_reserve)
-            .unwrap_or(started);
         let role_line = spec
             .role
             .as_deref()
@@ -296,21 +364,23 @@ fn run_inner(
             .unwrap_or_default();
         let system = format!(
             "You are a child agent at depth {}. Do only the delegated task. \
-             Be accurate: verify from primary sources, never guess. Tools: read-only project \
-             tools, web research, build/test/run shell, workflow(todo), workflow(agent). \
-             Never mutate files, ask the user, or touch parent todos. \
+             Be accurate: verify from primary sources, never guess. Tools: project and web \
+             research, build/test/run shell, workflow(todo), workflow(agent). Restricted calls \
+             pause and request access from the user; do not substitute a weaker investigation. \
+             Never ask the user directly or touch parent todos. \
              Delegate only independent parallel work — never work you need before it finishes. \
              Plan first, then batch: state a one-line plan of the files you expect to read, then \
              issue ALL reads in a single message (they run in parallel; results return together). \
+             When independent work needs different tools, issue those calls together too; unrelated \
+             paths execute concurrently, while overlaps and opaque side effects execute sequentially. \
              Never read one file, wait, then read another. Already-read files are served from cache. \
-             Report concisely with file:line refs. \
-             Budget: {}-second lease, {}/{} rounds, {}s cap, depth cap {}. \
-             CWD: {}{}",
+             Report concisely with file:line refs. {} \
+             There is no wall-clock deadline; continue until the task is complete, cancelled, or \
+             the {}/{} round safety budget requires final synthesis. Depth cap {}. CWD: {}{}",
             depth + 1,
-            budget.subagent_lease_secs,
+            urgency_instruction(&spec.urgency),
             budget.subagent_soft_rounds,
             budget.subagent_hard_rounds,
-            budget.subagent_max_duration_secs,
             MAX_AGENT_DEPTH + 1,
             spec.cwd.display(),
             role_line
@@ -326,35 +396,8 @@ fn run_inner(
         let mut pending_children: Vec<PendingChild<'_>> = Vec::new();
 
         loop {
-            if rounds >= budget.subagent_soft_rounds {
-                return force_final_report(
-                    spec,
-                    messages,
-                    FinalizeReason::SoftRoundLimit,
-                    absolute_deadline,
-                    rounds,
-                )
-                .await;
-            }
-            if rounds + 1 >= budget.subagent_hard_rounds {
-                return force_final_report(
-                    spec,
-                    messages,
-                    FinalizeReason::SoftRoundLimit,
-                    absolute_deadline,
-                    rounds,
-                )
-                .await;
-            }
-            if Instant::now() >= work_deadline {
-                return force_final_report(
-                    spec,
-                    messages,
-                    FinalizeReason::DurationLimit,
-                    absolute_deadline,
-                    rounds,
-                )
-                .await;
+            if rounds >= budget.subagent_soft_rounds || rounds + 1 >= budget.subagent_hard_rounds {
+                return force_final_report(spec, messages, rounds).await;
             }
 
             let request = ChatRequest::new(&spec.model, messages.clone())
@@ -373,38 +416,15 @@ fn run_inner(
                     })
                     .await;
             }
-            let response = match collect_stream_with_retry(
+            let response = collect_stream_with_retry(
                 || start_stream(spec, &request),
-                Duration::from_secs(budget.subagent_lease_secs),
-                work_deadline,
                 true,
                 Some((spec.id, &spec.tx)),
             )
             .await
-            {
-                Ok(response) => response,
-                Err(StreamStop::LeaseExpired) => {
-                    return force_final_report(
-                        spec,
-                        messages,
-                        FinalizeReason::ProgressLeaseExpired,
-                        absolute_deadline,
-                        rounds,
-                    )
-                    .await;
-                }
-                Err(StreamStop::DeadlineReached) => {
-                    return force_final_report(
-                        spec,
-                        messages,
-                        FinalizeReason::DurationLimit,
-                        absolute_deadline,
-                        rounds,
-                    )
-                    .await;
-                }
-                Err(StreamStop::Failed(error)) => return Err(error),
-            };
+            .map_err(|stop| match stop {
+                StreamStop::Failed(error) => error,
+            })?;
             let calls = crate::agent::parser::committed_tool_calls(&response);
             if spec.capture {
                 let prose = crate::agent::parser::strip_tool_blocks(&response)
@@ -505,29 +525,9 @@ fn run_inner(
                     {
                         call_index += 1;
                     }
-                    let (wait, _timeout_reason) = operation_wait(&budget, work_deadline);
-                    if wait.is_zero() {
-                        return force_final_report(
-                            spec,
-                            messages,
-                            FinalizeReason::DurationLimit,
-                            absolute_deadline,
-                            rounds,
-                        )
-                        .await;
-                    }
-                    // Launch the batch in the background instead of pausing the
-                    // round: the child keeps running its own tools while the
-                    // nested children work, and joins them at the end of the
-                    // round (before the next model request, which needs their
-                    // reports in context).
-                    let launched = execute_child_batch(
-                        calls[batch_start..call_index].to_vec(),
-                        spec,
-                        depth,
-                        work_deadline,
-                    )
-                    .await;
+                    let launched =
+                        execute_child_batch(calls[batch_start..call_index].to_vec(), spec, depth)
+                            .await;
                     for (index, future) in launched {
                         pending_children.push((
                             calls[batch_start + index].clone(),
@@ -538,22 +538,11 @@ fn run_inner(
                     continue;
                 }
 
-                if is_subtask_parallel_read(&calls[call_index]) {
+                let wave_len =
+                    crate::agent::tools::execution_wave_len(&calls[call_index..], &spec.cwd, 16);
+                if wave_len > 1 {
                     let batch_start = call_index;
-                    while call_index < calls.len() && is_subtask_parallel_read(&calls[call_index]) {
-                        call_index += 1;
-                    }
-                    let (wait, timeout_reason) = operation_wait(&budget, work_deadline);
-                    if wait.is_zero() {
-                        return force_final_report(
-                            spec,
-                            messages,
-                            FinalizeReason::DurationLimit,
-                            absolute_deadline,
-                            rounds,
-                        )
-                        .await;
-                    }
+                    call_index += wave_len;
                     let batch_started = Instant::now();
                     for call in &calls[batch_start..call_index] {
                         let summary = call.summary();
@@ -573,29 +562,19 @@ fn run_inner(
                             })
                             .await;
                     }
-                    let batch = futures_util::future::join_all(
+                    let results = futures_util::future::join_all(
                         calls[batch_start..call_index].iter().map(|call| {
                             execute_child_tool(
                                 call.clone(),
                                 &spec.cwd,
                                 spec.tool_policy.as_ref(),
                                 spec.abort.as_ref(),
+                                Some((spec.id, spec.tx.clone())),
+                                spec.capture,
                             )
                         }),
-                    );
-                    let results = match tokio::time::timeout(wait, batch).await {
-                        Ok(results) => results,
-                        Err(_) => {
-                            return force_final_report(
-                                spec,
-                                messages,
-                                timeout_reason,
-                                absolute_deadline,
-                                rounds,
-                            )
-                            .await;
-                        }
-                    };
+                    )
+                    .await;
                     for ((call, api_call), result) in calls[batch_start..call_index]
                         .iter()
                         .zip(&api_calls[batch_start..call_index])
@@ -651,41 +630,16 @@ fn run_inner(
                             },
                         })
                         .await;
-                    let (wait, timeout_reason) = operation_wait(&budget, work_deadline);
-                    if wait.is_zero() {
-                        return force_final_report(
-                            spec,
-                            messages,
-                            FinalizeReason::DurationLimit,
-                            absolute_deadline,
-                            rounds,
-                        )
-                        .await;
-                    }
                     let tool_started = Instant::now();
-                    let result = match tokio::time::timeout(
-                        wait,
-                        execute_child_tool(
-                            call.clone(),
-                            &spec.cwd,
-                            spec.tool_policy.as_ref(),
-                            spec.abort.as_ref(),
-                        ),
+                    let result = execute_child_tool(
+                        call.clone(),
+                        &spec.cwd,
+                        spec.tool_policy.as_ref(),
+                        spec.abort.as_ref(),
+                        Some((spec.id, spec.tx.clone())),
+                        spec.capture,
                     )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            return force_final_report(
-                                spec,
-                                messages,
-                                timeout_reason,
-                                absolute_deadline,
-                                rounds,
-                            )
-                            .await;
-                        }
-                    };
+                    .await;
                     let _ = spec
                         .tx
                         .send(SubtaskEvent::Progress {
@@ -718,17 +672,6 @@ fn run_inner(
             // Join nested children launched earlier in this round. Their reports
             // become tool results, so the next model request sees them.
             if !pending_children.is_empty() {
-                let (wait, timeout_reason) = operation_wait(&budget, work_deadline);
-                if wait.is_zero() {
-                    return force_final_report(
-                        spec,
-                        messages,
-                        FinalizeReason::DurationLimit,
-                        absolute_deadline,
-                        rounds,
-                    )
-                    .await;
-                }
                 let futures: Vec<_> = pending_children
                     .iter_mut()
                     .map(|(_, _, future)| {
@@ -738,21 +681,7 @@ fn run_inner(
                         )
                     })
                     .collect();
-                let results =
-                    match tokio::time::timeout(wait, futures_util::future::join_all(futures)).await
-                    {
-                        Ok(results) => results,
-                        Err(_) => {
-                            return force_final_report(
-                                spec,
-                                messages,
-                                timeout_reason,
-                                absolute_deadline,
-                                rounds,
-                            )
-                            .await;
-                        }
-                    };
+                let results = futures_util::future::join_all(futures).await;
                 let joined: Vec<(ToolCall, ApiToolCall, Result<String, String>)> =
                     std::mem::take(&mut pending_children)
                         .into_iter()
@@ -777,21 +706,6 @@ fn run_inner(
     })
 }
 
-fn operation_wait(budget: &AgentConfig, deadline: Instant) -> (Duration, FinalizeReason) {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let lease = Duration::from_secs(budget.subagent_lease_secs);
-    let operation = Duration::from_secs(budget.subagent_operation_timeout_secs);
-    let wait = remaining.min(lease).min(operation);
-    let reason = if wait == remaining {
-        FinalizeReason::DurationLimit
-    } else if wait == lease {
-        FinalizeReason::ProgressLeaseExpired
-    } else {
-        FinalizeReason::OperationTimeout
-    };
-    (wait, reason)
-}
-
 fn start_stream(
     spec: &SubtaskSpec,
     request: &ChatRequest,
@@ -810,50 +724,31 @@ fn start_stream(
 async fn force_final_report(
     spec: &SubtaskSpec,
     mut messages: Vec<ChatMessage>,
-    reason: FinalizeReason,
-    deadline: Instant,
     rounds: usize,
 ) -> Result<String, String> {
     if rounds >= spec.budget.clone().normalized().subagent_hard_rounds {
         return Err("Child agent reached its hard request limit before final synthesis".into());
     }
-    messages.push(ChatMessage::user(format!(
-        "{} Stop using tools. Return the best concise final report from gathered evidence; \
-         label uncertainty and incomplete checks; no tool calls.",
-        reason.instruction()
-    )));
+    messages.push(ChatMessage::user(
+        "The soft tool-round budget is exhausted. Stop using tools. Return the best concise final \
+         report from gathered evidence; label uncertainty and incomplete checks; no tool calls.",
+    ));
     let request = ChatRequest::new(&spec.model, messages)
         .with_reasoning(spec.reasoning_effort.clone(), spec.reasoning_mode.clone());
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(format!(
-            "{} No time remained for final synthesis",
-            reason.instruction()
-        ));
-    }
     let response = collect_stream_with_retry(
         || start_stream(spec, &request),
-        remaining,
-        deadline,
         false,
         Some((spec.id, &spec.tx)),
     )
     .await
     .map_err(|stop| match stop {
-        StreamStop::LeaseExpired | StreamStop::DeadlineReached => format!(
-            "{} Final synthesis did not complete before the absolute deadline",
-            reason.instruction()
-        ),
         StreamStop::Failed(error) => error,
     })?;
     let report = crate::agent::parser::strip_tool_blocks(&response)
         .trim()
         .to_string();
     if report.is_empty() {
-        Err(format!(
-            "{} Final synthesis returned no report",
-            reason.instruction()
-        ))
+        Err("Final synthesis returned no report".into())
     } else {
         Ok(report)
     }
@@ -895,7 +790,6 @@ async fn execute_child_batch(
     calls: Vec<ToolCall>,
     parent: &SubtaskSpec,
     depth: usize,
-    deadline: Instant,
 ) -> Vec<(usize, BoxFuture<'static, Result<String, String>>)> {
     if depth >= MAX_AGENT_DEPTH {
         return calls
@@ -905,10 +799,10 @@ async fn execute_child_batch(
                 (
                     index,
                     Box::pin(async {
-                        Err(format!(
+                        Ok(unresolved_report(&format!(
                             "Child-agent depth limit ({}) reached",
                             MAX_AGENT_DEPTH + 1
-                        ))
+                        )))
                     }) as BoxFuture<'_, Result<String, String>>,
                 )
             })
@@ -934,7 +828,7 @@ async fn execute_child_batch(
         if prompt.is_empty() {
             running.push((
                 index,
-                Box::pin(async { Err("agent: missing 'prompt'".to_string()) })
+                Box::pin(async { Ok(unresolved_report("agent: missing 'prompt'")) })
                     as BoxFuture<'_, Result<String, String>>,
             ));
             continue;
@@ -961,6 +855,13 @@ async fn execute_child_batch(
             prompt,
             checks: Vec::new(),
             verification: "none".into(),
+            urgency: call
+                .args
+                .get("urgency")
+                .and_then(|value| value.as_str())
+                .filter(|value| matches!(*value, "very_urgent" | "time_sensitive" | "best_quality"))
+                .unwrap_or(&parent.urgency)
+                .to_string(),
             cwd,
             model: parent.model.clone(),
             reasoning_effort: parent.reasoning_effort.clone(),
@@ -1017,7 +918,7 @@ async fn execute_child_batch(
             index,
             Box::pin(async move {
                 let started = Instant::now();
-                let output = run_inner(&child, depth + 1, Some(deadline)).await;
+                let output = normalize_child_output(run_inner(&child, depth + 1).await);
                 if capture {
                     let _ = child
                         .tx
@@ -1060,38 +961,21 @@ fn execute_local_todo(call: &ToolCall) -> Result<(usize, usize, usize), String> 
 
 #[derive(Debug, PartialEq, Eq)]
 enum StreamStop {
-    LeaseExpired,
-    DeadlineReached,
     Failed(String),
 }
 
 /// Collect the streamed reply. `stop_on_call` returns early the moment a complete
-/// tool call is visible in the text or reasoning: models in interleaved-thinking
-/// mode (Claude Code style) emit their call inside a closed `<thinking>` block and
-/// then stop, waiting for the harness to run it — waiting for `[DONE]` would stall
-/// the child until its lease expired. The caller then runs the committed call and
-/// loops back for the next round.
+/// tool call is visible in the text or reasoning. There is deliberately no child
+/// orchestration timeout: the user-selected urgency guides behavior rather than
+/// imposing a wall-clock deadline.
 async fn collect_stream(
     rx: &mut mpsc::Receiver<StreamEvent>,
-    lease: Duration,
-    deadline: Instant,
     stop_on_call: bool,
     progress: Option<(u64, &mpsc::Sender<SubtaskEvent>)>,
 ) -> Result<String, StreamStop> {
     let mut text = String::new();
     let mut reasoning = String::new();
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(StreamStop::DeadlineReached);
-        }
-        let wait = lease.min(remaining);
-        let event = match tokio::time::timeout(wait, rx.recv()).await {
-            Ok(Some(event)) => event,
-            Ok(None) => break,
-            Err(_) if wait == remaining => return Err(StreamStop::DeadlineReached),
-            Err(_) => return Err(StreamStop::LeaseExpired),
-        };
+    while let Some(event) = rx.recv().await {
         match event {
             StreamEvent::Token(token) => {
                 text.push_str(&token);
@@ -1127,13 +1011,9 @@ async fn collect_stream(
     }
 }
 
-/// Start and collect one model request, retrying transient startup, stream, and
-/// silent-lease failures. The absolute deadline is shared by every attempt, so
-/// retries cannot extend the child agent's wall-clock budget.
+/// Start and collect one model request, retrying transient startup and stream failures.
 async fn collect_stream_with_retry<F>(
     mut start: F,
-    lease: Duration,
-    deadline: Instant,
     stop_on_call: bool,
     progress: Option<(u64, &mpsc::Sender<SubtaskEvent>)>,
 ) -> Result<String, StreamStop>
@@ -1141,23 +1021,15 @@ where
     F: FnMut() -> Result<mpsc::Receiver<StreamEvent>, String>,
 {
     for attempt in 1..=MAX_STREAM_ATTEMPTS {
-        if Instant::now() >= deadline {
-            return Err(StreamStop::DeadlineReached);
-        }
         let result = match start() {
-            Ok(mut rx) => collect_stream(&mut rx, lease, deadline, stop_on_call, progress).await,
+            Ok(mut rx) => collect_stream(&mut rx, stop_on_call, progress).await,
             Err(error) => Err(StreamStop::Failed(error)),
         };
         match result {
             Ok(response) => return Ok(response),
-            Err(StreamStop::DeadlineReached) => return Err(StreamStop::DeadlineReached),
             Err(stop) if attempt < MAX_STREAM_ATTEMPTS => {
                 if let Some((id, tx)) = progress {
-                    let reason = match &stop {
-                        StreamStop::LeaseExpired => "stream produced no progress".to_string(),
-                        StreamStop::Failed(error) => error.clone(),
-                        StreamStop::DeadlineReached => unreachable!(),
-                    };
+                    let StreamStop::Failed(reason) = &stop;
                     let _ = tx
                         .send(SubtaskEvent::Progress {
                             id,
@@ -1186,57 +1058,71 @@ fn stream_has_committed_call(text: &str) -> bool {
     !visible_tool_calls(text).is_empty() || !closed_thinking_calls(text).is_empty()
 }
 
-fn is_subtask_parallel_read(call: &ToolCall) -> bool {
-    matches!(
-        call.kind(),
-        Some(
-            ToolKind::Read
-                | ToolKind::List
-                | ToolKind::Search
-                | ToolKind::WebSearch
-                | ToolKind::WebImages
-                | ToolKind::ReverseImage
-                | ToolKind::WebFetch
-        )
-    )
-}
-
 async fn execute_child_tool(
-    call: ToolCall,
+    mut call: ToolCall,
     cwd: &std::path::Path,
     policy: Option<&ToolPolicy>,
     abort: Option<&crate::agent::executor::ToolAbort>,
+    progress: Option<(u64, mpsc::Sender<SubtaskEvent>)>,
+    can_request_access: bool,
 ) -> Result<String, String> {
     let kind = call.kind();
-    let name = kind.map(|value| value.name()).unwrap_or(&call.name);
+    let name = kind
+        .map(|value| value.name())
+        .unwrap_or(&call.name)
+        .to_string();
     let policy = policy.cloned().unwrap_or_default();
-    if !policy.permits(&call) {
-        let hint = if policy.allow.is_empty() && policy.deny.is_empty() {
-            "Sub-agents are read-only; "
-        } else {
-            "Tool "
-        };
-        return Err(format!("{}'{}' is not allowed", hint, name));
-    }
-    if kind == Some(ToolKind::Shell) {
-        let command = call
-            .args
-            .get("command")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        if !safe_subtask_shell(command) {
-            return Err(
-                "Sub-agent shell is limited to recognized build, test, run, and read-only git commands"
-                    .into(),
-            );
+    let shell_needs_access = kind == Some(ToolKind::Shell)
+        && !safe_subtask_shell(
+            call.args
+                .get("command")
+                .and_then(|value| value.as_str())
+                .unwrap_or(""),
+        );
+    if !policy.permits(&call) || shell_needs_access {
+        if !can_request_access || policy.deny.iter().any(|entry| entry == &name) {
+            return Err(format!(
+                "Tool '{}' is not allowed for this child agent",
+                name
+            ));
         }
+        let Some((id, tx)) = progress.as_ref() else {
+            return Err(format!("Tool '{}' requires access", name));
+        };
+        let request_id = CHILD_ACCESS_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (response, wait) = oneshot::channel();
+        tx.send(SubtaskEvent::AccessRequested {
+            id: *id,
+            request_id,
+            call: call.clone(),
+            cwd: cwd.to_path_buf(),
+            response,
+        })
+        .await
+        .map_err(|_| "Access request channel closed".to_string())?;
+        call = wait
+            .await
+            .map_err(|_| "Access request was cancelled".to_string())??;
     }
     let cwd = cwd.to_path_buf();
     let abort = abort
         .cloned()
         .unwrap_or_else(crate::agent::executor::ToolAbort::default);
+    let summary = call.summary();
+    let progress_name = name.to_string();
     tokio::task::spawn_blocking(move || {
-        let result = agent::execute_abortable(call, &cwd, &abort);
+        let result = agent::execute_abortable_streaming(call, &cwd, &abort, |chunk| {
+            if let Some((id, tx)) = &progress {
+                let _ = tx.try_send(SubtaskEvent::Progress {
+                    id: *id,
+                    progress: SubtaskProgress::ToolOutput {
+                        name: progress_name.clone(),
+                        summary: summary.clone(),
+                        chunk: chunk.to_string(),
+                    },
+                });
+            }
+        });
         result.output
     })
     .await
@@ -1281,7 +1167,9 @@ fn child_tool_schemas(policy: Option<&ToolPolicy>) -> serde_json::Value {
         return serde_json::Value::Array(Vec::new());
     };
     let policy = policy.cloned().unwrap_or_default();
-    let allowed = |kind: &str| policy.permits_kind(kind);
+    // Show requestable operations as well as pre-granted ones. Explicit named-agent
+    // denies stay absent; every other restricted call pauses for user approval.
+    let allowed = |kind: &str| !policy.deny.iter().any(|entry| entry == kind);
     let mut out = Vec::new();
     for mut schema in schemas {
         let name = schema["function"]["name"].as_str().unwrap_or("");
@@ -1353,7 +1241,7 @@ fn child_tool_schemas(policy: Option<&ToolPolicy>) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::{
         child_tool_schemas, collect_stream, collect_stream_with_retry, execute_local_todo,
@@ -1387,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn subtask_schemas_expose_only_read_only_categories() {
+    fn subtask_schemas_expose_read_only_and_requestable_categories() {
         let schemas = child_tool_schemas(None);
         let names: Vec<_> = schemas
             .as_array()
@@ -1398,20 +1286,28 @@ mod tests {
         assert_eq!(names, vec!["file_management", "shell", "web", "workflow"]);
         assert_eq!(
             schemas[0]["function"]["parameters"]["properties"]["action"]["enum"],
-            serde_json::json!(["read", "list", "search"])
+            serde_json::json!([
+                "read", "list", "search", "edit", "write", "delete", "copy", "move", "mkdir"
+            ])
         );
         assert_eq!(
             schemas[2]["function"]["parameters"]["properties"]["action"]["enum"],
-            serde_json::json!(["search", "images", "reverse_image", "fetch"])
+            serde_json::json!(["search", "images", "reverse_image", "fetch", "download"])
         );
         assert_eq!(
             schemas[3]["function"]["parameters"]["properties"]["action"]["enum"],
             serde_json::json!(["todo", "agent"])
         );
+        let edit = ToolCall {
+            name: "file_management".into(),
+            args: serde_json::json!({"action":"edit","path":"a.rs","old":"a","new":"b"}),
+            id: None,
+        };
+        assert!(!ToolPolicy::default().permits(&edit));
     }
 
     #[test]
-    fn named_agent_policy_expands_and_restricts_the_tool_surface() {
+    fn named_agent_policy_hides_denied_tools_but_leaves_other_tools_requestable() {
         let expanded = child_tool_schemas(Some(&ToolPolicy {
             allow: vec![
                 "read".into(),
@@ -1429,14 +1325,13 @@ mod tests {
             .iter()
             .filter_map(|value| value.as_str())
             .collect();
-        assert_eq!(actions, vec!["read", "search", "write", "mkdir"]);
         assert_eq!(
-            expanded[0]["function"]["parameters"]["properties"]["action"]["enum"],
-            serde_json::json!(["read", "search", "write", "mkdir"])
+            actions,
+            vec!["read", "list", "search", "edit", "write", "delete", "copy", "move", "mkdir"]
         );
         assert_eq!(
-            expanded[1]["function"]["parameters"]["properties"]["action"]["enum"],
-            serde_json::json!(["download"])
+            expanded[2]["function"]["parameters"]["properties"]["action"]["enum"],
+            serde_json::json!(["search", "images", "reverse_image", "fetch", "download"])
         );
         for schema in expanded.as_array().unwrap() {
             let name = schema["function"]["name"].as_str().unwrap();
@@ -1461,11 +1356,20 @@ mod tests {
 
         let denied = child_tool_schemas(Some(&ToolPolicy {
             allow: vec!["read".into(), "shell".into()],
-            deny: vec!["shell".into()],
+            deny: vec!["shell".into(), "write".into()],
         }));
+        let names: Vec<_> = denied
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .collect();
+        assert!(!names.contains(&"shell"));
         assert_eq!(
             denied[0]["function"]["parameters"]["properties"]["action"]["enum"],
-            serde_json::json!(["read"])
+            serde_json::json!([
+                "read", "list", "search", "edit", "delete", "copy", "move", "mkdir"
+            ])
         );
     }
 
@@ -1505,7 +1409,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_progress_renews_the_lease() {
+    async fn stream_waits_for_delayed_progress_without_a_lease() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         tokio::spawn(async move {
             tx.send(StreamEvent::Token("first".into())).await.unwrap();
@@ -1515,43 +1419,29 @@ mod tests {
             tx.send(StreamEvent::Done).await.unwrap();
         });
 
-        let result = collect_stream(
-            &mut rx,
-            Duration::from_millis(30),
-            Instant::now() + Duration::from_secs(1),
-            false,
-            None,
-        )
-        .await;
+        let result = collect_stream(&mut rx, false, None).await;
         assert_eq!(result.unwrap(), "first second");
     }
 
     #[tokio::test]
-    async fn stalled_stream_expires_its_progress_lease() {
+    async fn idle_stream_has_no_child_orchestration_timeout() {
         let (_tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let result = collect_stream(
-            &mut rx,
+        let result = tokio::time::timeout(
             Duration::from_millis(10),
-            Instant::now() + Duration::from_secs(1),
-            false,
-            None,
+            collect_stream(&mut rx, false, None),
         )
         .await;
-        assert_eq!(result, Err(StreamStop::LeaseExpired));
+        assert!(
+            result.is_err(),
+            "the external test timeout should fire first"
+        );
     }
 
     #[tokio::test]
     async fn empty_stream_is_a_retryable_failure() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         tx.send(StreamEvent::Done).await.unwrap();
-        let result = collect_stream(
-            &mut rx,
-            Duration::from_millis(10),
-            Instant::now() + Duration::from_secs(1),
-            false,
-            None,
-        )
-        .await;
+        let result = collect_stream(&mut rx, false, None).await;
         assert_eq!(
             result,
             Err(StreamStop::Failed(
@@ -1582,8 +1472,6 @@ mod tests {
                 });
                 Ok(rx)
             },
-            Duration::from_millis(50),
-            Instant::now() + Duration::from_secs(1),
             false,
             None,
         )
@@ -1604,8 +1492,6 @@ mod tests {
                 attempts_for_start.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err("backend unavailable".into())
             },
-            Duration::from_millis(10),
-            Instant::now() + Duration::from_secs(1),
             false,
             None,
         )
@@ -1618,30 +1504,6 @@ mod tests {
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             MAX_STREAM_ATTEMPTS
         );
-    }
-
-    #[tokio::test]
-    async fn retry_helper_never_retries_past_the_absolute_deadline() {
-        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let attempts_for_start = attempts.clone();
-        let result = collect_stream_with_retry(
-            move || {
-                attempts_for_start.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let (tx, rx) = tokio::sync::mpsc::channel(1);
-                tokio::spawn(async move {
-                    let _keep_stream_open = tx;
-                    std::future::pending::<()>().await;
-                });
-                Ok(rx)
-            },
-            Duration::from_secs(1),
-            Instant::now() + Duration::from_millis(15),
-            false,
-            None,
-        )
-        .await;
-        assert_eq!(result, Err(StreamStop::DeadlineReached));
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1658,14 +1520,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        let result = collect_stream(
-            &mut rx,
-            Duration::from_secs(30),
-            Instant::now() + Duration::from_secs(1),
-            true,
-            None,
-        )
-        .await;
+        let result = collect_stream(&mut rx, true, None).await;
         let response = result.unwrap();
         assert!(response.contains("\"name\":\"read\""), "{response}");
     }
@@ -1684,14 +1539,7 @@ mod tests {
             .unwrap();
         stream_tx.send(StreamEvent::Done).await.unwrap();
 
-        let result = collect_stream(
-            &mut stream_rx,
-            Duration::from_secs(1),
-            Instant::now() + Duration::from_secs(1),
-            false,
-            Some((7, &progress_tx)),
-        )
-        .await;
+        let result = collect_stream(&mut stream_rx, false, Some((7, &progress_tx))).await;
         assert_eq!(result.unwrap(), "done");
         match progress_rx.try_recv().unwrap() {
             crate::app::state::SubtaskEvent::Progress {
@@ -1703,6 +1551,29 @@ mod tests {
             }
             event => panic!("unexpected event: {event:?}"),
         }
+    }
+
+    #[test]
+    fn provider_tool_output_failure_becomes_bounded_unresolved_report() {
+        let raw = r#"API error 400 Bad Request: {"error":{"message":"No tool output found for function call call_secret.","type":"invalid_request_error"}}"#;
+        let report = super::unresolved_report(raw);
+        assert!(super::is_unresolved_report(&report));
+        assert!(report.contains("required tool result was missing"));
+        assert!(!report.contains("call_secret"));
+        assert!(!report.contains("invalid_request_error"));
+    }
+
+    #[test]
+    fn child_failures_and_empty_reviews_normalize_to_unresolved_success() {
+        for output in [Err("backend unavailable".into()), Ok("   ".into())] {
+            let normalized = super::normalize_child_output(output).expect("structured outcome");
+            assert!(super::is_unresolved_report(&normalized));
+            assert!(normalized.contains("Review unresolved"));
+        }
+        assert_eq!(
+            super::normalize_child_output(Ok("review itself".into())).unwrap(),
+            "review itself"
+        );
     }
 
     #[test]

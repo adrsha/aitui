@@ -25,8 +25,18 @@ pub fn handle_event(app: &App, event: Event) -> Vec<Action> {
 }
 
 fn normalize_shifted_key(mut key: KeyEvent) -> KeyEvent {
-    if key.modifiers.contains(KeyModifiers::SHIFT) {
-        if let KeyCode::Char(c) = key.code {
+    if let KeyCode::Char(c) = key.code {
+        // Kitty/CSI-u capable terminals usually preserve Shift explicitly, but
+        // some report Ctrl+Shift+letter as an uppercase control character with
+        // only CONTROL set. Recover the missing modifier before keymap matching
+        // so Ctrl+Shift+D remains distinct from Ctrl+D in the real event path.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+            && c.is_ascii_uppercase()
+        {
+            key.modifiers.insert(KeyModifiers::SHIFT);
+        }
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
             key.code = KeyCode::Char(shifted_char(c));
         }
     }
@@ -66,8 +76,10 @@ fn handle_key(app: &App, key: KeyEvent) -> Vec<Action> {
 
     // ── Global shortcuts (fire in any mode, configurable) ───────────────
     if km.quit.matches(&key) {
-        return if app.sessions.active().is_streaming() {
-            vec![Action::CancelStream]
+        return if app.is_busy() {
+            // First Ctrl-C always interrupts active generation/tool work. Once the
+            // app is idle, a subsequent Ctrl-C follows the configured quit binding.
+            vec![Action::AgentCancel]
         } else {
             vec![Action::Quit]
         };
@@ -146,6 +158,7 @@ fn handle_key(app: &App, key: KeyEvent) -> Vec<Action> {
         Overlay::Settings(_) => return handle_settings(&key),
         Overlay::Permission(_) => return handle_permission(app, &key),
         Overlay::Decision(_) => return handle_decision(app, &key),
+        Overlay::PromptDuringRun(_) => return handle_prompt_during_run(&key),
         Overlay::Plan(_) => return handle_plan(&key),
         Overlay::ToolRequest(_) => return handle_tool_request(&key),
         Overlay::ApiSetup(_) => return handle_api_setup(&key),
@@ -183,7 +196,7 @@ fn handle_key(app: &App, key: KeyEvent) -> Vec<Action> {
     // No overlay is open here. In insert mode, plain Tab belongs to the
     // composer: it accepts the visible ghost suggestion or inserts a tab.
     // Shift-Tab and non-insert Tab keep session cycling available.
-    if !(app.mention.active && !app.mention.matches.is_empty()) {
+    if !app.mention.active || app.mention.matches.is_empty() {
         if key.code == KeyCode::BackTab
             || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
         {
@@ -223,6 +236,9 @@ fn handle_key(app: &App, key: KeyEvent) -> Vec<Action> {
     }
     if km.toggle_output.matches(&key) {
         return vec![Action::ToggleOutput];
+    }
+    if km.paste_clipboard.matches(&key) {
+        return vec![Action::PasteClipboard];
     }
 
     // ── Help overlay steals keys while open ──────────────────────────
@@ -325,11 +341,19 @@ fn handle_picker(app: &App, key: &KeyEvent) -> Vec<Action> {
             }
         }
     }
+    let picker_len = match &app.overlay {
+        Overlay::Picker(p) => p.filtered.len(),
+        _ => 0,
+    };
     match key.code {
         KeyCode::Esc => vec![Action::PickerCancel],
         KeyCode::Enter => vec![Action::PickerConfirm],
         KeyCode::Up => vec![Action::PickerUp],
         KeyCode::Down => vec![Action::PickerDown],
+        KeyCode::PageUp => (0..6).map(|_| Action::PickerUp).collect(),
+        KeyCode::PageDown => (0..6).map(|_| Action::PickerDown).collect(),
+        KeyCode::Home => (0..picker_len).map(|_| Action::PickerUp).collect(),
+        KeyCode::End => (0..picker_len).map(|_| Action::PickerDown).collect(),
         KeyCode::Backspace => vec![Action::PickerBackspace],
         KeyCode::Char(c) => vec![Action::PickerChar(c)],
         _ => vec![],
@@ -479,6 +503,12 @@ fn handle_permission(app: &App, key: &KeyEvent) -> Vec<Action> {
         KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
             vec![Action::AgentPermScrollRight]
         }
+        KeyCode::Char('[') | KeyCode::Char('N') if !ctrl_pressed(key) => {
+            vec![Action::AgentPermissionOperationPrev]
+        }
+        KeyCode::Char(']') | KeyCode::Char('n') if !ctrl_pressed(key) => {
+            vec![Action::AgentPermissionOperationNext]
+        }
         KeyCode::Up | KeyCode::Left | KeyCode::Char('k') | KeyCode::Char('h')
             if !ctrl_pressed(key) =>
         {
@@ -496,9 +526,10 @@ fn handle_permission(app: &App, key: &KeyEvent) -> Vec<Action> {
             vec![Action::AgentResolvePermission]
         }
         KeyCode::Enter => vec![Action::AgentReviewPermission],
-        // Quick shortcuts for the common once-off cases, so you don't have to
-        // arrow to them: 'a' allow this call, 'd' deny this call, 'e' edit in $EDITOR.
+        // Quick shortcuts: lowercase applies to the highlighted operation;
+        // uppercase A allows every operation in the request.
         KeyCode::Char('a') if !ctrl_pressed(key) => vec![Action::AgentQuickAllow],
+        KeyCode::Char('A') if !ctrl_pressed(key) => vec![Action::AgentQuickAllowAll],
         KeyCode::Char('d') if !ctrl_pressed(key) => vec![Action::AgentQuickDeny],
         KeyCode::Char('e') if !ctrl_pressed(key) => vec![Action::AgentPermissionEdit],
         // 'p' opens $EDITOR to set the session access policy; on save this batch is
@@ -532,6 +563,33 @@ fn handle_decision(app: &App, key: &KeyEvent) -> Vec<Action> {
         KeyCode::Char(' ') if !editing && !ctrl_pressed(key) => {
             vec![Action::AgentDecisionToggle]
         }
+        _ => vec![],
+    }
+}
+
+fn handle_prompt_during_run(key: &KeyEvent) -> Vec<Action> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('3') => vec![
+            Action::PromptDuringRunDown,
+            Action::PromptDuringRunDown,
+            Action::PromptDuringRunResolve,
+        ],
+        KeyCode::Char('1') => vec![
+            Action::PromptDuringRunUp,
+            Action::PromptDuringRunUp,
+            Action::PromptDuringRunResolve,
+        ],
+        KeyCode::Char('2') => vec![
+            Action::PromptDuringRunUp,
+            Action::PromptDuringRunUp,
+            Action::PromptDuringRunDown,
+            Action::PromptDuringRunResolve,
+        ],
+        KeyCode::Up | KeyCode::Char('k') if !ctrl_pressed(key) => vec![Action::PromptDuringRunUp],
+        KeyCode::Down | KeyCode::Char('j') if !ctrl_pressed(key) => {
+            vec![Action::PromptDuringRunDown]
+        }
+        KeyCode::Enter => vec![Action::PromptDuringRunResolve],
         _ => vec![],
     }
 }
@@ -840,6 +898,7 @@ fn chord_escapes(chord: Option<(char, char)>, last_insert: Option<char>, key: Ke
 
 fn handle_mouse(app: &App, mouse: MouseEvent) -> Vec<Action> {
     // While a scrollable overlay is open the wheel belongs to that overlay.
+    let picker_open = matches!(app.overlay, Overlay::Picker(_));
     let perm_open = matches!(app.overlay, Overlay::Permission(_));
     let subtask_open = matches!(app.overlay, Overlay::SubtaskDetail { .. });
     let over_sidebar_list = app.layout.sidebar_tasks.is_some_and(|area| {
@@ -849,6 +908,8 @@ fn handle_mouse(app: &App, mouse: MouseEvent) -> Vec<Action> {
             && mouse.row < area.y + area.height
     });
     match mouse.kind {
+        MouseEventKind::ScrollUp if picker_open => vec![Action::PickerUp],
+        MouseEventKind::ScrollDown if picker_open => vec![Action::PickerDown],
         MouseEventKind::ScrollUp if perm_open => vec![Action::AgentPermScrollUp],
         MouseEventKind::ScrollDown if perm_open => vec![Action::AgentPermScrollDown],
         MouseEventKind::ScrollUp if subtask_open => vec![Action::SubtaskDetailUp],
@@ -858,13 +919,13 @@ fn handle_mouse(app: &App, mouse: MouseEvent) -> Vec<Action> {
         MouseEventKind::ScrollUp => vec![Action::ChatScroll(3)],
         MouseEventKind::ScrollDown => vec![Action::ChatScroll(-3)],
         MouseEventKind::Down(MouseButton::Left) => {
-            vec![Action::ChatClick(mouse.column, mouse.row)]
+            vec![Action::ChatPress(mouse.column, mouse.row)]
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             vec![Action::ChatDrag(mouse.column, mouse.row)]
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            vec![Action::ChatRelease]
+            vec![Action::ChatRelease(mouse.column, mouse.row)]
         }
         _ => vec![],
     }
@@ -904,6 +965,66 @@ mod tests {
     }
 
     #[test]
+    fn session_picker_supports_page_and_home_end_navigation() {
+        let mut app = test_app();
+        app.overlay = Overlay::Picker(crate::app::overlay::Picker::sessions(
+            (0..20).map(|i| format!("session {i}")).collect(),
+            0,
+        ));
+
+        assert_eq!(handle_picker(&app, &key(KeyCode::PageDown)).len(), 6);
+        assert_eq!(handle_picker(&app, &key(KeyCode::PageUp)).len(), 6);
+        assert_eq!(handle_picker(&app, &key(KeyCode::End)).len(), 20);
+        assert_eq!(handle_picker(&app, &key(KeyCode::Home)).len(), 20);
+    }
+
+    #[test]
+    fn mouse_wheel_moves_open_session_picker_not_chat() {
+        let mut app = test_app();
+        app.overlay = Overlay::Picker(crate::app::overlay::Picker::sessions(
+            vec!["new".into(), "one".into(), "two".into()],
+            1,
+        ));
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: 20,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(matches!(
+            handle_mouse(&app, mouse(MouseEventKind::ScrollDown)).as_slice(),
+            [Action::PickerDown]
+        ));
+        assert!(matches!(
+            handle_mouse(&app, mouse(MouseEventKind::ScrollUp)).as_slice(),
+            [Action::PickerUp]
+        ));
+    }
+
+    #[test]
+    fn left_mouse_controls_activate_on_release_not_press() {
+        let app = test_app();
+        let event = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 12,
+                row: 7,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        assert!(matches!(
+            handle_event(&app, event(MouseEventKind::Down(MouseButton::Left))).as_slice(),
+            [Action::ChatPress(12, 7)]
+        ));
+        assert!(matches!(
+            handle_event(&app, event(MouseEventKind::Up(MouseButton::Left))).as_slice(),
+            [Action::ChatRelease(12, 7)]
+        ));
+    }
+
+    #[test]
     fn sidebar_wheel_scrolls_the_active_list_one_row_at_a_time() {
         let mut app = test_app();
         app.layout.sidebar_tasks = Some(ratatui::layout::Rect::new(10, 5, 20, 8));
@@ -923,6 +1044,34 @@ mod tests {
         assert!(matches!(
             handle_event(&app, event(MouseEventKind::ScrollUp)).as_slice(),
             [Action::SidebarListScroll(-1)]
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_cancels_busy_work_before_quitting() {
+        let mut app = test_app();
+        app.sessions.active_mut().begin_assistant_stream();
+        let ctrl_c = Event::Key(ctrl_key(KeyCode::Char('c')));
+        assert!(matches!(
+            handle_event(&app, ctrl_c.clone()).as_slice(),
+            [Action::AgentCancel]
+        ));
+        app.sessions.active_mut().finalize_assistant_stream();
+        assert!(matches!(
+            handle_event(&app, ctrl_c).as_slice(),
+            [Action::Quit]
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_cancels_parallel_tool_batch_before_quitting() {
+        let mut app = test_app();
+        app.agent_session = Some(app.sessions.active_id());
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        app.agent_tool_batch_rx = Some(rx);
+        assert!(matches!(
+            handle_event(&app, Event::Key(ctrl_key(KeyCode::Char('c')))).as_slice(),
+            [Action::AgentCancel]
         ));
     }
 
@@ -985,23 +1134,25 @@ mod tests {
     #[test]
     fn ctrl_shift_d_jumps_to_bottom_while_ctrl_d_keeps_half_scroll() {
         let app = test_app();
+        for shifted in [
+            modified_key(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            // Some terminals encode Ctrl+Shift+D as uppercase D but omit SHIFT.
+            modified_key(KeyCode::Char('D'), KeyModifiers::CONTROL),
+        ] {
+            assert!(matches!(
+                handle_event(&app, Event::Key(shifted)).as_slice(),
+                [Action::ChatBottom]
+            ));
+        }
         assert!(matches!(
-            handle_key(
-                &app,
-                modified_key(
-                    KeyCode::Char('d'),
-                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
-                ),
-            )
-            .as_slice(),
-            [Action::ChatBottom]
-        ));
-        assert!(matches!(
-            handle_key(&app, ctrl_key(KeyCode::Char('d'))).as_slice(),
+            handle_event(&app, Event::Key(ctrl_key(KeyCode::Char('d')))).as_slice(),
             [Action::ChatHalfDown]
         ));
         assert!(!matches!(
-            handle_key(&app, ctrl_key(KeyCode::End)).as_slice(),
+            handle_event(&app, Event::Key(ctrl_key(KeyCode::End))).as_slice(),
             [Action::ChatBottom]
         ));
     }
@@ -1092,6 +1243,20 @@ mod tests {
         assert!(matches!(
             handle_insert(&app, &key(KeyCode::Down)).as_slice(),
             [Action::Move(Dir::Down)]
+        ));
+    }
+
+    #[test]
+    fn ctrl_v_pastes_from_system_clipboard_in_any_input_mode() {
+        let mut app = test_app();
+        assert!(matches!(
+            handle_key(&app, ctrl_key(KeyCode::Char('v'))).as_slice(),
+            [Action::PasteClipboard]
+        ));
+        app.vim = VimMode::Normal;
+        assert!(matches!(
+            handle_key(&app, ctrl_key(KeyCode::Char('v'))).as_slice(),
+            [Action::PasteClipboard]
         ));
     }
 
@@ -1278,6 +1443,10 @@ mod tests {
             [Action::AgentQuickAllow]
         ));
         assert!(matches!(
+            handle_permission(&app, &key(KeyCode::Char('A'))).as_slice(),
+            [Action::AgentQuickAllowAll]
+        ));
+        assert!(matches!(
             handle_permission(&app, &key(KeyCode::Char('d'))).as_slice(),
             [Action::AgentQuickDeny]
         ));
@@ -1288,6 +1457,35 @@ mod tests {
         assert!(matches!(
             handle_permission(&app, &key(KeyCode::Char('p'))).as_slice(),
             [Action::AgentEditPolicy]
+        ));
+    }
+
+    #[test]
+    fn permission_multi_operation_navigation_has_dedicated_keys() {
+        let mut app = test_app();
+        app.overlay = Overlay::Permission(crate::app::overlay::PermissionRequest::new(
+            vec![crate::agent::ToolCall {
+                name: "shell".into(),
+                args: serde_json::json!({ "commands": ["one", "two"] }),
+                id: None,
+            }],
+            std::env::current_dir().unwrap(),
+        ));
+        assert!(matches!(
+            handle_permission(&app, &key(KeyCode::Char('n'))).as_slice(),
+            [Action::AgentPermissionOperationNext]
+        ));
+        assert!(matches!(
+            handle_permission(&app, &key(KeyCode::Char('N'))).as_slice(),
+            [Action::AgentPermissionOperationPrev]
+        ));
+        assert!(matches!(
+            handle_permission(&app, &key(KeyCode::Char(']'))).as_slice(),
+            [Action::AgentPermissionOperationNext]
+        ));
+        assert!(matches!(
+            handle_permission(&app, &key(KeyCode::Char('['))).as_slice(),
+            [Action::AgentPermissionOperationPrev]
         ));
     }
 

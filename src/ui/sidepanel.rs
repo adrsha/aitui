@@ -43,14 +43,17 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) -> SidebarHit
         .map(|path| display_path(path))
         .unwrap_or_default();
     let directory_lines = directory_lines(&cwd, inner_w, theme);
+    // Keep the final sidebar row blank so the CWD footer has breathing room
+    // instead of sitting directly on the terminal edge.
+    let footer_bottom = bottom.saturating_sub(1);
     let directory_height = directory_lines.len().min(area.height as usize) as u16;
-    let directory_y = bottom.saturating_sub(directory_height);
+    let directory_y = footer_bottom.saturating_sub(directory_height);
     render_lines(
         f,
         inner_x,
         directory_y,
         inner_w,
-        bottom,
+        footer_bottom,
         directory_lines,
         surface,
     );
@@ -131,7 +134,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) -> SidebarHit
         if y < content_bottom {
             let mode = app.config.api.access_review_mode;
             let (mark, status, color) = if mode == crate::config::AccessReviewMode::Off {
-                ("○", "Review model off".to_string(), theme.muted)
+                ("◈", "Review model off".to_string(), theme.muted)
             } else if app.judging.is_some() {
                 (
                     "◉",
@@ -145,6 +148,22 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) -> SidebarHit
                     theme.success,
                 )
             };
+            let mark_span = if mode == crate::config::AccessReviewMode::Off {
+                Span::styled(
+                    " ◈ ",
+                    Style::default()
+                        .bg(theme.accent)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(format!("{} ", mark), Style::default().fg(color))
+            };
+            let status = if mode == crate::config::AccessReviewMode::Off {
+                format!(" {}", status)
+            } else {
+                status
+            };
             y = render_lines(
                 f,
                 inner_x,
@@ -152,7 +171,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) -> SidebarHit
                 inner_w,
                 content_bottom,
                 vec![Line::from(vec![
-                    Span::styled(format!("{} ", mark), Style::default().fg(color)),
+                    mark_span,
                     Span::styled(status, Style::default().fg(theme.text)),
                 ])],
                 surface,
@@ -230,17 +249,26 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) -> SidebarHit
         width: (inner_w as u16).saturating_sub(tab_width),
         height: 1,
     };
+    let tasks_done = session
+        .todos
+        .iter()
+        .filter(|todo| todo.status == TodoStatus::Done)
+        .count();
+    let agents_done = sid_agents
+        .iter()
+        .filter(|task| task.status == crate::app::state::SubtaskStatus::Completed)
+        .count();
     render_sidebar_tab(
         f,
         tasks_tab,
-        &format!("Tasks {}", session.todos.len()),
+        &format!("Tasks {}/{}", tasks_done, session.todos.len()),
         app.sidebar_tab == SidebarTab::Tasks,
         theme,
     );
     render_sidebar_tab(
         f,
         agents_tab,
-        &format!("Agents {}", sid_agents.len()),
+        &format!("Agents {}/{}", agents_done, sid_agents.len()),
         app.sidebar_tab == SidebarTab::Agents,
         theme,
     );
@@ -252,7 +280,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) -> SidebarHit
             .iter()
             .filter(|task| task.status == SubtaskStatus::Running)
             .count();
-        let done = sid_agents.len().saturating_sub(running);
+        let done = sid_agents
+            .iter()
+            .filter(|task| task.status == SubtaskStatus::Completed)
+            .count();
         y = render_section(
             f,
             inner_x,
@@ -475,6 +506,7 @@ pub(crate) fn agent_lines(
             theme.warning,
         ),
         SubtaskStatus::Completed => ("●", theme.success),
+        SubtaskStatus::Unresolved => ("?", theme.warning),
         SubtaskStatus::Failed => ("×", theme.danger),
     };
     let name = agent_display_name(task);
@@ -893,7 +925,7 @@ mod tests {
         prefixed_lines, progress_meter_line, sidebar_window, task_item_lines,
     };
     use crate::agent::ToolCall;
-    use crate::app::state::{Subtask, SubtaskStatus};
+    use crate::app::state::{App, Subtask, SubtaskStatus, TodoItem, TodoStatus};
     use crate::render::theme::Theme;
     use unicode_width::UnicodeWidthStr;
 
@@ -933,6 +965,53 @@ mod tests {
             abort: None,
             agent: agent.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn sidebar_shows_completion_counts_review_icon_and_footer_spacing() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(crate::config::Config::default()).unwrap();
+        let sid = app.sessions.active_id();
+        app.sessions.active_mut().cwd = Some(std::path::PathBuf::from("/tmp/project"));
+        app.sessions.active_mut().todos = vec![
+            TodoItem {
+                text: "done".into(),
+                status: TodoStatus::Done,
+                percent: Some(100),
+            },
+            TodoItem {
+                text: "remaining".into(),
+                status: TodoStatus::Pending,
+                percent: Some(0),
+            },
+        ];
+        app.subtasks
+            .push(subtask(1, SubtaskStatus::Completed, Some("one"), None));
+        let mut unresolved = subtask(2, SubtaskStatus::Unresolved, Some("two"), None);
+        unresolved.session_id = sid;
+        app.subtasks[0].session_id = sid;
+        app.subtasks.push(unresolved);
+
+        let backend = TestBackend::new(60, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = app.theme();
+        terminal
+            .draw(|frame| {
+                super::render(frame, &app, frame.area(), &theme);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..35)
+            .map(|y| (0..60).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let screen = rows.join("\n");
+        assert!(screen.contains("◈  Review model off"), "{screen}");
+        assert!(screen.contains("Tasks 1/2"), "{screen}");
+        assert!(screen.contains("Agents 1/2"), "{screen}");
+        assert!(rows[33].contains("/tmp/project"), "{screen}");
+        assert!(rows[34].trim().is_empty(), "{screen}");
     }
 
     #[test]

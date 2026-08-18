@@ -898,10 +898,10 @@ mod tests {
                     "c1\r\ndata: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\r\n0\r\n\r\n",
                 );
             }
-            if let Err(_) = stream.write_all(body.as_bytes()) {
+            if stream.write_all(body.as_bytes()).is_err() {
                 return;
             }
-            if let Err(_) = stream.flush() {
+            if stream.flush().is_err() {
                 return;
             }
             // Hold the connection open (no more bytes) until the test ends.
@@ -933,16 +933,16 @@ mod tests {
                 let mut stream = reader.into_inner();
                 if attempt == 0 {
                     let body = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
-                    if let Err(_) = stream.write_all(body.as_bytes()) {
+                    if stream.write_all(body.as_bytes()).is_err() {
                         return;
                     }
                 } else {
                     let body = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nc1\r\ndata: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\r\n0\r\n\r\n";
-                    if let Err(_) = stream.write_all(body.as_bytes()) {
+                    if stream.write_all(body.as_bytes()).is_err() {
                         return;
                     }
                 }
-                if let Err(_) = stream.flush() {
+                if stream.flush().is_err() {
                     return;
                 }
             }

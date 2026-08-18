@@ -39,10 +39,12 @@ pub(crate) fn render_search_output(
         render_file_group(
             &path,
             &lines[start..index],
-            pattern,
-            mi,
-            avail,
-            theme,
+            FileGroupContext {
+                pattern,
+                mi,
+                avail,
+                theme,
+            },
             &mut line_idx,
             out,
         );
@@ -65,16 +67,26 @@ pub(crate) fn search_pattern_from_summary(summary: &str) -> Option<String> {
     .filter(|s| !s.is_empty() && s != "?")
 }
 
+struct FileGroupContext<'a> {
+    pattern: Option<&'a str>,
+    mi: usize,
+    avail: usize,
+    theme: &'a Theme,
+}
+
 fn render_file_group(
     path: &str,
     lines: &[&str],
-    pattern: Option<&str>,
-    mi: usize,
-    avail: usize,
-    theme: &Theme,
+    context: FileGroupContext<'_>,
     line_idx: &mut usize,
     out: &mut Vec<RenderedLine>,
 ) {
+    let FileGroupContext {
+        pattern,
+        mi,
+        avail,
+        theme,
+    } = context;
     let display_path = abbreviate_home(path.trim());
     // Separate each file group from the result summary or preceding file. The
     // nested tool indent is applied by the document renderer afterward.
@@ -108,37 +120,50 @@ fn render_file_group(
             continue;
         };
         render_match_line(
-            &display_path,
-            line_no,
-            body,
-            number_width,
-            pattern,
+            MatchLine {
+                path: &display_path,
+                line_no,
+                body,
+                number_width,
+                pattern,
+                idx: *line_idx,
+            },
             mi,
             avail,
             theme,
-            *line_idx,
             out,
         );
         *line_idx += 1;
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_match_line(
-    path: &str,
-    line_no: &str,
-    body: &str,
+struct MatchLine<'a> {
+    path: &'a str,
+    line_no: &'a str,
+    body: &'a str,
     number_width: usize,
-    pattern: Option<&str>,
+    pattern: Option<&'a str>,
+    idx: usize,
+}
+
+fn render_match_line(
+    line: MatchLine<'_>,
     mi: usize,
     avail: usize,
     theme: &Theme,
-    idx: usize,
     out: &mut Vec<RenderedLine>,
 ) {
+    let MatchLine {
+        path,
+        line_no,
+        body,
+        number_width,
+        pattern,
+        idx,
+    } = line;
     let dim = Style::default().fg(theme.muted);
     let base = dim;
-    let ln_bg = if idx % 2 == 0 {
+    let ln_bg = if idx.is_multiple_of(2) {
         None
     } else {
         Some(Color::DarkGray)

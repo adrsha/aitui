@@ -40,11 +40,31 @@ fn message_text(m: &ChatMessage) -> String {
     }
 }
 
+fn completed_subtask_outcome(
+    output: Result<String, String>,
+) -> (crate::app::state::SubtaskStatus, String) {
+    match output {
+        Ok(text)
+            if crate::agent::subtask::is_unresolved_report(&text)
+                || crate::agent::report::verification_report(&text).is_some_and(|report| {
+                    matches!(report.status.as_str(), "unresolved" | "partially_verified")
+                }) =>
+        {
+            (crate::app::state::SubtaskStatus::Unresolved, text)
+        }
+        Ok(text) => (crate::app::state::SubtaskStatus::Completed, text),
+        Err(error) => (
+            crate::app::state::SubtaskStatus::Unresolved,
+            crate::agent::subtask::unresolved_report(&error),
+        ),
+    }
+}
+
 fn subtask_message_body(task: &crate::app::state::Subtask) -> String {
     let status = match task.status {
-        crate::app::state::SubtaskStatus::Running | crate::app::state::SubtaskStatus::Completed => {
-            "ok"
-        }
+        crate::app::state::SubtaskStatus::Running
+        | crate::app::state::SubtaskStatus::Completed
+        | crate::app::state::SubtaskStatus::Unresolved => "ok",
         crate::app::state::SubtaskStatus::Failed => "error",
     };
     let elapsed_ms = task
@@ -55,6 +75,7 @@ fn subtask_message_body(task: &crate::app::state::Subtask) -> String {
         "status": match task.status {
             crate::app::state::SubtaskStatus::Running => "running",
             crate::app::state::SubtaskStatus::Completed => "completed",
+            crate::app::state::SubtaskStatus::Unresolved => "unresolved",
             crate::app::state::SubtaskStatus::Failed => "failed",
         },
         "description": task.description,
@@ -376,13 +397,15 @@ impl App {
         use ratatui::text::{Line, Span};
 
         let theme = self.theme();
-        let show_output = self.show_output;
+        // Entering an agent is an inspection view: always show the actual tool
+        // outputs there, independently of the root transcript's compact toggle.
+        let show_output = true;
         let toggled = &self.chat.toggled;
         let task = self.subtasks.iter().find(|task| task.id == node_id);
 
         let mut out: Vec<RenderedLine> = Vec::new();
         let name = task
-            .map(|task| crate::ui::sidepanel::agent_display_name(task))
+            .map(crate::ui::sidepanel::agent_display_name)
             .unwrap_or_else(|| "agent".into());
         let crumb = RenderedLine::new(
             Line::from(vec![
@@ -464,6 +487,12 @@ impl App {
 
     // ── Smart paste ─────────────────────────────────────────────────────────
 
+    pub fn replace_attachment(&mut self, attachment: Option<PathBuf>) {
+        if let Some(previous) = std::mem::replace(&mut self.attachment, attachment) {
+            crate::app::clipboard::remove_managed_image(&previous);
+        }
+    }
+
     /// Handle a bracketed paste. Big blobs are written to a file and attached so
     /// they don't flood the composer; medium blobs are stored and shown as a
     /// compact `[PASTED#N-…]` chip (expanded to full text on submit); small pastes
@@ -480,14 +509,14 @@ impl App {
         if chars >= FILE_CHARS {
             match write_paste_file(&text) {
                 Ok(path) => {
-                    self.attachment = Some(path);
+                    self.replace_attachment(Some(path));
                     self.set_status(format!(
                         "Large paste attached as file ({} lines, {} chars)",
                         lines, chars
                     ));
                 }
                 Err(e) => {
-                    self.set_status(format!("Paste file error: {} — pasted inline", e));
+                    crate::app::toast::warning(format!("Paste file error: {} — pasted inline", e));
                     self.input.paste(&text);
                     self.update_mention();
                 }
@@ -543,35 +572,32 @@ impl App {
     // ── Submission ──────────────────────────────────────────────────────────
 
     pub fn submit(&mut self) -> Option<Action> {
-        // No parallel turns yet: block a new send while the assistant is working,
-        // but keep the composed text in the input so it's ready to fire once idle.
-        if self.is_busy() {
-            self.overlay = Overlay::Notice {
-                title: " Busy ".into(),
-                body: "The assistant is still working.\n\nYour message is kept in the input — \
-                       press Enter again once the reply finishes.\n\n(Ctrl-C cancels the current turn.)"
-                    .into(),
-            };
-            self.set_status("Can't send yet — assistant is working (Ctrl-C to cancel)");
+        // Child agents run independently. Accept an intervening user message into
+        // the transcript without starting a competing parent response; the later
+        // child-report synthesis explicitly distinguishes the earlier request.
+        if self.child_agents_only_busy() {
+            return self.submit_between_prompt();
+        }
+        if self.main_agent_busy_for(self.sessions.active_id()) {
+            self.overlay =
+                Overlay::PromptDuringRun(crate::app::overlay::PromptDuringRun { selected: 0 });
+            self.set_status("Assistant is working — choose queue, interrupt, or wait");
             return None;
         }
 
-        self.agent_iterations = 0;
-        self.show_last_prompt = false;
-        self.mention.reset();
-        // Restore any `[PASTED#N-…]` chips to their full text before sending.
-        let text = self.input.take();
-        let text = self.expand_pastes(text);
-        let attachment = self.attachment.take();
+        self.submit_current_prompt(true)
+    }
 
+    fn take_composed_prompt(&mut self) -> Option<crate::app::state::QueuedPrompt> {
+        let raw = self.input.take();
+        let text = self.expand_pastes(raw);
+        let attachment = self.attachment.take();
         if text.trim().is_empty() && attachment.is_none() {
             self.set_status("Nothing to send. Type a message first.");
             return None;
         }
-
-        // Save to input history (shell-style up/down recall).
         let trimmed = text.trim().to_string();
-        if !trimmed.is_empty() && self.input_history.last().map(|s| s.as_str()) != Some(&trimmed) {
+        if !trimmed.is_empty() && self.input_history.last().map(String::as_str) != Some(&trimmed) {
             self.input_history.push(trimmed);
             if self.input_history.len() > 100 {
                 self.input_history.remove(0);
@@ -579,32 +605,92 @@ impl App {
         }
         self.input_history_idx = None;
         self.input_draft.clear();
-        // The composed text is now a real message; clear the session's stashed
-        // draft so a stale copy isn't persisted or restored later.
         self.sessions.active_mut().draft.clear();
+        Some(crate::app::state::QueuedPrompt { text, attachment })
+    }
 
+    fn append_composed_prompt_for(&mut self, sid: usize, prompt: crate::app::state::QueuedPrompt) {
         let mention_root = self
             .sessions
-            .active()
-            .cwd
-            .clone()
+            .by_id(sid)
+            .and_then(|session| session.cwd.clone())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
-        let mention_ctx = expand_mentions(&text, &mention_root);
+        let mention_ctx = expand_mentions(&prompt.text, &mention_root);
         let text = if mention_ctx.is_empty() {
-            text
+            prompt.text
         } else {
-            format!("{}\n\n{}", mention_ctx, text)
+            format!("{}\n\n{}", mention_ctx, prompt.text)
         };
-
-        let msg = build_user_message(&text, attachment.as_ref(), self);
-        self.sessions.active_mut().push_message(msg);
-        self.auto_name_session();
+        if let Some(session) = self.sessions.by_id_mut(sid) {
+            session.push_message(build_user_message(&text, prompt.attachment.as_ref()));
+        }
+        if let Some(path) = prompt.attachment.as_ref() {
+            crate::app::clipboard::remove_managed_image(path);
+        }
+        if self.sessions.active_id() == sid {
+            self.auto_name_session();
+        }
         self.sessions.save();
         self.touch();
+    }
 
+    fn submit_current_prompt(&mut self, start_stream: bool) -> Option<Action> {
+        self.agent_iterations = 0;
+        self.show_last_prompt = false;
+        self.mention.reset();
+        let prompt = self.take_composed_prompt()?;
         let sid = self.sessions.active_id();
+        self.append_composed_prompt_for(sid, prompt);
+        if start_stream {
+            self.begin_stream_for(sid)
+        } else {
+            None
+        }
+    }
+
+    fn submit_between_prompt(&mut self) -> Option<Action> {
+        self.submit_current_prompt(false);
+        self.set_status(
+            "Prompt added between turns — child reports still answer the earlier request",
+        );
+        None
+    }
+
+    pub fn queue_current_prompt(&mut self) -> Option<Action> {
+        let prompt = self.take_composed_prompt()?;
+        let sid = self.sessions.active_id();
+        self.queued_prompts
+            .entry(sid)
+            .or_default()
+            .push_back(prompt);
+        self.set_status("Prompt queued — it will send when the current work finishes");
+        self.touch();
+        None
+    }
+
+    pub fn send_queued_prompt(&mut self, sid: usize) -> Option<Action> {
+        if self.session_busy(sid) {
+            return None;
+        }
+        let prompt = self.queued_prompts.get_mut(&sid)?.pop_front()?;
+        self.append_composed_prompt_for(sid, prompt);
+        if self
+            .queued_prompts
+            .get(&sid)
+            .is_some_and(|queue| queue.is_empty())
+        {
+            self.queued_prompts.remove(&sid);
+        }
         self.begin_stream_for(sid)
+    }
+
+    pub fn next_ready_queued_prompt(&self) -> Option<usize> {
+        self.queued_prompts
+            .iter()
+            .filter(|(_, queue)| !queue.is_empty())
+            .map(|(sid, _)| *sid)
+            .find(|sid| !self.session_busy(*sid))
     }
 
     /// Regenerate the last assistant turn: drop everything after the last user
@@ -742,7 +828,10 @@ impl App {
         let memories = session.memories.clone();
         let source_turn = session.memory_source_turn.saturating_add(1);
         let Some(api) = self.api.clone() else {
-            eprintln!("Session memory skipped for session {}: no API client", sid);
+            crate::app::toast::warning(format!(
+                "Session memory skipped for session {}: no API client",
+                sid
+            ));
             return;
         };
         let model = self.current_model().to_string();
@@ -766,10 +855,7 @@ impl App {
                 Err(error) => Err(format!("memory extraction request failed: {}", error)),
             };
             if tx.send((sid, source_turn, result)).await.is_err() {
-                eprintln!(
-                    "Session memory result dropped for session {}: application channel closed",
-                    sid
-                );
+                // The application is shutting down; no UI remains to notify.
             }
         });
     }
@@ -798,21 +884,24 @@ impl App {
                         );
                         self.sessions.save();
                     }
-                    (Some(_), Some(_)) => eprintln!(
+                    (Some(_), Some(_)) => crate::app::toast::warning(format!(
                         "Session memory result skipped for session {}: stale source turn {}",
                         sid, source_turn
-                    ),
-                    (Some(_), None) => eprintln!(
+                    )),
+                    (Some(_), None) => crate::app::toast::warning(format!(
                         "Session memory result skipped for session {}: system clock unavailable",
                         sid
-                    ),
-                    (None, _) => eprintln!(
+                    )),
+                    (None, _) => crate::app::toast::warning(format!(
                         "Session memory result skipped: session {} no longer exists",
                         sid
-                    ),
+                    )),
                 }
             }
-            Err(error) => eprintln!("Session memory skipped for session {}: {}", sid, error),
+            Err(error) => crate::app::toast::warning(format!(
+                "Session memory skipped for session {}: {}",
+                sid, error
+            )),
         }
         if self.memory_pending.remove(&sid) {
             self.maybe_request_session_memory(sid);
@@ -1032,12 +1121,12 @@ impl App {
         result: Result<crate::app::state::TodoUpdate, String>,
     ) {
         let base_signature = self.todo_inflight.remove(&(sid, signature));
-        let Ok(update) = result else {
-            eprintln!(
+        let Ok(mut update) = result else {
+            crate::app::toast::warning(format!(
                 "Todo tracker skipped for session {}: {}",
                 sid,
                 result.unwrap_err()
-            );
+            ));
             return;
         };
         let Some(session) = self.sessions.by_id_mut(sid) else {
@@ -1061,6 +1150,7 @@ impl App {
         {
             return;
         }
+        crate::app::todo_tracker::normalize(&mut update);
         session.todos = update.items;
         session.todo_overall_percent = update.overall_percent;
         self.sessions.save();
@@ -1069,7 +1159,7 @@ impl App {
 
     pub(super) fn set_response_suggestions(&mut self, enabled: bool) {
         self.config.ui.response_suggestions = enabled;
-        let _ = self.config.save();
+        self.save_config();
         if !enabled {
             for session in self.sessions.all_mut() {
                 session.response_suggestions.clear();
@@ -1164,7 +1254,7 @@ impl App {
                         if let Some(s) = self.sessions.by_id_mut(sid) {
                             s.finalize_assistant_stream();
                         }
-                        self.set_status(format!("Image request failed: {}", e));
+                        crate::app::toast::error(format!("Image request failed: {}", e));
                         None
                     }
                 },
@@ -1172,7 +1262,7 @@ impl App {
                     if let Some(s) = self.sessions.by_id_mut(sid) {
                         s.finalize_assistant_stream();
                     }
-                    self.set_status("No API client");
+                    crate::app::toast::error("No API client");
                     None
                 }
             };
@@ -1259,7 +1349,7 @@ impl App {
                     if let Some(s) = self.sessions.by_id_mut(sid) {
                         s.finalize_assistant_stream();
                     }
-                    self.set_status(format!("Request failed: {}", e));
+                    crate::app::toast::error(format!("Request failed: {}", e));
                     None
                 }
             },
@@ -1267,7 +1357,7 @@ impl App {
                 if let Some(s) = self.sessions.by_id_mut(sid) {
                     s.finalize_assistant_stream();
                 }
-                self.set_status("No API client");
+                crate::app::toast::error("No API client");
                 None
             }
         }
@@ -1314,7 +1404,7 @@ impl App {
                         .count();
                     if running > 0 {
                         self.set_status(format!(
-                            "Delegated {} parallel agent(s) still working — finishing when they complete",
+                            "Waiting for {} parallel child agent(s) to complete",
                             running
                         ));
                         return None;
@@ -1439,15 +1529,10 @@ impl App {
         let cwd = self.agent_cwd();
         // Calls already cleared this round (judged-allow or batch-allow) run first,
         // straight to execution with no fresh permission check or re-judge.
-        if let Some(call) = self.approved.pop_front() {
-            let mut calls = vec![call];
-            if is_parallel_read(&calls[0]) {
-                while calls.len() < 16 && self.approved.front().is_some_and(is_parallel_read) {
-                    if let Some(next) = self.approved.pop_front() {
-                        calls.push(next);
-                    }
-                }
-            }
+        if !self.approved.is_empty() {
+            let contiguous = self.approved.make_contiguous();
+            let wave_len = crate::agent::tools::execution_wave_len(contiguous, &cwd, 16);
+            let calls: Vec<_> = self.approved.drain(..wave_len).collect();
             return self.execute_tool_batch(calls);
         }
         while let Some(call) = self.pending_tools.pop_front() {
@@ -1503,27 +1588,22 @@ impl App {
                 }
                 Some(PermissionDecision::Allow) => {
                     self.permissions.consume(&call, &cwd);
-                    let mut calls = vec![call];
-                    if is_parallel_read(&calls[0]) {
-                        while calls.len() < 8 {
-                            let Some(next) = self.pending_tools.front() else {
-                                break;
-                            };
-                            if !is_parallel_read(next)
-                                || agent::needs_hard_prompt(next, &cwd)
-                                || self.permissions.check(next, &cwd)
-                                    != Some(PermissionDecision::Allow)
-                            {
-                                break;
-                            }
-                            let Some(next) = self.pending_tools.pop_front() else {
-                                break;
-                            };
-                            self.permissions.consume(&next, &cwd);
-                            calls.push(next);
+                    self.approved.push_back(call);
+                    while self.approved.len() < 16 {
+                        let Some(next) = self.pending_tools.front() else {
+                            break;
+                        };
+                        if !is_directly_executable(next)
+                            || agent::needs_hard_prompt(next, &cwd)
+                            || self.permissions.check(next, &cwd) != Some(PermissionDecision::Allow)
+                        {
+                            break;
                         }
+                        let next = self.pending_tools.pop_front().unwrap();
+                        self.permissions.consume(&next, &cwd);
+                        self.approved.push_back(next);
                     }
-                    return self.execute_tool_batch(calls);
+                    return self.process_next_tool();
                 }
                 None if agent::needs_hard_prompt(&call, &cwd) => {
                     return self.prompt_permission(vec![call]);
@@ -1539,6 +1619,8 @@ impl App {
                                         | ToolKind::Ask
                                         | ToolKind::Plan
                                         | ToolKind::ProposeStep
+                                        | ToolKind::Task
+                                        | ToolKind::Finish
                                 )
                             )
                         {
@@ -1565,6 +1647,169 @@ impl App {
         self.continue_after_tools()
     }
 
+    /// Apply one concrete operation decision in a multi-operation request. Once
+    /// every operation is decided, allowed top-level calls are queued, denied calls
+    /// receive failures, and mixed batched calls execute only their accepted items.
+    pub fn resolve_permission_operation(&mut self, decision: PermissionDecision) -> Option<Action> {
+        let complete = match &mut self.overlay {
+            Overlay::Permission(request) if request.has_multiple_operations() => {
+                request.decide_operation(decision)
+            }
+            _ => return None,
+        };
+        if !complete {
+            let request = match &self.overlay {
+                Overlay::Permission(request) => request,
+                _ => return None,
+            };
+            let allowed = request
+                .operation_decisions
+                .iter()
+                .filter(|value| **value == Some(PermissionDecision::Allow))
+                .count();
+            let denied = request
+                .operation_decisions
+                .iter()
+                .filter(|value| **value == Some(PermissionDecision::Deny))
+                .count();
+            self.set_status(format!(
+                "Operation {}/{} · {} accepted · {} denied · [/] or n/N move",
+                request.operation_index + 1,
+                request.operation_count(),
+                allowed,
+                denied
+            ));
+            self.touch();
+            return None;
+        }
+
+        self.finish_permission_operations()
+    }
+
+    /// Allow every concrete operation, replacing any earlier per-operation
+    /// choices, and resolve through the same filtered execution pipeline.
+    pub fn resolve_all_permission_operations(&mut self) -> Option<Action> {
+        match &mut self.overlay {
+            Overlay::Permission(request) if request.has_multiple_operations() => {
+                request.decide_all_operations(PermissionDecision::Allow);
+            }
+            _ => return self.resolve_permission(Permission::Allow, None),
+        }
+        self.finish_permission_operations()
+    }
+
+    fn finish_permission_operations(&mut self) -> Option<Action> {
+        let (calls, counts, decisions, child_request_id) =
+            match std::mem::replace(&mut self.overlay, Overlay::None) {
+                Overlay::Permission(request) => (
+                    request.calls,
+                    request.operation_counts,
+                    request.operation_decisions,
+                    request.child_request_id,
+                ),
+                _ => return None,
+            };
+        self.notification_generation = self.notification_generation.wrapping_add(1);
+        crate::app::notify::dismiss();
+
+        if let Some(request_id) = child_request_id {
+            let mut call = calls.into_iter().next()?;
+            let count = counts.first().copied().unwrap_or(1).min(decisions.len());
+            let call_decisions = &decisions[..count];
+            let all_allowed = call_decisions
+                .iter()
+                .all(|value| *value == Some(PermissionDecision::Allow));
+            let all_denied = call_decisions
+                .iter()
+                .all(|value| *value == Some(PermissionDecision::Deny));
+            let result = if all_denied {
+                Err("Denied by user: every operation in this request was denied".into())
+            } else {
+                if !all_allowed {
+                    let denied = call_decisions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, value)| {
+                            (*value == Some(PermissionDecision::Deny)).then_some(index)
+                        })
+                        .map(|index| serde_json::Value::from(index as u64))
+                        .collect();
+                    if let Some(args) = call.args.as_object_mut() {
+                        args.insert(
+                            "__aitui_denied_operations".into(),
+                            serde_json::Value::Array(denied),
+                        );
+                    }
+                }
+                Ok(call)
+            };
+            if let Some(index) = self
+                .child_access_queue
+                .iter()
+                .position(|request| request.request_id == request_id)
+            {
+                if let Some(request) = self.child_access_queue.remove(index) {
+                    let allowed = result.is_ok();
+                    let _ = request.response.send(result);
+                    if let Some(task) = self
+                        .subtasks
+                        .iter_mut()
+                        .find(|task| task.id == request.task_id)
+                    {
+                        task.activity = Some(if allowed {
+                            format!("Access partially approved · {}", request.call.summary())
+                        } else {
+                            format!("Access denied · {}", request.call.summary())
+                        });
+                    }
+                    self.sync_subtask_message(request.task_id);
+                }
+            }
+            self.prompt_next_child_access();
+            self.touch();
+            return None;
+        }
+
+        let mut offset = 0;
+        for (mut call, count) in calls.into_iter().zip(counts) {
+            let end = (offset + count).min(decisions.len());
+            let call_decisions = &decisions[offset..end];
+            offset = end;
+            if call_decisions
+                .iter()
+                .all(|value| *value == Some(PermissionDecision::Allow))
+            {
+                self.approved.push_back(call);
+            } else if call_decisions
+                .iter()
+                .all(|value| *value == Some(PermissionDecision::Deny))
+            {
+                self.record_tool_result(ToolResult::failure(
+                    call,
+                    "Denied by user: every operation in this request was denied".into(),
+                    0,
+                ));
+            } else {
+                let denied = call_decisions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, value)| {
+                        (*value == Some(PermissionDecision::Deny)).then_some(index)
+                    })
+                    .map(|index| serde_json::Value::from(index as u64))
+                    .collect();
+                if let Some(args) = call.args.as_object_mut() {
+                    args.insert(
+                        "__aitui_denied_operations".into(),
+                        serde_json::Value::Array(denied),
+                    );
+                }
+                self.approved.push_back(call);
+            }
+        }
+        self.process_next_tool()
+    }
+
     /// Apply a permission choice from the menu (or a quick allow/deny). Choices
     /// broader than "once" are recorded as a session rule so the same
     /// kind/directory/timed decision auto-applies for the rest of the session.
@@ -1576,13 +1821,96 @@ impl App {
         perm: Permission,
         reason: Option<String>,
     ) -> Option<Action> {
-        let calls = match &self.overlay {
-            Overlay::Permission(req) => req.calls.clone(),
+        let (calls, child_request_id, request_cwd) = match &self.overlay {
+            Overlay::Permission(req) => (req.calls.clone(), req.child_request_id, req.cwd.clone()),
             _ => return None,
         };
         self.overlay = Overlay::None;
         self.notification_generation = self.notification_generation.wrapping_add(1);
         crate::app::notify::dismiss();
+
+        if let Some(request_id) = child_request_id {
+            let allow = match &perm {
+                Permission::Custom(rule) => {
+                    self.permissions.remember_custom_rule(rule.clone());
+                    rule.decision == PermissionDecision::Allow
+                        && calls
+                            .first()
+                            .is_some_and(|call| rule.matches(call, &request_cwd))
+                }
+                Permission::Allow
+                | Permission::AllowKind
+                | Permission::AllowDirectory
+                | Permission::AllowTimed => true,
+                Permission::Deny
+                | Permission::DenyKind
+                | Permission::DenyDirectory
+                | Permission::DenyTimed => false,
+            };
+            let decision = if allow {
+                PermissionDecision::Allow
+            } else {
+                PermissionDecision::Deny
+            };
+            if !matches!(perm, Permission::Custom(_)) {
+                for call in &calls {
+                    match &perm {
+                        Permission::AllowKind | Permission::DenyKind => {
+                            if let Some(kind) = call.kind() {
+                                self.permissions.remember_rule(
+                                    decision,
+                                    PermissionScope::Kind(kind),
+                                    false,
+                                );
+                            }
+                        }
+                        Permission::AllowDirectory | Permission::DenyDirectory => {
+                            if let Some(directory) = call.permission_directory(&request_cwd) {
+                                self.permissions.remember_rule(
+                                    decision,
+                                    PermissionScope::Directory(directory),
+                                    false,
+                                );
+                            }
+                        }
+                        Permission::AllowTimed | Permission::DenyTimed => {
+                            self.permissions
+                                .remember_rule(decision, PermissionScope::Timed, false);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(index) = self
+                .child_access_queue
+                .iter()
+                .position(|request| request.request_id == request_id)
+            {
+                if let Some(request) = self.child_access_queue.remove(index) {
+                    let result = if allow {
+                        Ok(request.call.clone())
+                    } else {
+                        Err(deny_text(reason.as_deref()))
+                    };
+                    let _ = request.response.send(result);
+                    if let Some(task) = self
+                        .subtasks
+                        .iter_mut()
+                        .find(|task| task.id == request.task_id)
+                    {
+                        task.activity = Some(if allow {
+                            format!("Access approved · {}", request.call.summary())
+                        } else {
+                            format!("Access denied · {}", request.call.summary())
+                        });
+                    }
+                    self.sync_subtask_message(request.task_id);
+                }
+            }
+            self.prompt_next_child_access();
+            self.touch();
+            return None;
+        }
 
         let allow = matches!(
             perm,
@@ -1644,12 +1972,8 @@ impl App {
         }
 
         if allow {
-            let mut calls = calls;
-            let first = calls.remove(0);
-            for call in calls.into_iter().rev() {
-                self.pending_tools.push_front(call);
-            }
-            self.execute_tool(first)
+            self.approved.extend(calls);
+            self.process_next_tool()
         } else {
             let text = deny_text(reason.as_deref());
             for call in calls {
@@ -1660,6 +1984,57 @@ impl App {
         }
     }
 
+    fn prompt_next_child_access(&mut self) {
+        if !matches!(self.overlay, Overlay::None) {
+            return;
+        }
+        let Some(request) = self.child_access_queue.front() else {
+            return;
+        };
+        let request_id = request.request_id;
+        let task_id = request.task_id;
+        let call = request.call.clone();
+        let cwd = request.cwd.clone();
+        let child_label = self
+            .subtasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .map(|task| {
+                let name = task.agent.clone().unwrap_or_else(|| {
+                    task.call
+                        .args
+                        .get("agent_index")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|index| format!("agent {}", index))
+                        .unwrap_or_else(|| format!("subagent #{}", task.id))
+                });
+                let description = task.description.trim();
+                if description.is_empty() || description.eq_ignore_ascii_case(&name) {
+                    name
+                } else {
+                    format!("{} — {}", name, description)
+                }
+            })
+            .unwrap_or_else(|| format!("subagent #{}", task_id));
+        let mut prompt = PermissionRequest::new(vec![call.clone()], cwd);
+        prompt.child_request_id = Some(request_id);
+        prompt.child_agent_label = Some(child_label.clone());
+        self.notify_desktop(
+            "AiTUI — subagent access needed",
+            format!("{} requests {}", child_label, call.summary()),
+            &[
+                crate::app::notify::DesktopAction::Review,
+                crate::app::notify::DesktopAction::AllowAll,
+                crate::app::notify::DesktopAction::DenyOnce,
+            ],
+        );
+        self.overlay = Overlay::Permission(prompt);
+        self.set_status(format!(
+            "Subagent access · {} — a allow current · A allow all · d deny current · e edit · p policy · Esc cancel",
+            child_label
+        ));
+    }
+
     /// Show the permission prompt for a batch the judge couldn't clear (or when no
     /// policy is set). Shared by the plain path, the judge's "ask" verdicts, and a
     /// re-judge that still needs the human.
@@ -1667,19 +2042,19 @@ impl App {
         self.notify_desktop(
             "AiTUI — access needed",
             format!(
-                "Allow {} pending tool call{}?",
+                "Allow all operations in {} pending tool call{}?",
                 calls.len(),
                 if calls.len() == 1 { "" } else { "s" }
             ),
             &[
                 crate::app::notify::DesktopAction::Review,
-                crate::app::notify::DesktopAction::AllowOnce,
+                crate::app::notify::DesktopAction::AllowAll,
                 crate::app::notify::DesktopAction::DenyOnce,
             ],
         );
         self.overlay = Overlay::Permission(PermissionRequest::new(calls, self.agent_cwd()));
         self.set_status(
-            "Access — ↑↓ option · ←→ phrase · a allow · d deny · e edit · p policy · ⏎ model review · Esc cancel",
+            "Access — a allow current · A allow all · d deny current · e edit · p policy · ⏎ model review · Esc cancel",
         );
         None
     }
@@ -1942,7 +2317,7 @@ impl App {
     /// recover the untouched batch, and route it straight to the human prompt.
     pub fn disable_access_review(&mut self) -> Option<Action> {
         self.config.api.access_review_mode = crate::config::AccessReviewMode::Off;
-        let _ = self.config.save();
+        self.save_config();
         if let Some(task) = self.judge_task.take() {
             task.abort();
         }
@@ -1965,7 +2340,7 @@ impl App {
         mode: crate::config::AccessReviewMode,
     ) -> Option<Action> {
         self.config.api.access_review_mode = mode;
-        let _ = self.config.save();
+        self.save_config();
         self.set_status(format!("Permission review: {}", mode.label()));
         self.retriage_open_permission()
     }
@@ -1996,7 +2371,9 @@ impl App {
             _ => return None,
         };
         if dropped.is_empty() {
-            self.set_status("Commands updated — a allow · d deny · e edit again · ⏎ model review");
+            self.set_status(
+                "Commands updated — a allow current · A allow all · d deny current · e edit again · ⏎ model review",
+            );
             self.touch();
             return None;
         }
@@ -2011,6 +2388,7 @@ impl App {
             }
             req.selected = req.selected.min(PERMISSION_OPTIONS - 1);
             req.scroll = 0;
+            req.reset_operation_decisions();
         }
         for call in denied {
             let res = ToolResult::failure(call, "Skipped by user (removed in editor)".into(), 0);
@@ -2021,7 +2399,9 @@ impl App {
             self.overlay = Overlay::None;
             return self.process_next_tool();
         }
-        self.set_status("Commands updated — a allow · d deny · e edit again · ⏎ model review");
+        self.set_status(
+            "Commands updated — a allow current · A allow all · d deny current · e edit again · ⏎ model review",
+        );
         self.touch();
         None
     }
@@ -2452,11 +2832,11 @@ impl App {
             }
         }
         self.set_status(format!(
-            "Running {} read-only tools in parallel",
+            "Running {} independent tools in parallel",
             results.len()
         ));
         self.active_tool = Some((
-            format!("{} parallel read-only tools", results.len()),
+            format!("{} independent tools", results.len()),
             std::time::Instant::now(),
         ));
         self.touch();
@@ -2654,11 +3034,14 @@ impl App {
                 .get("verification")
                 .and_then(|value| value.as_str())
                 .filter(|value| matches!(*value, "none" | "replicate"))
-                .unwrap_or(if checks.is_empty() {
-                    "none"
-                } else {
-                    "replicate"
-                })
+                .unwrap_or("none")
+                .to_string();
+            let urgency = call
+                .args
+                .get("urgency")
+                .and_then(|value| value.as_str())
+                .filter(|value| matches!(*value, "very_urgent" | "time_sensitive" | "best_quality"))
+                .unwrap_or("best_quality")
                 .to_string();
             let todo_index = call
                 .args
@@ -2723,6 +3106,7 @@ impl App {
                 prompt,
                 checks,
                 verification,
+                urgency,
                 cwd,
                 model: agent_def
                     .as_ref()
@@ -2809,6 +3193,47 @@ impl App {
         event: crate::app::state::SubtaskEvent,
     ) -> Option<Action> {
         match event {
+            crate::app::state::SubtaskEvent::AccessRequested {
+                id,
+                request_id,
+                call,
+                cwd,
+                response,
+            } => {
+                use crate::app::state::ChildAccessRequest;
+                let remembered = self.permissions.check(&call, &cwd);
+                match remembered {
+                    Some(PermissionDecision::Deny) => {
+                        self.permissions.consume(&call, &cwd);
+                        let _ = response.send(Err("Denied by session access policy".into()));
+                    }
+                    Some(PermissionDecision::Allow)
+                        if !crate::agent::needs_hard_prompt(&call, &cwd) =>
+                    {
+                        self.permissions.consume(&call, &cwd);
+                        let _ = response.send(Ok(call));
+                    }
+                    _ => {
+                        if let Some(task) = self.subtasks.iter_mut().find(|task| task.id == id) {
+                            let text = format!("Waiting for access · {}", call.summary());
+                            task.activity = Some(text.clone());
+                            task.log
+                                .push(crate::app::state::SubtaskLogEntry::Phase { text });
+                        }
+                        self.child_access_queue.push_back(ChildAccessRequest {
+                            request_id,
+                            task_id: id,
+                            call,
+                            cwd,
+                            response,
+                        });
+                        self.prompt_next_child_access();
+                    }
+                }
+                self.sync_subtask_message(id);
+                self.touch();
+                None
+            }
             crate::app::state::SubtaskEvent::Progress { id, progress } => {
                 use crate::app::state::{SubtaskLogEntry, SubtaskProgress, SubtaskToolStatus};
                 if let Some(task) = self.subtasks.iter_mut().find(|task| {
@@ -2859,6 +3284,38 @@ impl App {
                                 output: None,
                             });
                         }
+                        SubtaskProgress::ToolOutput {
+                            name,
+                            summary,
+                            chunk,
+                        } => {
+                            const MAX_LIVE_OUTPUT_BYTES: usize = 8 * 1024;
+                            if let Some(SubtaskLogEntry::Tool { output, .. }) =
+                                task.log.iter_mut().rev().find(|entry| {
+                                    matches!(
+                                        entry,
+                                        SubtaskLogEntry::Tool {
+                                            name: entry_name,
+                                            summary: entry_summary,
+                                            status: SubtaskToolStatus::Running,
+                                            ..
+                                        } if *entry_name == name && *entry_summary == summary
+                                    )
+                                })
+                            {
+                                let live = output.get_or_insert_with(String::new);
+                                live.push_str(&chunk);
+                                if live.len() > MAX_LIVE_OUTPUT_BYTES {
+                                    let mut drain = live.len() - MAX_LIVE_OUTPUT_BYTES;
+                                    while drain < live.len() && !live.is_char_boundary(drain) {
+                                        drain += 1;
+                                    }
+                                    live.drain(..drain);
+                                    live.insert_str(0, "[… earlier output truncated …]\n");
+                                }
+                            }
+                            task.activity = Some(format!("Running {} · live output", summary));
+                        }
                         SubtaskProgress::ToolFinished {
                             name,
                             summary,
@@ -2867,7 +3324,11 @@ impl App {
                             ok,
                             duration_ms,
                         } => {
-                            task.activity = Some("Reviewing tool result · continuing".into());
+                            task.activity = Some(format!(
+                                "{} {} · preparing next step",
+                                if ok { "Completed" } else { "Failed" },
+                                summary
+                            ));
                             let finished = SubtaskLogEntry::Tool {
                                 name: name.clone(),
                                 summary: summary.clone(),
@@ -2980,20 +3441,14 @@ impl App {
                     .subtasks
                     .iter()
                     .any(|task| task.id == id && task.parent_id.is_some());
+                let (status, report) = completed_subtask_outcome(output);
                 if nested {
                     if let Some(task) = self.subtasks.iter_mut().find(|task| task.id == id) {
-                        task.status = if output.is_ok() {
-                            crate::app::state::SubtaskStatus::Completed
-                        } else {
-                            crate::app::state::SubtaskStatus::Failed
-                        };
+                        task.status = status;
                         task.activity = None;
                         task.duration_ms = Some(duration_ms);
                         task.abort = None;
-                        task.output = Some(match &output {
-                            Ok(text) => text.clone(),
-                            Err(error) => error.clone(),
-                        });
+                        task.output = Some(report.clone());
                     }
                     self.sync_subtask_message(id);
                     let sid = self
@@ -3018,18 +3473,11 @@ impl App {
                     return None;
                 }
                 if let Some(task) = self.subtasks.iter_mut().find(|task| task.id == id) {
-                    task.status = if output.is_ok() {
-                        crate::app::state::SubtaskStatus::Completed
-                    } else {
-                        crate::app::state::SubtaskStatus::Failed
-                    };
+                    task.status = status;
                     task.activity = None;
                     task.duration_ms = Some(duration_ms);
                     task.abort = None;
-                    task.output = Some(match &output {
-                        Ok(text) => text.clone(),
-                        Err(error) => error.clone(),
-                    });
+                    task.output = Some(report);
                 }
                 self.sync_subtask_message(id);
                 let sid = self
@@ -3113,10 +3561,19 @@ impl App {
                     (crate::app::state::SubtaskStatus::Completed, Some(out)) => {
                         format!("{name} (completed):\n{out}")
                     }
-                    (crate::app::state::SubtaskStatus::Failed, Some(err)) => {
-                        format!("{name} (failed):\n{err}")
+                    (crate::app::state::SubtaskStatus::Unresolved, Some(reason)) => {
+                        format!("{name} (unresolved):\n{reason}")
                     }
-                    _ => format!("{name}: no report"),
+                    (crate::app::state::SubtaskStatus::Failed, Some(reason)) => {
+                        let unresolved = crate::agent::subtask::unresolved_report(reason);
+                        format!("{name} (unresolved):\n{unresolved}")
+                    }
+                    _ => format!(
+                        "{name} (unresolved):\n{}",
+                        crate::agent::subtask::unresolved_report(
+                            "The child completed without a review or unresolved reason."
+                        )
+                    ),
                 };
                 lines.push(body);
             }
@@ -3127,7 +3584,8 @@ impl App {
         if let Some(session) = self.sessions.by_id_mut(sid) {
             session.push_message(ChatMessage::user(format!(
                 "All delegated child agents have completed. Reports:\n\n{}\n\n\
-                 Synthesize your final response now, incorporating these results.",
+                 These reports answer the earlier delegation request, not any user messages sent while the children were working. \
+                 Synthesize the reports, then explicitly acknowledge and address every intervening user prompt visible after that earlier request.",
                 lines.join("\n\n---\n\n")
             )));
         }
@@ -3405,7 +3863,7 @@ fn prepend_or_merge_system(messages: &mut Vec<ChatMessage>, text: String) {
     messages.insert(0, ChatMessage::system(text.trim().to_string()));
 }
 
-fn build_user_message(text: &str, attachment: Option<&PathBuf>, app: &mut App) -> ChatMessage {
+fn build_user_message(text: &str, attachment: Option<&PathBuf>) -> ChatMessage {
     let Some(path) = attachment else {
         return ChatMessage::user(text.to_string());
     };
@@ -3413,7 +3871,7 @@ fn build_user_message(text: &str, attachment: Option<&PathBuf>, app: &mut App) -
         match crate::files::load_image_base64(path) {
             Ok((b64, mime)) => return ChatMessage::user_with_image(text, &b64, &mime),
             Err(e) => {
-                app.set_status(format!("Image load error: {}", e));
+                crate::app::toast::error(format!("Image load error: {}", e));
                 return ChatMessage::user(text.to_string());
             }
         }
@@ -3428,7 +3886,7 @@ fn build_user_message(text: &str, attachment: Option<&PathBuf>, app: &mut App) -
             ChatMessage::user(combined)
         }
         Err(e) => {
-            app.set_status(format!("File read error: {}", e));
+            crate::app::toast::error(format!("File read error: {}", e));
             ChatMessage::user(text.to_string())
         }
     }
@@ -3462,17 +3920,16 @@ fn deny_text(reason: Option<&str>) -> String {
     }
 }
 
-fn is_parallel_read(call: &ToolCall) -> bool {
-    matches!(
+fn is_directly_executable(call: &ToolCall) -> bool {
+    !matches!(
         call.kind(),
-        Some(
-            ToolKind::Read
-                | ToolKind::List
-                | ToolKind::Search
-                | ToolKind::WebSearch
-                | ToolKind::WebImages
-                | ToolKind::ReverseImage
-                | ToolKind::WebFetch
+        None | Some(
+            ToolKind::Todo
+                | ToolKind::Ask
+                | ToolKind::Plan
+                | ToolKind::ProposeStep
+                | ToolKind::Task
+                | ToolKind::Finish
         )
     )
 }
@@ -3630,6 +4087,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn attached_png_builds_multimodal_user_message() {
+        let path = std::env::temp_dir().join(format!(
+            "aitui-clipboard-message-{}-{}.png",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+            .save(&path)
+            .unwrap();
+
+        let message = build_user_message("describe this", Some(&path));
+        let MessageContent::Parts(parts) = message.content else {
+            panic!("image attachment must produce multimodal message parts");
+        };
+        assert!(matches!(
+            &parts[0],
+            crate::api::models::ContentPart::ImageUrl { image_url }
+                if image_url.url.starts_with("data:image/png;base64,")
+        ));
+        assert!(matches!(
+            &parts[1],
+            crate::api::models::ContentPart::Text { text } if text == "describe this"
+        ));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn image_prompt_carries_text_model_context_into_latest_request() {
         let mut session = crate::domain::session::Session::new(1);
         session.messages.push(ChatMessage::user(
@@ -3706,18 +4190,24 @@ mod tests {
     }
 
     #[test]
-    fn parallel_read_classifier_keeps_mutations_as_barriers() {
+    fn direct_execution_classifier_keeps_workflow_controls_out_of_waves() {
         let call = |action| ToolCall {
             name: "file_management".into(),
             args: serde_json::json!({"action": action, "path": "."}),
             id: None,
         };
-        assert!(is_parallel_read(&call("read")));
-        assert!(is_parallel_read(&call("list")));
-        assert!(is_parallel_read(&call("search")));
-        assert!(!is_parallel_read(&call("write")));
-        assert!(!is_parallel_read(&call("edit")));
-        assert!(!is_parallel_read(&call("delete")));
+        assert!(is_directly_executable(&call("read")));
+        assert!(is_directly_executable(&call("write")));
+        assert!(is_directly_executable(&ToolCall {
+            name: "shell".into(),
+            args: serde_json::json!({"command": "cargo test"}),
+            id: None,
+        }));
+        assert!(!is_directly_executable(&ToolCall {
+            name: "interaction".into(),
+            args: serde_json::json!({"action": "ask", "question": "Continue?"}),
+            id: None,
+        }));
     }
 
     #[test]
@@ -3752,9 +4242,9 @@ mod tests {
             items: vec![crate::app::state::TodoItem {
                 text: "Fix build".into(),
                 status: crate::app::state::TodoStatus::Done,
-                percent: Some(100),
+                percent: Some(98),
             }],
-            overall_percent: Some(100),
+            overall_percent: Some(99),
         };
         app.apply_todo_update(sid, signature, Ok(update));
         assert_eq!(app.sessions.active().todos.len(), 1);

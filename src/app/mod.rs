@@ -12,6 +12,7 @@ pub mod overlay;
 pub mod reducer;
 pub mod state;
 pub mod suggestions;
+pub mod toast;
 pub mod todo_tracker;
 
 pub use action::Action;

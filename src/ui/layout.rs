@@ -16,7 +16,7 @@ pub fn sidebar_width(total: u16) -> u16 {
     if total < SIDEBAR_SHOW_THRESHOLD {
         0
     } else {
-        (total / 5).max(22).min(30)
+        (total / 5).clamp(22, 30)
     }
 }
 

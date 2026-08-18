@@ -285,6 +285,7 @@ fn detail_lines(task: &Subtask, width: usize, theme: &Theme) -> Vec<Line<'static
     let (state, color) = match task.status {
         SubtaskStatus::Running => ("RUNNING", theme.warning),
         SubtaskStatus::Completed => ("COMPLETED", theme.success),
+        SubtaskStatus::Unresolved => ("UNRESOLVED", theme.warning),
         SubtaskStatus::Failed => ("FAILED", theme.danger),
     };
     let elapsed = crate::render::document::fmt_duration_ms(
@@ -444,21 +445,69 @@ fn detail_lines(task: &Subtask, width: usize, theme: &Theme) -> Vec<Line<'static
         .as_deref()
         .filter(|report| !report.trim().is_empty())
     {
+        let unresolved = task.status == SubtaskStatus::Unresolved
+            || crate::agent::subtask::is_unresolved_report(report);
         out.push(Line::from(Span::styled(
-            " REPORT ",
+            if unresolved { " REVIEW UNRESOLVED " } else { " REVIEW " },
             Style::default()
-                .bg(theme.accent)
+                .bg(if unresolved { theme.warning } else { theme.accent })
                 .fg(ratatui::style::Color::Black)
                 .add_modifier(Modifier::BOLD),
         )));
-        for text in wrapped_indented(report, width.saturating_sub(3))
-            .into_iter()
-            .take(MAX_REPORT_LINES)
-        {
-            out.push(Line::from(Span::styled(
-                format!("  {}", text),
-                Style::default().fg(theme.text),
-            )));
+        let report = report
+            .trim()
+            .strip_prefix("[agent-outcome:unresolved]")
+            .unwrap_or(report.trim())
+            .trim();
+        if let Some(structured) = crate::agent::report::verification_report(report) {
+            use crate::agent::report::FindingAnswer;
+            for finding in structured.findings.iter().take(MAX_REPORT_LINES / 2) {
+                let (glyph, color) = match finding.answer {
+                    FindingAnswer::Yes => ("✓", theme.success),
+                    FindingAnswer::No => ("×", theme.danger),
+                    FindingAnswer::Mixed => ("◐", theme.warning),
+                    FindingAnswer::Unknown => ("?", theme.muted),
+                };
+                out.push(Line::from(vec![
+                    Span::styled(format!("  {} ", glyph), Style::default().fg(color)),
+                    Span::styled(
+                        finding.check_id.clone(),
+                        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  {}", finding.support),
+                        Style::default().fg(theme.muted),
+                    ),
+                ]));
+                for text in wrap_words(&finding.statement, width.saturating_sub(6).max(1))
+                    .into_iter()
+                    .take(1)
+                {
+                    out.push(Line::from(Span::styled(
+                        format!("    {}", text),
+                        Style::default().fg(theme.text),
+                    )));
+                }
+            }
+            if !structured.unresolved.is_empty() {
+                out.push(Line::from(vec![
+                    Span::styled("  ? ", Style::default().fg(theme.warning)),
+                    Span::styled(
+                        format!("Unresolved: {}", structured.unresolved.join(", ")),
+                        Style::default().fg(theme.warning),
+                    ),
+                ]));
+            }
+        } else {
+            for text in wrapped_indented(report, width.saturating_sub(3))
+                .into_iter()
+                .take(MAX_REPORT_LINES)
+            {
+                out.push(Line::from(Span::styled(
+                    format!("  {}", text),
+                    Style::default().fg(theme.text),
+                )));
+            }
         }
     }
     out
@@ -546,6 +595,40 @@ mod tests {
         let text: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
         assert!(text.iter().any(|line| line.contains("2.0s")));
         assert!(text.iter().any(|line| line.contains("test result: ok")));
+    }
+
+    #[test]
+    fn unresolved_detail_uses_review_card_label_and_hides_marker() {
+        let mut task = subtask(SubtaskStatus::Unresolved, Vec::new());
+        task.output = Some(crate::agent::subtask::unresolved_report(
+            "No tool output found for function call call_private",
+        ));
+        let lines = detail_lines(&task, 70, &Theme::default());
+        let text: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        assert!(text.iter().any(|line| line.contains("UNRESOLVED")));
+        assert!(text.iter().any(|line| line.contains("REVIEW UNRESOLVED")));
+        assert!(text.iter().any(|line| line.contains("required tool result")));
+        assert!(!text.iter().any(|line| line.contains("call_private")));
+        assert!(!text.iter().any(|line| line.contains("agent-outcome")));
+    }
+
+    #[test]
+    fn structured_report_detail_uses_finding_and_unresolved_icons() {
+        let mut task = subtask(SubtaskStatus::Unresolved, Vec::new());
+        task.output = Some(concat!(
+            "{\"schema\":\"aitui.verification-summary.v1\",\"status\":\"partially_verified\",",
+            "\"findings\":[{\"check_id\":\"latency\",\"answer\":\"yes\",",
+            "\"statement\":\"Avoidable waits exist.\",\"support\":\"2/2 replicas\",",
+            "\"evidence\":[]}],\"unresolved\":[\"access\"],\"diagnostics\":[]}"
+        ).into());
+        let lines = detail_lines(&task, 80, &Theme::default());
+        let text: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        assert!(text.iter().any(|line| line.contains("✓ latency")));
+        assert!(text.iter().any(|line| line.contains("2/2 replicas")));
+        assert!(text.iter().any(|line| line.contains("Unresolved: access")));
+        assert!(!text
+            .iter()
+            .any(|line| line.contains("aitui.verification-summary.v1")));
     }
 
     #[test]

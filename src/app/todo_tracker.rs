@@ -52,11 +52,11 @@ Given the last user message, the agent's latest response, completed child-agent 
 the current checklist, produce the updated checklist:\n\
 - Create the checklist from the conversation when none exists yet.\n\
 - Mark items the agent (or its child agents) has verifiably finished as \"done\".\n\
-- Mark exactly one currently active item as \"in_progress\" (the work the agent is doing now).\n\
+- If work remains, mark at most one currently active item as \"in_progress\". If every item is finished, mark every item \"done\" and none \"in_progress\".\n\
 - Tasks worked on inside child agents still count: use their reports and todo activity.\n\
 - Keep item text identical unless the conversation genuinely replans.\n\
 - Estimate a percent (0-100) for every item reflecting real progress.\n\
-- Estimate an overall_percent (0-100) for the whole checklist.\n\
+- Estimate an overall_percent (0-100) for the whole checklist. It must be 100 when every item is done, and less than 100 while any item remains.\n\
 Reply with ONLY a JSON object, no prose:\n\
 {\"overall_percent\": 40, \"items\": [{\"text\": \"...\", \"status\": \"pending|in_progress|done\", \"percent\": 10}]}";
     let current = if todos.is_empty() {
@@ -149,7 +149,37 @@ pub fn parse(reply: &str) -> TodoUpdate {
             percent,
         });
     }
+    normalize(&mut update);
     update
+}
+
+/// Enforce consistency that should not depend on model arithmetic. A completed
+/// checklist is always exactly 100%; an incomplete checklist can never claim
+/// 100%, and an item's percent agrees with its status.
+pub fn normalize(update: &mut TodoUpdate) {
+    if update.items.is_empty() {
+        update.overall_percent = None;
+        return;
+    }
+    for item in &mut update.items {
+        match item.status {
+            TodoStatus::Done => item.percent = Some(100),
+            TodoStatus::Pending | TodoStatus::InProgress => {
+                if item.percent.is_some_and(|percent| percent >= 100) {
+                    item.percent = Some(99);
+                }
+            }
+        }
+    }
+    if update
+        .items
+        .iter()
+        .all(|item| item.status == TodoStatus::Done)
+    {
+        update.overall_percent = Some(100);
+    } else if update.overall_percent.is_some_and(|percent| percent >= 100) {
+        update.overall_percent = Some(99);
+    }
 }
 
 fn extract_json_block(reply: &str) -> Option<&str> {
@@ -192,11 +222,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_bare_array_and_defaults_missing_fields() {
+    fn parses_bare_array_and_normalizes_completed_items() {
         let update = parse(r#"[{"text": "one", "status": "done"}]"#);
-        assert_eq!(update.overall_percent, None);
+        assert_eq!(update.overall_percent, Some(100));
         assert_eq!(update.items.len(), 1);
-        assert_eq!(update.items[0].percent, None);
+        assert_eq!(update.items[0].percent, Some(100));
     }
 
     #[test]
@@ -215,9 +245,29 @@ mod tests {
           {"text": "a", "percent": 10}
         ]}"#;
         let update = parse(reply);
-        assert_eq!(update.overall_percent, Some(100));
+        assert_eq!(update.overall_percent, Some(99));
         assert_eq!(update.items.len(), 1);
-        assert_eq!(update.items[0].percent, Some(100));
+        assert_eq!(update.items[0].percent, Some(99));
+    }
+
+    #[test]
+    fn all_done_checklists_normalize_to_exactly_100_percent() {
+        let update = parse(
+            r#"{"overall_percent": 99, "items": [
+                {"text": "one", "status": "done", "percent": 98},
+                {"text": "two", "status": "completed"}
+            ]}"#,
+        );
+        assert_eq!(update.overall_percent, Some(100));
+        assert!(update.items.iter().all(|item| item.percent == Some(100)));
+    }
+
+    #[test]
+    fn prompt_allows_no_active_item_when_everything_is_finished() {
+        let (system, _) = build_prompt("u", "a", &[], &[]);
+        assert!(system.contains("at most one currently active item"));
+        assert!(system.contains("mark every item \"done\" and none \"in_progress\""));
+        assert!(system.contains("must be 100 when every item is done"));
     }
 
     #[test]

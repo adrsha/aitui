@@ -538,9 +538,21 @@ impl CommandLine {
 pub struct PermissionRequest {
     pub calls: Vec<ToolCall>,
     pub cwd: PathBuf,
+    /// Child agent waiting for this access decision, when the request did not
+    /// originate from the root tool queue.
+    pub child_request_id: Option<u64>,
+    /// Human-readable identity of the requesting child, shown prominently so a
+    /// child-originated request cannot be mistaken for a root-agent request.
+    pub child_agent_label: Option<String>,
     pub selected: usize,
     pub scroll: usize,
     pub horizontal_scroll: usize,
+    /// Concrete operation highlighted for an individual allow/deny decision.
+    pub operation_index: usize,
+    /// Per-concrete-operation decisions. A batch is resolved once every entry is set.
+    pub operation_decisions: Vec<Option<PermissionDecision>>,
+    /// Number of concrete operations represented by each top-level tool call.
+    pub operation_counts: Vec<usize>,
     pub deny: Option<DenyDraft>,
     pub decision: PermissionDecision,
     pub tool_index: usize,
@@ -592,12 +604,28 @@ impl PermissionRequest {
             .as_ref()
             .map(|directory| directory.to_string_lossy().to_string())
             .unwrap_or_default();
+        let operation_counts = calls
+            .iter()
+            .map(|call| {
+                call.expanded_calls()
+                    .ok()
+                    .flatten()
+                    .filter(|items| !items.is_empty())
+                    .map_or(1, |items| items.len())
+            })
+            .collect::<Vec<_>>();
+        let operation_count = operation_counts.iter().sum();
         Self {
             calls,
             cwd,
+            child_request_id: None,
+            child_agent_label: None,
             selected,
             scroll: 0,
             horizontal_scroll: 0,
+            operation_index: 0,
+            operation_decisions: vec![None; operation_count],
+            operation_counts,
             deny: None,
             decision: PermissionDecision::Allow,
             tool_index,
@@ -632,6 +660,64 @@ impl PermissionRequest {
     }
     pub fn scroll_right(&mut self) {
         self.horizontal_scroll = self.horizontal_scroll.saturating_add(4);
+    }
+
+    pub fn operation_count(&self) -> usize {
+        self.operation_decisions.len()
+    }
+
+    pub fn has_multiple_operations(&self) -> bool {
+        self.operation_count() > 1
+    }
+
+    pub fn previous_operation(&mut self) {
+        if self.has_multiple_operations() {
+            self.operation_index = self
+                .operation_index
+                .checked_sub(1)
+                .unwrap_or_else(|| self.operation_count() - 1);
+        }
+    }
+
+    pub fn next_operation(&mut self) {
+        if self.has_multiple_operations() {
+            self.operation_index = (self.operation_index + 1) % self.operation_count();
+        }
+    }
+
+    /// Decide the highlighted concrete operation and advance to the next undecided
+    /// one. Returns true when every operation in the request has a decision.
+    pub fn decide_operation(&mut self, decision: PermissionDecision) -> bool {
+        if let Some(slot) = self.operation_decisions.get_mut(self.operation_index) {
+            *slot = Some(decision);
+        }
+        if let Some(next) = self.operation_decisions.iter().position(Option::is_none) {
+            self.operation_index = next;
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Replace every prior per-operation choice with the same decision.
+    pub fn decide_all_operations(&mut self, decision: PermissionDecision) {
+        self.operation_decisions.fill(Some(decision));
+    }
+
+    pub fn reset_operation_decisions(&mut self) {
+        self.operation_counts = self
+            .calls
+            .iter()
+            .map(|call| {
+                call.expanded_calls()
+                    .ok()
+                    .flatten()
+                    .filter(|items| !items.is_empty())
+                    .map_or(1, |items| items.len())
+            })
+            .collect();
+        self.operation_decisions = vec![None; self.operation_counts.iter().sum()];
+        self.operation_index = 0;
     }
 
     /// Render the batch as an editable plain-text buffer for `$EDITOR`. Each call
@@ -1152,6 +1238,27 @@ impl ApiSetup {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct PromptDuringRun {
+    pub selected: usize,
+}
+
+impl PromptDuringRun {
+    pub const OPTIONS: [&'static str; 3] = [
+        "Queue — send as soon as the current work finishes",
+        "Interrupt — stop the current work and send now",
+        "Wait — keep this prompt in the composer",
+    ];
+
+    pub fn up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn down(&mut self) {
+        self.selected = (self.selected + 1).min(Self::OPTIONS.len() - 1);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Overlay {
     None,
     Picker(Picker),
@@ -1160,6 +1267,8 @@ pub enum Overlay {
     Settings(Settings),
     Permission(PermissionRequest),
     Decision(DecisionRequest),
+    /// Confirmation shown when Enter is pressed while the main agent is active.
+    PromptDuringRun(PromptDuringRun),
     Plan(PlanRequest),
     /// Model asked for tools while agent mode is off — enable & run, or decline.
     ToolRequest(ToolRequest),
@@ -1665,6 +1774,59 @@ mod tests {
             req.down();
         }
         assert_eq!(req.selected, PERMISSION_OPTIONS - 1);
+    }
+
+    #[test]
+    fn multi_operation_decisions_advance_and_can_be_revisited() {
+        let mut req = PermissionRequest::new(
+            vec![ToolCall {
+                name: "shell".into(),
+                args: serde_json::json!({ "commands": ["one", "two", "three"] }),
+                id: None,
+            }],
+            std::env::current_dir().unwrap(),
+        );
+        assert_eq!(req.operation_count(), 3);
+        assert!(req.has_multiple_operations());
+        assert!(!req.decide_operation(PermissionDecision::Allow));
+        assert_eq!(req.operation_index, 1);
+        req.next_operation();
+        assert_eq!(req.operation_index, 2);
+        assert!(!req.decide_operation(PermissionDecision::Deny));
+        assert_eq!(req.operation_index, 1);
+        assert!(req.decide_operation(PermissionDecision::Allow));
+        assert_eq!(
+            req.operation_decisions,
+            vec![
+                Some(PermissionDecision::Allow),
+                Some(PermissionDecision::Allow),
+                Some(PermissionDecision::Deny),
+            ]
+        );
+        req.previous_operation();
+        assert_eq!(req.operation_index, 0);
+    }
+
+    #[test]
+    fn allow_all_replaces_prior_operation_decisions() {
+        let mut req = PermissionRequest::new(
+            vec![ToolCall {
+                name: "shell".into(),
+                args: serde_json::json!({ "commands": ["one", "two", "three"] }),
+                id: None,
+            }],
+            std::env::current_dir().unwrap(),
+        );
+        assert!(!req.decide_operation(PermissionDecision::Deny));
+        req.decide_all_operations(PermissionDecision::Allow);
+        assert_eq!(
+            req.operation_decisions,
+            vec![
+                Some(PermissionDecision::Allow),
+                Some(PermissionDecision::Allow),
+                Some(PermissionDecision::Allow),
+            ]
+        );
     }
 
     #[test]

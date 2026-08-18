@@ -7,6 +7,7 @@ mod powerpoint;
 pub mod report;
 pub mod subtask;
 pub mod tools;
+pub mod video;
 
 pub use access::{describe_call, needs_hard_prompt, AccessVerdict};
 pub use tools::{
@@ -15,7 +16,9 @@ pub use tools::{
 };
 // Re-exported but currently unused; available for tool-schema / function-calling
 // integrations and live-stream tool parsing.
-pub use executor::{configure_search, execute, execute_abortable, SearchSettings};
+pub use executor::{
+    configure_search, execute, execute_abortable, execute_abortable_streaming, SearchSettings,
+};
 #[allow(unused_imports)]
 pub use parser::{strip_tool_blocks, StreamingParser};
 #[allow(unused_imports)]

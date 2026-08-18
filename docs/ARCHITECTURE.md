@@ -78,8 +78,8 @@ the same reducer/effect split: startup, API setup, and `:reload-models` call
 | **`agent/`** | The agentic layer. |
 | `agent/tools.rs` | Six model-visible tool categories, operation-level `ToolKind` resolution, risk levels, JSON schemas, system prompt, and permission memory. |
 | `agent/parser.rs` | Extract `<tool>…</tool>` calls (and legacy ```` ```tool ```` fences) from model text (+ a streaming parser, currently unused). |
-| `agent/executor.rs` | Actually run a `ToolCall` on the filesystem/shell → `ToolResult`; dispatches `specialized(powerpoint)` through AiTUI's bundled generator. |
-| `agent/powerpoint.rs` + `agent/powerpoint/animated_pptx/` | Rust-owned embedded Python implementation for the native PowerPoint tool: static slide construction, fixed OOXML animations/transitions, atomic save, and round-trip validation. See [`POWERPOINT_TOOL.md`](./POWERPOINT_TOOL.md). |
+| `agent/executor.rs` | Actually run a `ToolCall` on the filesystem/shell → `ToolResult`; dispatches `specialized(powerpoint)` directly to AiTUI's in-process Rust engine. |
+| `agent/powerpoint.rs` + `agent/powerpoint/native.rs` | Rust-native PowerPoint implementation: OPC/presentation construction, fixed OOXML animations/transitions, inspection, preservation checks, atomic save, and reopen validation. See [`POWERPOINT_TOOL.md`](./POWERPOINT_TOOL.md). |
 | `agent/subtask.rs` | Runs isolated read-only child-agent loops, including safe build/test shell filtering and progress/result events. |
 | **`domain/`** | Pure domain model. |
 | `domain/session.rs` | `Session` + `SessionManager`: history, streaming accumulation, JSON persistence. |
@@ -187,9 +187,9 @@ risk and permission scopes for operations such as read, edit, and delete.
 `web` includes search/images/reverse_image/fetch/download; `specialized` includes
 PowerPoint generation from validated structured slide specs. PowerPoint is routed as
 `ToolKind::PowerPoint` through normal permissions and executor dispatch—not through the
-model-visible shell tool. Its Python implementation is embedded from
-`src/agent/powerpoint/animated_pptx/`, so runtime does not depend on a repository-root
-module or separately installed AiTUI package (see [`POWERPOINT_TOOL.md`](./POWERPOINT_TOOL.md)); `interaction` includes
+model-visible shell tool. Its implementation runs in-process using Rust's `pptx` and
+`quick-xml` crates, with no Python interpreter or Python package dependency (see
+[`POWERPOINT_TOOL.md`](./POWERPOINT_TOOL.md)); `interaction` includes
 ask/propose/plan; and `workflow` includes todo/agent/finish. `todo` is the numbered main checklist (displayed
 as subtasks); `agent` is a parallel child execution context and accepts optional one-based
 `task_index` ownership metadata. The legacy `task` spelling remains parseable for old

@@ -44,7 +44,11 @@ struct LspConnection {
 }
 
 impl LspConnection {
-    fn send_request(&mut self, method: &str, params: serde_json::Value) -> tokio::sync::oneshot::Receiver<serde_json::Value> {
+    fn send_request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> tokio::sync::oneshot::Receiver<serde_json::Value> {
         let id = self.next_id;
         self.next_id += 1;
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -55,8 +59,22 @@ impl LspConnection {
             "method": method,
             "params": params,
         });
-        let _ = write!(&mut self.stdin, "Content-Length: {}\r\n\r\n{}", msg.to_string().len(), msg);
-        let _ = self.stdin.flush();
+        let payload = format!(
+            "Content-Length: {}\r\n\r\n{}",
+            msg.to_string().len(),
+            msg
+        );
+        if let Err(error) = self
+            .stdin
+            .write_all(payload.as_bytes())
+            .and_then(|_| self.stdin.flush())
+        {
+            self.request_map.remove(&id);
+            crate::app::toast::warning(format!(
+                "LSP request '{}' could not be sent: {}",
+                method, error
+            ));
+        }
         rx
     }
 
@@ -66,8 +84,21 @@ impl LspConnection {
             "method": method,
             "params": params,
         });
-        let _ = write!(&mut self.stdin, "Content-Length: {}\r\n\r\n{}", msg.to_string().len(), msg);
-        let _ = self.stdin.flush();
+        let payload = format!(
+            "Content-Length: {}\r\n\r\n{}",
+            msg.to_string().len(),
+            msg
+        );
+        if let Err(error) = self
+            .stdin
+            .write_all(payload.as_bytes())
+            .and_then(|_| self.stdin.flush())
+        {
+            crate::app::toast::warning(format!(
+                "LSP notification '{}' could not be sent: {}",
+                method, error
+            ));
+        }
     }
 
     fn read_response(&mut self) -> Option<(u64, serde_json::Value)> {

@@ -61,7 +61,8 @@ pub fn needs_hard_prompt(call: &ToolCall, cwd: &Path) -> bool {
         | Some(ToolKind::Move)
         | Some(ToolKind::Copy)
         | Some(ToolKind::Download)
-        | Some(ToolKind::PowerPoint) => writes_outside_cwd(call, cwd),
+        | Some(ToolKind::PowerPoint)
+        | Some(ToolKind::Video) => writes_outside_cwd(call, cwd),
         _ => false,
     }
 }
@@ -72,6 +73,7 @@ fn writes_outside_cwd(call: &ToolCall, cwd: &Path) -> bool {
         Some(ToolKind::Move) | Some(ToolKind::Copy) => &["from", "to"],
         Some(ToolKind::Download) => &["path"],
         Some(ToolKind::PowerPoint) => &["input_path", "output_path"],
+        Some(ToolKind::Video) => &["entry_file", "output_path"],
         _ => &["path"],
     };
     keys.iter()

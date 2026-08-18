@@ -92,19 +92,10 @@ pub struct AgentConfig {
     /// Absolute request ceiling, including the final synthesis request.
     #[serde(default = "default_subagent_hard_rounds")]
     pub subagent_hard_rounds: usize,
-    /// Maximum seconds without streamed output or a completed tool result.
-    #[serde(default = "default_subagent_lease_secs")]
-    pub subagent_lease_secs: u64,
-    /// Absolute wall-clock lifetime for one child agent.
-    #[serde(default = "default_subagent_max_duration_secs")]
-    pub subagent_max_duration_secs: u64,
-    /// Maximum time allowed for one tool or nested-agent batch.
-    #[serde(default = "default_subagent_operation_timeout_secs")]
-    pub subagent_operation_timeout_secs: u64,
-    /// Model used for child agents (`workflow(agent)` calls). Empty = the
-    /// active chat model; a named `[agents.<name>].model` still wins for that
-    /// specific agent.
-    #[serde(default)]
+    /// Model used for child agents (`workflow(agent)` calls). Defaults to
+    /// `gpt-5.6-sol-wm`; a non-empty configured value overrides it, and a named
+    /// `[agents.<name>].model` still wins for that specific agent.
+    #[serde(default = "default_child_agent_model")]
     pub child_model: String,
     /// Model used for the parallel task-tracker agent (the background model
     /// that maintains the task checklist). Empty = the active chat model.
@@ -115,13 +106,15 @@ pub struct AgentConfig {
 impl AgentConfig {
     pub fn normalized(self) -> Self {
         let hard = self.subagent_hard_rounds.max(2);
+        let child_model = if self.child_model.trim().is_empty() {
+            default_child_agent_model()
+        } else {
+            self.child_model
+        };
         Self {
             subagent_soft_rounds: self.subagent_soft_rounds.clamp(1, hard - 1),
             subagent_hard_rounds: hard,
-            subagent_lease_secs: self.subagent_lease_secs.max(1),
-            subagent_max_duration_secs: self.subagent_max_duration_secs.max(1),
-            subagent_operation_timeout_secs: self.subagent_operation_timeout_secs.max(1),
-            child_model: self.child_model,
+            child_model,
             task_model: self.task_model,
         }
     }
@@ -132,33 +125,22 @@ impl Default for AgentConfig {
         Self {
             subagent_soft_rounds: default_subagent_soft_rounds(),
             subagent_hard_rounds: default_subagent_hard_rounds(),
-            subagent_lease_secs: default_subagent_lease_secs(),
-            subagent_max_duration_secs: default_subagent_max_duration_secs(),
-            subagent_operation_timeout_secs: default_subagent_operation_timeout_secs(),
-            child_model: String::new(),
+            child_model: default_child_agent_model(),
             task_model: String::new(),
         }
     }
 }
 
+fn default_child_agent_model() -> String {
+    "gpt-5.6-sol-wm".to_string()
+}
+
 fn default_subagent_soft_rounds() -> usize {
-    48
+    12
 }
 
 fn default_subagent_hard_rounds() -> usize {
-    60
-}
-
-fn default_subagent_lease_secs() -> u64 {
-    90
-}
-
-fn default_subagent_max_duration_secs() -> u64 {
-    900
-}
-
-fn default_subagent_operation_timeout_secs() -> u64 {
-    120
+    16
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -345,6 +327,9 @@ pub struct KeybindConfig {
     /// Show / hide the full output of executed tools (collapsed by default).
     #[serde(default = "kb_toggle_output", alias = "toggle_tool_output")]
     pub toggle_output: String,
+    /// Paste text or an image directly from the system clipboard.
+    #[serde(default = "kb_paste_clipboard", alias = "paste_system_clipboard")]
+    pub paste_clipboard: String,
 
     // ── Normal mode (input box) ────────────────────────────────────────────
     #[serde(default = "kb_insert", alias = "normal_insert", alias = "enter_insert")]
@@ -437,6 +422,9 @@ fn kb_scroll_half_up() -> String {
 fn kb_toggle_output() -> String {
     "ctrl-t".into()
 }
+fn kb_paste_clipboard() -> String {
+    "ctrl-v".into()
+}
 fn kb_insert() -> String {
     "i".into()
 }
@@ -484,6 +472,7 @@ impl Default for KeybindConfig {
             scroll_half_down: kb_scroll_half_down(),
             scroll_half_up: kb_scroll_half_up(),
             toggle_output: kb_toggle_output(),
+            paste_clipboard: kb_paste_clipboard(),
             insert: kb_insert(),
             command: kb_command(),
             palette: kb_palette(),
@@ -566,17 +555,7 @@ impl Config {
         // A malformed config must not brick launch: warn and fall back to defaults
         // rather than exiting. Env overrides below still apply, so a usable endpoint
         // can be supplied even with a broken file.
-        let mut cfg: Config = match toml::from_str(&raw) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                eprintln!(
-                    "AiTUI: ignoring invalid config at {} ({}); using defaults",
-                    path.display(),
-                    e
-                );
-                Config::default()
-            }
-        };
+        let mut cfg = parse_config_or_default(&raw, &path);
 
         if cfg.api.access_judge_model.trim().is_empty() {
             cfg.api.access_judge_model = default_access_judge_model();
@@ -675,6 +654,20 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+fn parse_config_or_default(raw: &str, path: &std::path::Path) -> Config {
+    match toml::from_str(raw) {
+        Ok(config) => config,
+        Err(error) => {
+            crate::app::toast::warning(format!(
+                "Ignoring invalid config at {} ({}); using defaults",
+                path.display(),
+                error
+            ));
+            Config::default()
+        }
+    }
+}
+
 fn config_path() -> PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -708,11 +701,18 @@ mod tests {
     }
 
     #[test]
-    fn malformed_config_falls_back_to_default() {
-        // Garbage TOML must parse-fail into defaults, never panic.
+    fn malformed_config_falls_back_to_default_and_warns_via_toast() {
         let bad = "this is not [valid toml";
-        let cfg: Config = toml::from_str(bad).unwrap_or_default();
+        let path = std::path::Path::new("/tmp/invalid-aitui-config.toml");
+        let cfg = parse_config_or_default(bad, path);
         assert_eq!(cfg.ui.input_height, Config::default().ui.input_height);
+        assert!(crate::app::toast::drain_messages()
+            .iter()
+            .any(|(level, message)| {
+                *level == crate::app::toast::ToastLevel::Warning
+                    && message.contains("Ignoring invalid config")
+                    && message.contains("invalid-aitui-config.toml")
+            }));
     }
 
     #[test]
@@ -727,29 +727,64 @@ mod tests {
     }
 
     #[test]
-    fn child_agent_budget_defaults_for_old_configs_and_normalizes_bounds() {
+    fn child_agent_round_budget_defaults_for_old_configs_and_normalizes_bounds() {
         let raw = r#"
             [api]
             default_model = "chat-model"
         "#;
         let cfg: Config = toml::from_str(raw).unwrap();
         assert_eq!(cfg.agent, AgentConfig::default());
+        assert_eq!(cfg.agent.child_model, "gpt-5.6-sol-wm");
+
+        let partial: Config = toml::from_str(
+            r#"
+                [api]
+                default_model = "chat-model"
+
+                [agent]
+                subagent_soft_rounds = 4
+            "#,
+        )
+        .unwrap();
+        assert_eq!(partial.agent.child_model, "gpt-5.6-sol-wm");
+
+        let explicit: Config = toml::from_str(
+            r#"
+                [api]
+                default_model = "chat-model"
+
+                [agent]
+                child_model = "custom-agent-model"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(explicit.agent.child_model, "custom-agent-model");
+
+        let legacy_blank: Config = toml::from_str(
+            r#"
+                [api]
+                default_model = "chat-model"
+
+                [agent]
+                child_model = ""
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_blank.agent.normalized().child_model,
+            "gpt-5.6-sol-wm"
+        );
 
         let normalized = AgentConfig {
             subagent_soft_rounds: 99,
             subagent_hard_rounds: 1,
-            subagent_lease_secs: 0,
-            subagent_max_duration_secs: 0,
-            subagent_operation_timeout_secs: 0,
             child_model: String::new(),
             task_model: String::new(),
         }
         .normalized();
         assert_eq!(normalized.subagent_soft_rounds, 1);
         assert_eq!(normalized.subagent_hard_rounds, 2);
-        assert_eq!(normalized.subagent_lease_secs, 1);
-        assert_eq!(normalized.subagent_max_duration_secs, 1);
-        assert_eq!(normalized.subagent_operation_timeout_secs, 1);
+        assert_eq!(normalized.child_model, "gpt-5.6-sol-wm");
     }
 
     #[test]
@@ -761,6 +796,12 @@ mod tests {
         assert!(AccessReviewMode::Strict.default_policy().is_some());
         assert!(AccessReviewMode::Lenient.default_policy().is_some());
         assert!(AccessReviewMode::Off.default_policy().is_none());
+    }
+
+    #[test]
+    fn old_configs_receive_default_clipboard_paste_binding() {
+        let cfg: Config = toml::from_str("[api]\ndefault_model = \"m\"\n").unwrap();
+        assert_eq!(cfg.keybinds.paste_clipboard, "ctrl-v");
     }
 
     #[test]

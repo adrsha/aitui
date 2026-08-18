@@ -6,6 +6,7 @@ pub mod overlay;
 pub mod promptbar;
 pub mod sidepanel;
 pub mod statusbar;
+pub mod toast;
 
 use crate::app::input_layout;
 use crate::app::state::{App, PanelLayout};
@@ -89,6 +90,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.show_help {
         help::render(f, app, &theme);
     }
+    toast::render(f, app, &theme);
 
     // Flush any queued clipboard copy via OSC 52 (one-shot).
     if let Some(text) = app.pending_clipboard.take() {

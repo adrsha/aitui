@@ -1,9 +1,9 @@
 use std::fs;
-use std::io::Write;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{OnceLock, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 
@@ -58,9 +58,20 @@ pub fn execute(call: ToolCall, cwd: &Path) -> ToolResult {
 
 /// Like [`execute`], but aborts promptly (with a "Cancelled by user" result)
 /// once `abort` is set — shells are killed at their process group.
-pub fn execute_abortable(mut call: ToolCall, cwd: &Path, abort: &ToolAbort) -> ToolResult {
+pub fn execute_abortable(call: ToolCall, cwd: &Path, abort: &ToolAbort) -> ToolResult {
+    execute_abortable_streaming(call, cwd, abort, |_| {})
+}
+
+/// Abortable execution with incremental shell stdout/stderr delivery. Non-shell
+/// tools simply never invoke `on_output`.
+pub fn execute_abortable_streaming(
+    mut call: ToolCall,
+    cwd: &Path,
+    abort: &ToolAbort,
+    mut on_output: impl FnMut(&str),
+) -> ToolResult {
     attach_display_metadata(&mut call, cwd);
-    execute_with(call, |call| run(call, cwd, abort))
+    execute_with(call, |call| run(call, cwd, abort, &mut on_output))
 }
 
 fn attach_display_metadata(call: &mut ToolCall, cwd: &Path) {
@@ -131,16 +142,39 @@ fn resolve_path(raw: &str, cwd: &Path) -> PathBuf {
     }
 }
 
-fn run(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String> {
+fn run(
+    call: &ToolCall,
+    cwd: &Path,
+    abort: &ToolAbort,
+    on_output: &mut dyn FnMut(&str),
+) -> Result<String, String> {
     use super::tools::ToolKind;
 
     if let Some(items) = call.expanded_calls()? {
         if items.is_empty() {
             return Err("Batch must contain at least one operation".into());
         }
+        let denied: std::collections::BTreeSet<usize> = call
+            .args
+            .get("__aitui_denied_operations")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_u64)
+            .map(|index| index as usize)
+            .collect();
         let total = items.len();
         let mut output = Vec::with_capacity(total);
         for (index, item) in items.into_iter().enumerate() {
+            if denied.contains(&index) {
+                output.push(format!(
+                    "## {}/{} · {} · denied\nDenied by user",
+                    index + 1,
+                    total,
+                    item.summary()
+                ));
+                continue;
+            }
             if abort.load(std::sync::atomic::Ordering::Relaxed) {
                 output.push(format!(
                     "## {}/{} · cancelled\nCancelled by user",
@@ -150,7 +184,7 @@ fn run(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String>
                 break;
             }
             let summary = item.summary();
-            match run(&item, cwd, abort) {
+            match run(&item, cwd, abort, on_output) {
                 Ok(result) => output.push(format!(
                     "## {}/{} · {} · ok\n{}",
                     index + 1,
@@ -182,13 +216,16 @@ fn run(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String>
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'path' argument")?;
             let path = resolve_path(path_str, cwd);
+            let offset = usize_arg(call, "offset");
+            let limit = usize_arg(call, "limit");
+            if crate::files::is_media(&path) {
+                return crate::files::read_media_pixels(&path, offset, limit);
+            }
             // Cache-first: a file read earlier in the process (and unchanged on
             // disk) is served from memory, so the agent's repeated reads of the
             // same file cost no IO.
             let (content, cached) = crate::agent::file_cache::read_file(&path)?;
             // Optional line window: offset = 1-based first line, limit = line count.
-            let offset = usize_arg(call, "offset");
-            let limit = usize_arg(call, "limit");
             let mut output = read_output(&content, path_str, offset, limit);
             if cached && !output.trim().is_empty() {
                 output.push_str("\n\n[cached: file unchanged since last read]");
@@ -268,7 +305,7 @@ fn run(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String>
                 .get("command")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'command' argument")?;
-            let output = run_shell_command(cmd, cwd, abort)?;
+            let output = run_shell_command(cmd, cwd, abort, on_output)?;
 
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -443,18 +480,63 @@ fn run(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String>
                 .get("url")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'url' argument")?;
-            let body = http_get_text(url)?;
-            let text = truncate(strip_html(&body), 8192);
-            if text.trim().is_empty() {
-                // A blank "(ok)" reads as success to the model and it retries forever.
-                // Say plainly that there was no readable text.
+            let body = match http_get_text(url) {
+                Ok(body) => body,
+                Err(http_error) => {
+                    let rendered_html =
+                        rendered_page_html(url, abort).map_err(|browser_error| {
+                            format!(
+                                "HTTP fetch failed: {}; browser-rendered fallback also failed: {}",
+                                http_error, browser_error
+                            )
+                        })?;
+                    let markdown = webpage_markdown(url, &rendered_html)?;
+                    if markdown_readable_score(&markdown) < 80 {
+                        return Ok(format!(
+                            "Rendered {} in a browser but found no readable content.",
+                            url
+                        ));
+                    }
+                    return Ok(truncate(markdown, 60_000));
+                }
+            };
+            let static_markdown = webpage_markdown(url, &body)?;
+            let markdown = if page_needs_browser_render(&body, &static_markdown) {
+                match rendered_page_html(url, abort) {
+                    Ok(rendered_html) => {
+                        let rendered_markdown = webpage_markdown(url, &rendered_html)?;
+                        if markdown_readable_score(&rendered_markdown)
+                            > markdown_readable_score(&static_markdown)
+                        {
+                            rendered_markdown
+                        } else {
+                            static_markdown
+                        }
+                    }
+                    Err(error) if markdown_readable_score(&static_markdown) >= 80 => {
+                        format!(
+                            "{}\n\n> Browser-rendered fallback was unavailable: {}",
+                            static_markdown, error
+                        )
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "Fetched {} but found no readable static content, and the \
+                             JavaScript-rendered fallback failed: {}",
+                            url, error
+                        ));
+                    }
+                }
+            } else {
+                static_markdown
+            };
+            if markdown_readable_score(&markdown) < 80 {
                 Ok(format!(
-                    "Fetched {} but found no readable text — likely a JavaScript-rendered \
-                     page. Use web_search to find a direct article URL, or try a different page.",
+                    "Fetched {} but found no readable content after static and browser-rendered parsing.",
                     url
                 ))
             } else {
-                Ok(text)
+                Ok(truncate(markdown, 60_000))
             }
         }
 
@@ -498,6 +580,7 @@ fn run(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String>
         }
 
         Some(ToolKind::PowerPoint) => generate_powerpoint(call, cwd, abort),
+        Some(ToolKind::Video) => crate::agent::video::render(call, cwd, abort),
 
         // These are intercepted by the app layer and never reach the executor;
         // handled here only for match exhaustiveness.
@@ -512,9 +595,7 @@ fn run(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String>
     }
 }
 
-const POWERPOINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
-
-fn generate_powerpoint(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result<String, String> {
+fn generate_powerpoint(call: &ToolCall, cwd: &Path, _abort: &ToolAbort) -> Result<String, String> {
     let operation = call
         .args
         .get("operation")
@@ -599,230 +680,105 @@ fn generate_powerpoint(call: &ToolCall, cwd: &Path, abort: &ToolAbort) -> Result
             serde_json::Value::String(destination.to_string_lossy().to_string()),
         );
     }
-    let use_native_engine = request
-        .remove("engine")
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .is_some_and(|engine| engine == "native")
-        || std::env::var("AITUI_POWERPOINT_ENGINE").as_deref() == Ok("native");
-    if use_native_engine {
-        if operation == "inspect" {
-            let input_path = request
-                .get("input_path")
-                .and_then(|value| value.as_str())
-                .ok_or("powerpoint: inspect requires 'input_path'")?;
-            let inspection = crate::agent::powerpoint::inspect_native(Path::new(input_path))
-                .map_err(|error| format!("powerpoint: native inspect failed: {error}"))?;
-            return serde_json::to_string_pretty(&inspection)
-                .map_err(|error| format!("powerpoint: cannot format inspection: {error}"));
-        }
-        let empty_modifiers = request
-            .get("modifiers")
-            .and_then(|value| value.as_array())
-            .is_some_and(Vec::is_empty)
-            && request
-                .get("package_modifiers")
-                .and_then(|value| value.as_array())
-                .is_none_or(Vec::is_empty);
-        if operation == "edit" && empty_modifiers {
-            let output_path = request
-                .get("output_path")
-                .and_then(|value| value.as_str())
-                .ok_or("powerpoint: edit requires 'output_path'")?;
-            let input_path = request
-                .get("input_path")
-                .and_then(|value| value.as_str())
-                .unwrap_or(output_path);
-            let result = crate::agent::powerpoint::open_save_native(
-                Path::new(input_path),
-                Path::new(output_path),
-            )
-            .map_err(|error| format!("powerpoint: native open-save failed: {error}"))?;
-            let slide_count = result
-                .get("slides")
-                .and_then(|value| value.as_u64())
-                .ok_or("powerpoint: native open-save omitted slide count")?;
-            let destination = destination
-                .as_ref()
-                .ok_or("powerpoint: native open-save has no destination")?;
-            crate::agent::file_cache::invalidate(destination);
-            return Ok(format!(
-                "PowerPoint edit completed: {} ({} slide{}, native preservation-checked open-save)",
-                destination.display(),
-                slide_count,
-                if slide_count == 1 { "" } else { "s" }
-            ));
-        }
-        return Err(format!(
-            "powerpoint: native Rust engine does not yet support '{operation}' with the requested changes; omit engine=native to use the compatibility fallback"
-        ));
+    request.remove("engine");
+    if operation == "inspect" {
+        let input_path = request
+            .get("input_path")
+            .and_then(|value| value.as_str())
+            .ok_or("powerpoint: inspect requires 'input_path'")?;
+        let inspection = crate::agent::powerpoint::inspect(Path::new(input_path))
+            .map_err(|error| format!("powerpoint: native inspect failed: {error}"))?;
+        return serde_json::to_string_pretty(&inspection)
+            .map_err(|error| format!("powerpoint: cannot format inspection: {error}"));
     }
-
-    let payload = serde_json::to_vec(request)
-        .map_err(|error| format!("powerpoint: cannot serialize request: {error}"))?;
-
-    let embedded_package = crate::agent::powerpoint::materialize_embedded_package()
-        .map_err(|error| format!("powerpoint: {error}"))?;
-    let mut candidates = Vec::new();
-    if let Some(configured) = std::env::var_os("AITUI_POWERPOINT_PYTHON") {
-        candidates.push(PathBuf::from(configured));
-    }
-    candidates.push(cwd.join(".venv/bin/python"));
-    if let Ok(launch_directory) = std::env::current_dir() {
-        let launch_python = launch_directory.join(".venv/bin/python");
-        if !candidates.contains(&launch_python) {
-            candidates.push(launch_python);
-        }
-    }
-    candidates.extend([PathBuf::from("python3"), PathBuf::from("python")]);
-    let mut last_error = String::new();
-    for python in candidates {
-        let mut command = Command::new(&python);
-        command
-            .arg("-m")
-            .arg("animated_pptx.cli")
-            .current_dir(cwd)
-            .env("PYTHONPATH", &embedded_package)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                last_error = error.to_string();
-                continue;
-            }
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(&payload)
-                .map_err(|error| format!("powerpoint: cannot send request: {error}"))?;
-        }
-        let output = wait_for_powerpoint(child, abort, POWERPOINT_TIMEOUT)?;
-        if !output.status.success() {
-            let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if error.contains("No module named 'pptx'")
-                || error.contains("No module named 'lxml'")
-                || error.contains("No module named animated_pptx")
-            {
-                last_error = format!("{}: {error}", python.display());
-                continue;
-            }
-            return Err(if error.is_empty() {
-                "powerpoint: generator exited without an error message".into()
-            } else {
-                format!("powerpoint: {error}")
-            });
-        }
-        let response: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .map_err(|error| format!("powerpoint: invalid generator response: {error}"))?;
-        if response.get("ok").and_then(|value| value.as_bool()) != Some(true) {
-            return Err(format!(
-                "powerpoint: generator returned an unsuccessful response: {}",
-                truncate(response.to_string(), 1000)
-            ));
-        }
-        if operation == "inspect" {
-            let inspection = response
-                .get("inspection")
-                .ok_or("powerpoint: inspector response omitted inspection data")?;
-            return serde_json::to_string_pretty(inspection)
-                .map_err(|error| format!("powerpoint: cannot format inspection: {error}"));
-        }
-        let slide_count = response
-            .get("slides")
-            .and_then(|value| value.as_u64())
-            .ok_or("powerpoint: generator response omitted slide count")?;
+    if matches!(operation, "create" | "replace" | "append") {
         let destination = destination
             .as_ref()
-            .ok_or("powerpoint: generator response has no destination")?;
-        let metadata = fs::metadata(destination).map_err(|error| {
-            format!(
-                "powerpoint: generator reported success but {} is unavailable: {error}",
-                destination.display()
-            )
-        })?;
-        if !metadata.is_file() || metadata.len() == 0 {
-            return Err(format!(
-                "powerpoint: generator reported success but {} is not a non-empty file",
-                destination.display()
-            ));
+            .ok_or("powerpoint: native generator has no destination")?;
+        let result = if operation == "append" {
+            let input = request
+                .get("input_path")
+                .and_then(|value| value.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| destination.clone());
+            crate::agent::powerpoint::append(request, &input, destination, cwd)
+        } else {
+            crate::agent::powerpoint::create(request, destination, cwd)
         }
-        let reported_path = response
-            .get("path")
-            .and_then(|value| value.as_str())
-            .ok_or("powerpoint: generator response omitted output path")?;
-        if Path::new(reported_path) != destination {
-            return Err(format!(
-                "powerpoint: generator response path mismatch (expected {}, got {})",
-                destination.display(),
-                reported_path
-            ));
-        }
+        .map_err(|error| format!("powerpoint: native generation failed: {error}"))?;
+        let slide_count = result
+            .get("slides")
+            .and_then(|value| value.as_u64())
+            .ok_or("powerpoint: native generator omitted slide count")?;
         crate::agent::file_cache::invalidate(destination);
         return Ok(format!(
-            "PowerPoint {operation} completed: {} ({} slide{})",
+            "PowerPoint {operation} completed: {} ({} slide{}, native Rust)",
+            destination.display(),
+            slide_count,
+            if slide_count == 1 { "" } else { "s" }
+        ));
+    }
+    let empty_modifiers = request
+        .get("modifiers")
+        .and_then(|value| value.as_array())
+        .is_some_and(Vec::is_empty)
+        && request
+            .get("package_modifiers")
+            .and_then(|value| value.as_array())
+            .is_none_or(Vec::is_empty);
+    if operation == "edit" && !empty_modifiers {
+        let destination = destination
+            .as_ref()
+            .ok_or("powerpoint: native editor has no destination")?;
+        let input = request
+            .get("input_path")
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| destination.clone());
+        let result = crate::agent::powerpoint::edit(request, &input, destination)
+            .map_err(|error| format!("powerpoint: native edit failed: {error}"))?;
+        let slide_count = result
+            .get("slides")
+            .and_then(|value| value.as_u64())
+            .ok_or("powerpoint: native editor omitted slide count")?;
+        crate::agent::file_cache::invalidate(destination);
+        return Ok(format!(
+            "PowerPoint edit completed: {} ({} slide{}, native Rust)",
+            destination.display(),
+            slide_count,
+            if slide_count == 1 { "" } else { "s" }
+        ));
+    }
+    if operation == "edit" && empty_modifiers {
+        let output_path = request
+            .get("output_path")
+            .and_then(|value| value.as_str())
+            .ok_or("powerpoint: edit requires 'output_path'")?;
+        let input_path = request
+            .get("input_path")
+            .and_then(|value| value.as_str())
+            .unwrap_or(output_path);
+        let result =
+            crate::agent::powerpoint::open_save(Path::new(input_path), Path::new(output_path))
+                .map_err(|error| format!("powerpoint: native open-save failed: {error}"))?;
+        let slide_count = result
+            .get("slides")
+            .and_then(|value| value.as_u64())
+            .ok_or("powerpoint: native open-save omitted slide count")?;
+        let destination = destination
+            .as_ref()
+            .ok_or("powerpoint: native open-save has no destination")?;
+        crate::agent::file_cache::invalidate(destination);
+        return Ok(format!(
+            "PowerPoint edit completed: {} ({} slide{}, native preservation-checked open-save)",
             destination.display(),
             slide_count,
             if slide_count == 1 { "" } else { "s" }
         ));
     }
     Err(format!(
-        "powerpoint: Python 3 with python-pptx and lxml is required ({last_error})"
+        "powerpoint: native Rust engine does not yet support '{operation}' with the requested changes"
     ))
-}
-
-fn wait_for_powerpoint(
-    child: std::process::Child,
-    abort: &ToolAbort,
-    timeout: std::time::Duration,
-) -> Result<std::process::Output, String> {
-    use std::sync::atomic::Ordering;
-    use std::sync::mpsc;
-
-    let pid = child.id();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let kill = || {
-        #[cfg(unix)]
-        {
-            let _ = Command::new("kill")
-                .arg("-9")
-                .arg(format!("-{pid}"))
-                .output();
-        }
-        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
-    };
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if abort.load(Ordering::Relaxed) {
-            kill();
-            return Err("Cancelled by user".into());
-        }
-        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(result) => {
-                return result
-                    .map_err(|error| format!("powerpoint: generator failed to run: {error}"))
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() >= deadline => {
-                kill();
-                return Err(format!(
-                    "powerpoint: generator timed out after {}s and was killed",
-                    timeout.as_secs()
-                ));
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("powerpoint: generator waiter thread died".into())
-            }
-        }
-    }
 }
 
 /// Resolve the `from`/`to` (aliases `source`/`dest`/`destination`) path args.
@@ -1860,6 +1816,301 @@ fn looks_like_tag_start(bytes: &[u8], start: usize) -> bool {
     )
 }
 
+fn markdown_readable_score(markdown: &str) -> usize {
+    markdown
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty()
+                && line != "# Fetched page"
+                && !line.starts_with("Source: ")
+                && line != "## Images"
+        })
+        .flat_map(str::chars)
+        .filter(|character| character.is_alphanumeric())
+        .count()
+}
+
+fn page_needs_browser_render(html: &str, markdown: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    let score = markdown_readable_score(markdown);
+    let challenge = lower.contains("enable javascript")
+        || lower.contains("javascript is required")
+        || lower.contains("making sure you")
+        || lower.contains("just a moment");
+    let app_mount = lower.contains("id=\"root\"")
+        || lower.contains("id='root'")
+        || lower.contains("id=\"app\"")
+        || lower.contains("id='app'");
+    if challenge || (app_mount && score < 800) || (lower.contains("__next_data__") && score < 500) {
+        return true;
+    }
+    score < 240 && lower.contains("<script")
+}
+
+fn rendered_page_html(url: &str, abort: &ToolAbort) -> Result<String, String> {
+    use std::sync::atomic::Ordering;
+
+    let chrome = crate::agent::video::find_chrome().ok_or(
+        "Chrome/Chromium is not installed (tried google-chrome-stable, google-chrome, chromium, chromium-browser)",
+    )?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let profile =
+        std::env::temp_dir().join(format!("aitui-web-fetch-{}-{nonce}", std::process::id()));
+    fs::create_dir_all(&profile)
+        .map_err(|error| format!("cannot create browser profile: {error}"))?;
+
+    #[allow(unused_mut)]
+    let mut command = Command::new(chrome);
+    command
+        .arg("--headless=new")
+        .arg("--dump-dom")
+        .arg("--virtual-time-budget=5000")
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .args([
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-sync",
+            "--disable-extensions",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--hide-scrollbars",
+            "--mute-audio",
+            "--window-size=1440,1200",
+            "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        ])
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot start browser: {error}"))?;
+    let pid = child.id();
+    let stdout = child.stdout.take().ok_or("cannot capture browser stdout")?;
+    let stderr = child.stderr.take().ok_or("cannot capture browser stderr")?;
+    let stdout_thread = std::thread::spawn(move || {
+        let mut reader = stdout;
+        let mut bytes = Vec::new();
+        let _ = reader.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut reader = stderr;
+        let mut bytes = Vec::new();
+        let _ = reader.read_to_end(&mut bytes);
+        bytes
+    });
+    let kill = || {
+        #[cfg(unix)]
+        let _ = Command::new("kill")
+            .arg("-9")
+            .arg(format!("-{pid}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if abort.load(Ordering::Relaxed) {
+            kill();
+            let _ = child.wait();
+            let _ = fs::remove_dir_all(&profile);
+            return Err("Cancelled by user".into());
+        }
+        if Instant::now() >= deadline {
+            kill();
+            let _ = child.wait();
+            let _ = fs::remove_dir_all(&profile);
+            return Err("browser rendering timed out after 20s".into());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("cannot inspect browser: {error}"))?
+        {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    let _ = fs::remove_dir_all(&profile);
+    if !status.success() {
+        return Err(format!(
+            "browser exited unsuccessfully: {}",
+            truncate(String::from_utf8_lossy(&stderr).trim().to_string(), 500)
+        ));
+    }
+    let html = String::from_utf8(stdout)
+        .map_err(|error| format!("rendered DOM was not UTF-8: {error}"))?;
+    if html.trim().is_empty() {
+        return Err("browser returned an empty rendered DOM".into());
+    }
+    Ok(html)
+}
+
+fn absolutize_html_urls(html: &str, base: &reqwest::Url) -> String {
+    let attr_re = regex::Regex::new(
+        r#"(?is)\b(href|src|poster|data-src|data-original)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))"#,
+    )
+    .expect("valid URL attribute regex");
+    let rewritten = attr_re.replace_all(html, |captures: &regex::Captures<'_>| {
+        let name = captures.get(1).unwrap().as_str();
+        let raw = captures
+            .get(2)
+            .or_else(|| captures.get(3))
+            .or_else(|| captures.get(4))
+            .map(|value| value.as_str())
+            .unwrap_or_default();
+        let absolute = resolve_page_url(raw, base).unwrap_or_else(|| raw.to_string());
+        format!(r#"{}="{}""#, name, absolute.replace('"', "&quot;"))
+    });
+    let srcset_re = regex::Regex::new(
+        r#"(?is)\b(srcset|data-srcset)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))"#,
+    )
+    .expect("valid srcset attribute regex");
+    srcset_re
+        .replace_all(&rewritten, |captures: &regex::Captures<'_>| {
+            let name = captures.get(1).unwrap().as_str();
+            let raw = captures
+                .get(2)
+                .or_else(|| captures.get(3))
+                .or_else(|| captures.get(4))
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+            let value = raw
+                .split(',')
+                .map(|candidate| {
+                    let mut parts = candidate.split_whitespace();
+                    let url = parts.next().unwrap_or_default();
+                    let descriptor = parts.collect::<Vec<_>>().join(" ");
+                    let url = resolve_page_url(url, base).unwrap_or_else(|| url.to_string());
+                    if descriptor.is_empty() {
+                        url
+                    } else {
+                        format!("{url} {descriptor}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(r#"{}="{}""#, name, value.replace('"', "&quot;"))
+        })
+        .into_owned()
+}
+
+fn resolve_page_url(raw: &str, base: &reqwest::Url) -> Option<String> {
+    let raw = html_unescape(raw.trim());
+    if raw.is_empty()
+        || raw.starts_with("data:")
+        || raw.starts_with("blob:")
+        || raw.starts_with("javascript:")
+        || raw.starts_with("mailto:")
+        || raw.starts_with("tel:")
+    {
+        return None;
+    }
+    let url = base.join(&raw).ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.to_string())
+}
+
+fn webpage_markdown(page_url: &str, html: &str) -> Result<String, String> {
+    let base =
+        reqwest::Url::parse(page_url).map_err(|error| format!("Invalid page URL: {}", error))?;
+    let normalized_html = absolutize_html_urls(html, &base);
+    let mut markdown = html2md::parse_html(&normalized_html);
+    let inline_image =
+        regex::Regex::new(r#"!\[[^\]]*\]\(data:[^)]*\)"#).expect("valid inline image regex");
+    markdown = inline_image.replace_all(&markdown, "").into_owned();
+    let mut images = extract_page_image_urls(&normalized_html, &base);
+    images.sort();
+    images.dedup();
+
+    for (raw, absolute) in &images {
+        if raw != absolute {
+            markdown = markdown.replace(raw, absolute);
+        }
+    }
+    let mut output = format!(
+        "# Fetched page\n\nSource: {}\n\n{}",
+        page_url,
+        markdown.trim()
+    );
+    if !images.is_empty() {
+        output.push_str("\n\n## Images\n");
+        for (_, url) in images {
+            output.push_str(&format!("\n![Image]({})", url));
+        }
+    }
+    Ok(output)
+}
+
+fn extract_page_image_urls(html: &str, base: &reqwest::Url) -> Vec<(String, String)> {
+    let tag_re =
+        regex::Regex::new(r#"(?is)<(?:img|source)\b[^>]*>"#).expect("valid image tag regex");
+    let attr_re = regex::Regex::new(
+        r#"(?is)\b(?:src|data-src|data-original|poster)\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s>]+))"#,
+    )
+    .expect("valid image attribute regex");
+    let srcset_re = regex::Regex::new(
+        r#"(?is)\b(?:srcset|data-srcset)\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s>]+))"#,
+    )
+    .expect("valid srcset regex");
+    let mut urls = Vec::new();
+    for tag in tag_re.find_iter(html).map(|value| value.as_str()) {
+        for captures in attr_re.captures_iter(tag) {
+            if let Some(raw) = captures
+                .get(1)
+                .or_else(|| captures.get(2))
+                .or_else(|| captures.get(3))
+            {
+                push_resolved_image(&mut urls, raw.as_str(), base);
+            }
+        }
+        for captures in srcset_re.captures_iter(tag) {
+            if let Some(srcset) = captures
+                .get(1)
+                .or_else(|| captures.get(2))
+                .or_else(|| captures.get(3))
+            {
+                for candidate in srcset.as_str().split(',') {
+                    if let Some(raw) = candidate.split_whitespace().next() {
+                        push_resolved_image(&mut urls, raw, base);
+                    }
+                }
+            }
+        }
+    }
+    urls
+}
+
+fn push_resolved_image(urls: &mut Vec<(String, String)>, raw: &str, base: &reqwest::Url) {
+    let raw = html_unescape(raw.trim());
+    if raw.is_empty() || raw.starts_with("data:") || raw.starts_with("blob:") {
+        return;
+    }
+    if let Ok(url) = base.join(&raw) {
+        if matches!(url.scheme(), "http" | "https") {
+            urls.push((raw, url.to_string()));
+        }
+    }
+}
+
 /// Very small HTML→text reduction: drop script/style, strip tags, collapse
 /// whitespace. Good enough to feed a page's readable text back to the model.
 fn strip_html(html: &str) -> String {
@@ -2066,10 +2317,11 @@ fn run_shell_command(
     cmd: &str,
     cwd: &Path,
     abort: &ToolAbort,
+    on_output: &mut dyn FnMut(&str),
 ) -> Result<std::process::Output, String> {
     // TODO(audit): replace the ad-hoc `sh -c` runner with explicit command
     // classification; timeout alone is not enough process isolation.
-    run_shell_with_timeout(cmd, cwd, SHELL_TIMEOUT, abort)
+    run_shell_with_timeout(cmd, cwd, SHELL_TIMEOUT, abort, on_output)
 }
 
 fn run_shell_with_timeout(
@@ -2077,16 +2329,42 @@ fn run_shell_with_timeout(
     cwd: &Path,
     timeout: std::time::Duration,
     abort: &ToolAbort,
+    on_output: &mut dyn FnMut(&str),
 ) -> Result<std::process::Output, String> {
     use std::process::Stdio;
     use std::sync::atomic::Ordering;
     use std::sync::mpsc;
     use std::time::Instant;
 
+    enum ShellChunk {
+        Stdout(Vec<u8>),
+        Stderr(Vec<u8>),
+    }
+
+    fn read_chunks(mut pipe: impl Read, stderr: bool, tx: mpsc::Sender<ShellChunk>) {
+        let mut buffer = [0u8; 1024];
+        loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let bytes = buffer[..count].to_vec();
+                    let event = if stderr {
+                        ShellChunk::Stderr(bytes)
+                    } else {
+                        ShellChunk::Stdout(bytes)
+                    };
+                    if tx.send(event).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
     // `Stdio::null()` on stdin turns a blocking read (e.g. bare `cat`, a REPL)
     // into an immediate EOF rather than an infinite wait. `process_group(0)` puts
-    // the shell in its own group so the timeout path can kill the whole tree
-    // (`kill -9 -<pid>`), not just the shell.
+    // the shell in its own group so the timeout path can kill the whole tree.
     #[allow(unused_mut)]
     let mut command = Command::new("sh");
     command
@@ -2101,48 +2379,76 @@ fn run_shell_with_timeout(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|e| format!("Cannot run command: {}", e))?;
-
-    // Capture the pid before moving the child into the waiter thread, so the
-    // watchdog can still kill it on timeout or abort.
     let pid = child.id();
+    let stdout = child.stdout.take().ok_or("Cannot capture command stdout")?;
+    let stderr = child.stderr.take().ok_or("Cannot capture command stderr")?;
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
+    let stdout_thread = {
+        let tx = tx.clone();
+        std::thread::spawn(move || read_chunks(stdout, false, tx))
+    };
+    let stderr_thread = {
+        let tx = tx.clone();
+        std::thread::spawn(move || read_chunks(stderr, true, tx))
+    };
+    drop(tx);
 
     let kill = || {
-        // Kill the whole process group first (covers children the shell spawned),
-        // then the shell itself; ignore failures (it may have just exited).
         let _ = Command::new("kill")
             .arg("-9")
             .arg(format!("-{}", pid))
             .output();
         let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
     };
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut receive = |chunk: ShellChunk| match chunk {
+        ShellChunk::Stdout(bytes) => {
+            stdout_bytes.extend_from_slice(&bytes);
+            on_output(&String::from_utf8_lossy(&bytes));
+        }
+        ShellChunk::Stderr(bytes) => {
+            stderr_bytes.extend_from_slice(&bytes);
+            on_output(&format!("[stderr] {}", String::from_utf8_lossy(&bytes)));
+        }
+    };
     let deadline = Instant::now() + timeout;
-    loop {
+    let status = loop {
+        while let Ok(chunk) = rx.try_recv() {
+            receive(chunk);
+        }
         if abort.load(Ordering::Relaxed) {
             kill();
+            let _ = child.wait();
             return Err("Cancelled by user".into());
         }
-        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(result) => return result.map_err(|e| format!("Command failed: {}", e)),
-            Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
-                kill();
-                return Err(format!(
-                    "Command timed out after {}s and was killed",
-                    timeout.as_secs()
-                ));
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("Command runner thread died".to_string())
-            }
+        if Instant::now() >= deadline {
+            kill();
+            let _ = child.wait();
+            return Err(format!(
+                "Command timed out after {}s and was killed",
+                timeout.as_secs()
+            ));
         }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Err(error) => return Err(format!("Command failed: {}", error)),
+        }
+    };
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+    while let Ok(chunk) = rx.try_recv() {
+        receive(chunk);
     }
+    Ok(std::process::Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    })
 }
 
 fn truncate(s: String, max: usize) -> String {
@@ -2285,7 +2591,7 @@ mod tests {
         assert!(created.is_ok(), "{}", created.text());
         let source = dir.join("source.pptx");
         let source_bytes = std::fs::read(&source).unwrap();
-        let before = crate::agent::powerpoint::inspect_native(&source).unwrap();
+        let before = crate::agent::powerpoint::inspect(&source).unwrap();
         assert_eq!(before["slides"][0]["animations"]["present"], true);
         assert_eq!(before["slides"][0]["transition"]["present"], true);
 
@@ -2302,7 +2608,7 @@ mod tests {
         assert!(edited
             .text()
             .contains("native preservation-checked open-save"));
-        let after = crate::agent::powerpoint::inspect_native(&dir.join("saved.pptx")).unwrap();
+        let after = crate::agent::powerpoint::inspect(&dir.join("saved.pptx")).unwrap();
         assert_eq!(after["presentation"], before["presentation"]);
         assert_eq!(after["slides"], before["slides"]);
         assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
@@ -2592,6 +2898,96 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aitui_test_{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn browser_fallback_targets_script_shells_but_skips_readable_static_pages() {
+        let shell =
+            r#"<html><body><div id="root"></div><script src="app.js"></script></body></html>"#;
+        let shell_markdown = webpage_markdown("https://example.com", shell).unwrap();
+        assert!(page_needs_browser_render(shell, &shell_markdown));
+
+        let article = format!(
+            "<html><body><article><h1>Readable</h1><p>{}</p></article><script></script></body></html>",
+            "substantial article text ".repeat(30)
+        );
+        let article_markdown = webpage_markdown("https://example.com", &article).unwrap();
+        assert!(!page_needs_browser_render(&article, &article_markdown));
+    }
+
+    #[test]
+    fn browser_renderer_waits_for_delayed_javascript_dom_content_when_chrome_is_available() {
+        if crate::agent::video::find_chrome().is_none() {
+            return;
+        }
+        let page = r#"<!doctype html><html><body><div id='root'>Loading</div><script>
+            setTimeout(() => {
+                document.querySelector('#root').innerHTML = '<h1>Rendered guide</h1><p>Open <a href="https://example.com/docs">the docs</a>.</p><img src="https://example.com/hero.png" alt="Hero">';
+            }, 250);
+        </script></body></html>"#;
+        let url = format!(
+            "data:text/html,{}",
+            page.bytes()
+                .map(|byte| match byte {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                        (byte as char).to_string()
+                    }
+                    _ => format!("%{byte:02X}"),
+                })
+                .collect::<String>()
+        );
+        let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rendered = rendered_page_html(&url, &abort).unwrap();
+        assert!(rendered.contains("Rendered guide"), "{rendered}");
+        let markdown = webpage_markdown("https://example.com/app", &rendered).unwrap();
+        assert!(markdown.contains("Rendered guide"), "{markdown}");
+        assert!(
+            markdown.contains("[the docs](https://example.com/docs)"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("![Hero](https://example.com/hero.png)"),
+            "{markdown}"
+        );
+    }
+
+    #[test]
+    fn webpage_markdown_preserves_structure_and_lists_absolute_images() {
+        let html = r#"
+            <html><body><h1>Guide</h1><p>Read <strong>this</strong> and the
+            <a href="/docs/start">documentation</a>.</p>
+            <img src="/assets/hero.png"><source srcset="small.webp 1x, /large.webp 2x">
+            <img data-src="https://cdn.example.org/lazy.jpg"><img src="data:image/png;base64,abc">
+            </body></html>
+        "#;
+        let markdown = webpage_markdown("https://example.com/docs/page", html).unwrap();
+        assert!(markdown.contains("Guide"), "{markdown}");
+        assert!(markdown.contains("**this**"), "{markdown}");
+        assert!(
+            markdown.contains("[documentation](https://example.com/docs/start)"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("![Image](https://example.com/assets/hero.png)"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("https://example.com/assets/hero.png"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("https://example.com/docs/small.webp"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("https://example.com/large.webp"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("https://cdn.example.org/lazy.jpg"),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("data:image"), "{markdown}");
     }
 
     #[test]
@@ -2988,6 +3384,26 @@ mod tests {
     }
 
     #[test]
+    fn read_image_returns_pixels_instead_of_binary_error() {
+        let dir = tmp_dir();
+        let path = dir.join("read-pixels.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+            .save(&path)
+            .unwrap();
+        let result = execute(
+            make_call("read", serde_json::json!({"path": path.to_string_lossy()})),
+            &dir,
+        );
+        assert!(result.is_ok(), "{}", result.text());
+        let json: serde_json::Value = serde_json::from_str(result.text()).unwrap();
+        assert_eq!(json["frames"][0]["pixel_format"], "RGBA8");
+        assert_eq!(
+            json["frames"][0]["segments"][0]["rgba"],
+            serde_json::json!([1, 2, 3, 255])
+        );
+    }
+
+    #[test]
     fn run_shell_executes_command() {
         let dir = tmp_dir();
         let call = make_call(
@@ -3007,7 +3423,9 @@ mod tests {
         // hit EOF immediately and exit rather than blocking the test forever.
         let dir = tmp_dir();
         let abort = super::ToolAbort::default();
-        let out = run_shell_command("cat", &dir, &abort).expect("cat should finish on EOF");
+        let mut ignore: fn(&str) = |_| {};
+        let out =
+            run_shell_command("cat", &dir, &abort, &mut ignore).expect("cat should finish on EOF");
         assert!(out.status.success());
     }
 
@@ -3015,9 +3433,35 @@ mod tests {
     fn shell_captures_stdout_and_exit() {
         let dir = tmp_dir();
         let abort = super::ToolAbort::default();
-        let out = run_shell_command("printf done; exit 3", &dir, &abort).unwrap();
+        let mut ignore: fn(&str) = |_| {};
+        let out = run_shell_command("printf done; exit 3", &dir, &abort, &mut ignore).unwrap();
         assert_eq!(out.status.code(), Some(3));
         assert_eq!(String::from_utf8_lossy(&out.stdout), "done");
+    }
+
+    #[test]
+    fn shell_streams_output_before_process_finishes() {
+        let dir = tmp_dir();
+        let abort = super::ToolAbort::default();
+        let start = std::time::Instant::now();
+        let mut chunks = Vec::new();
+        let mut capture = |chunk: &str| chunks.push((start.elapsed(), chunk.to_string()));
+        let out = run_shell_command(
+            "printf first; sleep 0.3; printf second",
+            &dir,
+            &abort,
+            &mut capture,
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert!(chunks.iter().any(|(_, chunk)| chunk.contains("first")));
+        let first_at = chunks
+            .iter()
+            .find(|(_, chunk)| chunk.contains("first"))
+            .unwrap()
+            .0;
+        assert!(first_at < std::time::Duration::from_millis(250));
+        assert!(start.elapsed() >= std::time::Duration::from_millis(250));
     }
 
     #[test]
@@ -3025,11 +3469,13 @@ mod tests {
         let dir = tmp_dir();
         let start = std::time::Instant::now();
         let abort = super::ToolAbort::default();
+        let mut ignore: fn(&str) = |_| {};
         let err = run_shell_with_timeout(
             "sleep 30",
             &dir,
             std::time::Duration::from_millis(300),
             &abort,
+            &mut ignore,
         )
         .unwrap_err();
         // Must return promptly (well under the 30s sleep) with a timeout message.
@@ -3047,7 +3493,8 @@ mod tests {
             killer.store(true, std::sync::atomic::Ordering::Relaxed);
         });
         let start = std::time::Instant::now();
-        let err = run_shell_command("sleep 30", &dir, &abort).unwrap_err();
+        let mut ignore: fn(&str) = |_| {};
+        let err = run_shell_command("sleep 30", &dir, &abort, &mut ignore).unwrap_err();
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(err, "Cancelled by user");
     }

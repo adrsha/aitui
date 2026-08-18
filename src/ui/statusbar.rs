@@ -339,6 +339,7 @@ fn activity_state(app: &App) -> Option<ActivityState> {
         app.overlay,
         crate::app::overlay::Overlay::Permission(_)
             | crate::app::overlay::Overlay::Decision(_)
+            | crate::app::overlay::Overlay::PromptDuringRun(_)
             | crate::app::overlay::Overlay::Plan(_)
     ) {
         return Some(ActivityState::Decision);

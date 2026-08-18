@@ -3,7 +3,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::api::models::{ContentPart, MessageContent};
@@ -143,7 +142,10 @@ impl Session {
             todos: Vec::new(),
             todo_overall_percent: None,
             response_suggestions: Vec::new(),
-            agent_mode: false,
+            // Tool use and child-agent delegation are always available. This is
+            // runtime-only state (not persisted), so every construction path must
+            // initialize it consistently rather than relying on a later repair.
+            agent_mode: true,
             cwd: std::env::current_dir().ok(),
             last_prompt_at: None,
             draft: String::new(),
@@ -691,6 +693,11 @@ impl From<SavedSession> for Session {
             .unwrap_or(1)
             .max(s.next_memory_id)
             .max(1);
+        let mut todo_update = crate::app::state::TodoUpdate {
+            items: s.todos,
+            overall_percent: s.todo_overall_percent,
+        };
+        crate::app::todo_tracker::normalize(&mut todo_update);
         Session {
             id: s.id,
             name: s.name,
@@ -701,10 +708,13 @@ impl From<SavedSession> for Session {
             pending_started_at: None,
             pending_first_at: None,
             pending_mock: false,
-            todos: s.todos,
-            todo_overall_percent: s.todo_overall_percent,
+            todos: todo_update.items,
+            todo_overall_percent: todo_update.overall_percent,
             response_suggestions: Vec::new(),
-            agent_mode: false,
+            // Persisted sessions intentionally omit runtime agent state. Restore
+            // the application invariant here so disk/remote sync cannot silently
+            // remove tool schemas and `workflow(agent)` from future requests.
+            agent_mode: true,
             cwd: s.cwd,
             last_prompt_at: s.last_prompt_at,
             draft: s.draft,
@@ -785,8 +795,8 @@ impl SessionManager {
         }
     }
 
-    /// Persist all sessions to disk. Failures are reported to stderr but never
-    /// interrupt a conversation turn. Serialization and the blocking write move
+    /// Persist all sessions to disk. Failures are surfaced as bounded UI toasts but
+    /// never interrupt a conversation turn. Serialization and the blocking write
     /// off the UI thread when a tokio runtime is available (the app), so finishing a turn doesn't
     /// hitch the render loop; falls back to a synchronous write otherwise (tests).
     /// Saves within `SAVE_DEBOUNCE_MS` of the last write are silently coalesced.
@@ -802,11 +812,11 @@ impl SessionManager {
         let path = sessions_path();
         if let Some(parent) = path.parent() {
             if let Err(error) = fs::create_dir_all(parent) {
-                eprintln!(
+                crate::app::toast::error(format!(
                     "Failed to create session storage directory {}: {}",
                     parent.display(),
                     error
-                );
+                ));
                 return;
             }
         }
@@ -885,15 +895,35 @@ impl SessionManager {
     /// owns one heartbeat file, so clients never overwrite each other's live state.
     pub fn publish_presence(&self, running_sessions: &[usize]) {
         let dir = presence_dir();
-        if fs::create_dir_all(&dir).is_err() {
+        if let Err(error) = fs::create_dir_all(&dir) {
+            crate::app::toast::warning(format!(
+                "Failed to create session presence directory {}: {}",
+                dir.display(),
+                error
+            ));
             return;
         }
         let presence = ClientPresence {
             updated_at_ms: unix_timestamp_ms(),
             running_sessions: running_sessions.to_vec(),
         };
-        if let Ok(json) = serde_json::to_vec(&presence) {
-            let _ = atomic_write(&presence_path(std::process::id()), &json);
+        let json = match serde_json::to_vec(&presence) {
+            Ok(json) => json,
+            Err(error) => {
+                crate::app::toast::warning(format!(
+                    "Failed to serialize session presence: {}",
+                    error
+                ));
+                return;
+            }
+        };
+        let path = presence_path(std::process::id());
+        if let Err(error) = atomic_write(&path, &json) {
+            crate::app::toast::warning(format!(
+                "Failed to write session presence {}: {}",
+                path.display(),
+                error
+            ));
         }
     }
 
@@ -925,7 +955,16 @@ impl SessionManager {
     }
 
     pub fn clear_presence(&self) {
-        let _ = fs::remove_file(presence_path(std::process::id()));
+        let path = presence_path(std::process::id());
+        if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                crate::app::toast::warning(format!(
+                    "Failed to clear session presence {}: {}",
+                    path.display(),
+                    error
+                ));
+            }
+        }
     }
 
     pub fn active(&self) -> &Session {
@@ -946,14 +985,6 @@ impl SessionManager {
 
     pub fn active_idx(&self) -> usize {
         self.active_idx
-    }
-
-    /// Set agent mode on every session (used to apply `agent_default` at startup,
-    /// since agent mode isn't persisted and loaded sessions default to off).
-    pub fn set_agent_mode_all(&mut self, on: bool) {
-        for s in &mut self.sessions {
-            s.agent_mode = on;
-        }
     }
 
     pub fn new_session(&mut self) {
@@ -1147,11 +1178,11 @@ fn persist_session_state(path: &std::path::Path, state: SavedState) {
     let _lock = match SessionFileLock::acquire(path) {
         Ok(lock) => lock,
         Err(error) => {
-            eprintln!(
+            crate::app::toast::error(format!(
                 "Failed to acquire session storage lock {}: {}",
                 path.display(),
                 error
-            );
+            ));
             return;
         }
     };
@@ -1185,22 +1216,26 @@ fn persist_session_state(path: &std::path::Path, state: SavedState) {
     match serde_json::to_string_pretty(&merged) {
         Ok(json) => {
             if let Err(error) = atomic_write(path, json.as_bytes()) {
-                eprintln!(
+                crate::app::toast::error(format!(
                     "Failed to write session storage {}: {}",
                     path.display(),
                     error
-                );
+                ));
             }
         }
-        Err(error) => eprintln!("Failed to serialize session storage: {}", error),
+        Err(error) => {
+            crate::app::toast::error(format!("Failed to serialize session storage: {}", error))
+        }
     }
 }
 
 const SESSION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 const SESSION_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+const SESSION_LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 struct SessionFileLock {
-    file: fs::File,
+    path: PathBuf,
+    owner: String,
 }
 
 impl SessionFileLock {
@@ -1213,17 +1248,36 @@ impl SessionFileLock {
         timeout: std::time::Duration,
     ) -> std::io::Result<Self> {
         let path = sessions.with_extension("json.lock");
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
         let started = std::time::Instant::now();
+        let owner = format!(
+            "{} {}\n",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0)
+        );
         loop {
-            match file.try_lock_exclusive() {
-                Ok(()) => return Ok(Self { file }),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    if let Err(error) = file.write_all(owner.as_bytes()) {
+                        let _ = fs::remove_file(&path);
+                        return Err(error);
+                    }
+                    return Ok(Self {
+                        path,
+                        owner: owner.clone(),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if remove_stale_session_lock(&path) {
+                        continue;
+                    }
                     if started.elapsed() >= timeout {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::WouldBlock,
@@ -1241,9 +1295,59 @@ impl SessionFileLock {
     }
 }
 
+fn remove_stale_session_lock(path: &std::path::Path) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let old_enough = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= SESSION_LOCK_STALE_AFTER);
+    let owner_pid = contents
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<u32>().ok());
+    #[cfg(target_os = "linux")]
+    let owner_dead =
+        owner_pid.is_some_and(|pid| !std::path::Path::new("/proc").join(pid.to_string()).exists());
+    #[cfg(not(target_os = "linux"))]
+    let owner_dead = false;
+    if !old_enough && !owner_dead {
+        return false;
+    }
+
+    // Another contender may have removed the abandoned lock and created its own
+    // between our first read and this removal attempt. Re-read the contents and
+    // metadata identity before unlinking so we never delete that replacement.
+    let unchanged = fs::read_to_string(path).is_ok_and(|current| current == contents)
+        && same_file_identity(&metadata, &fs::metadata(path).ok());
+    unchanged && fs::remove_file(path).is_ok()
+}
+
+#[cfg(unix)]
+fn same_file_identity(before: &fs::Metadata, after: &Option<fs::Metadata>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    after
+        .as_ref()
+        .is_some_and(|after| before.dev() == after.dev() && before.ino() == after.ino())
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(before: &fs::Metadata, after: &Option<fs::Metadata>) -> bool {
+    after.as_ref().is_some_and(|after| {
+        before.len() == after.len() && before.modified().ok() == after.modified().ok()
+    })
+}
+
 impl Drop for SessionFileLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        if fs::read_to_string(&self.path).is_ok_and(|contents| contents == self.owner) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -1327,22 +1431,24 @@ mod tests {
         assert_eq!(session.last_prompt_at, Some(42));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn abandoned_legacy_session_lock_file_does_not_block_acquisition() {
+    fn abandoned_session_lock_owned_by_dead_process_is_recovered() {
         let dir = std::env::temp_dir().join(format!(
-            "aitui_session_lock_legacy_{}_{}",
+            "aitui_session_lock_abandoned_{}_{}",
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ));
         fs::create_dir_all(&dir).unwrap();
         let sessions = dir.join("sessions.json");
         let lock_path = sessions.with_extension("json.lock");
-        fs::write(&lock_path, b"").unwrap();
+        fs::write(&lock_path, b"4294967295 0\n").unwrap();
 
         let lock =
             SessionFileLock::acquire_with_timeout(&sessions, std::time::Duration::from_millis(100))
-                .expect("an unlocked legacy sentinel must not block an advisory lock");
+                .expect("a lock owned by a dead process must be recovered");
         drop(lock);
+        assert!(!lock_path.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1398,13 +1504,37 @@ mod tests {
     fn new_session_has_default_name() {
         let s = Session::new(1);
         assert_eq!(s.name, "Session 1");
-        assert!(!s.agent_mode);
+        assert!(s.agent_mode);
         assert!(s.messages.is_empty());
+    }
+
+    #[test]
+    fn manager_sessions_keep_agent_tools_enabled_without_startup_repair() {
+        let mut sessions = SessionManager::new();
+        assert!(sessions.active().agent_mode);
+
+        sessions.new_session();
+        assert!(sessions.active().agent_mode);
+        assert!(sessions.all().iter().all(|session| session.agent_mode));
+    }
+
+    #[test]
+    fn restored_session_reenables_runtime_agent_tools() {
+        let original = Session::new(7);
+        let saved = SavedSession::from(&original);
+        let restored = Session::from(saved);
+
+        assert!(restored.agent_mode);
+        let messages = restored.api_messages_windowed(true, None, &Default::default());
+        assert!(messages.first().is_some_and(|message| {
+            message.role == "system" && msg_text(message).contains("workflow(agent)")
+        }));
     }
 
     #[test]
     fn window_drops_oldest_turns_over_budget() {
         let mut s = Session::new(1);
+        s.agent_mode = false;
         // Three user/assistant turns, ~20 chars of text each.
         for n in 0..3 {
             s.push_message(ChatMessage::user(format!("question number {}", n)));
@@ -1425,6 +1555,7 @@ mod tests {
     #[test]
     fn window_keeps_last_user_turn_even_when_over_budget() {
         let mut s = Session::new(1);
+        s.agent_mode = false;
         s.push_message(ChatMessage::user(
             "a very long final question that exceeds the budget",
         ));
@@ -1701,9 +1832,10 @@ mod tests {
                 .push_message(ChatMessage::assistant("second message"));
             manager.active_mut().todos = vec![crate::app::state::TodoItem {
                 text: "Persist me".into(),
-                status: crate::app::state::TodoStatus::InProgress,
-                percent: None,
+                status: crate::app::state::TodoStatus::Done,
+                percent: Some(99),
             }];
+            manager.active_mut().todo_overall_percent = Some(99);
             manager.active_mut().loop_state = Some(LoopState {
                 goal: "finish".into(),
                 stop: "verified".into(),
@@ -1732,6 +1864,8 @@ mod tests {
         assert_eq!(loaded.all()[0].draft, "first draft");
         assert_eq!(loaded.active().name, "Second");
         assert_eq!(loaded.active().todos.len(), 1);
+        assert_eq!(loaded.active().todos[0].percent, Some(100));
+        assert_eq!(loaded.active().todo_overall_percent, Some(100));
         assert_eq!(loaded.active().loop_state.as_ref().unwrap().iteration, 2);
         assert_eq!(loaded.active().memories.len(), 1);
         assert_eq!(

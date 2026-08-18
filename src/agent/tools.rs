@@ -31,6 +31,8 @@ pub enum ToolKind {
     Download,
     /// Generate a validated animated PowerPoint deck from a structured slide spec.
     PowerPoint,
+    /// Capture a deterministic HTML/CSS/JS animation and encode it as video.
+    Video,
     Todo,
     Ask,
     Plan,
@@ -61,6 +63,7 @@ impl ToolKind {
             ToolKind::WebFetch => "web_fetch",
             ToolKind::Download => "download",
             ToolKind::PowerPoint => "powerpoint",
+            ToolKind::Video => "video",
             ToolKind::Todo => "todo",
             ToolKind::Ask => "ask",
             ToolKind::Plan => "plan",
@@ -72,7 +75,7 @@ impl ToolKind {
 
     pub fn description(&self) -> &'static str {
         match self {
-            ToolKind::Read => "Read a file's contents (optionally a line window)",
+            ToolKind::Read => "Read text or decoded, segmented RGBA pixel frames from media",
             ToolKind::Write => "Create or overwrite a whole file",
             ToolKind::Edit => "Replace an exact, unique snippet in a file",
             ToolKind::List => "List a directory (optionally as a tree)",
@@ -87,9 +90,12 @@ impl ToolKind {
             ToolKind::ReverseImage => {
                 "Find visually similar images and source pages from an image URL or local file"
             }
-            ToolKind::WebFetch => "Fetch the readable text of a web page",
+            ToolKind::WebFetch => {
+                "Fetch static or JavaScript-rendered pages as structured Markdown"
+            }
             ToolKind::Download => "Download a URL to a local file",
             ToolKind::PowerPoint => "Generate a validated animated PowerPoint deck",
+            ToolKind::Video => "Capture an HTML/CSS/JS animation as a validated video",
             ToolKind::Todo => "Set the task breakdown shown in the sticky todo panel",
             ToolKind::Ask => "Ask the user for missing information or a decision",
             ToolKind::Plan => "Write a plan file for user review and approval",
@@ -117,6 +123,7 @@ impl ToolKind {
             ToolKind::WebFetch => "⤓",
             ToolKind::Download => "⇩",
             ToolKind::PowerPoint => "▤",
+            ToolKind::Video => "▶",
             ToolKind::Todo => "☑",
             ToolKind::Ask => "?",
             ToolKind::Plan => "◫",
@@ -143,6 +150,7 @@ impl ToolKind {
             ToolKind::Copy => ToolRisk::Medium,
             ToolKind::Download => ToolRisk::Medium,
             ToolKind::PowerPoint => ToolRisk::Medium,
+            ToolKind::Video => ToolRisk::Medium,
             ToolKind::Todo => ToolRisk::Low,
             ToolKind::Ask => ToolRisk::Low,
             ToolKind::Plan => ToolRisk::Low,
@@ -174,6 +182,7 @@ impl ToolKind {
             "web_fetch" => Some(ToolKind::WebFetch),
             "download" | "download_file" => Some(ToolKind::Download),
             "powerpoint" | "pptx" | "presentation" => Some(ToolKind::PowerPoint),
+            "video" | "render_video" | "capture_video" => Some(ToolKind::Video),
             "todo" | "todos" | "todo_write" => Some(ToolKind::Todo),
             "ask" | "decide" => Some(ToolKind::Ask),
             "plan" => Some(ToolKind::Plan),
@@ -202,6 +211,7 @@ impl ToolKind {
             ToolKind::WebFetch,
             ToolKind::Download,
             ToolKind::PowerPoint,
+            ToolKind::Video,
             ToolKind::Delete,
         ]
     }
@@ -260,6 +270,7 @@ impl ToolCall {
             }),
             "specialized" => self.category_action().and_then(|action| match action {
                 "powerpoint" | "pptx" | "presentation" => Some(ToolKind::PowerPoint),
+                "video" | "render_video" | "capture_video" => Some(ToolKind::Video),
                 _ => None,
             }),
             "interaction" => self.category_action().and_then(|action| match action {
@@ -305,6 +316,14 @@ impl ToolCall {
             Some(ToolKind::PowerPoint) => {
                 raw_paths.extend(
                     ["input_path", "output_path"]
+                        .into_iter()
+                        .filter_map(|key| args.get(key).and_then(|value| value.as_str()))
+                        .map(str::to_string),
+                );
+            }
+            Some(ToolKind::Video) => {
+                raw_paths.extend(
+                    ["entry_file", "output_path"]
                         .into_iter()
                         .filter_map(|key| args.get(key).and_then(|value| value.as_str()))
                         .map(str::to_string),
@@ -400,6 +419,7 @@ impl ToolCall {
             base.remove("batch");
             base.remove("paths");
             base.remove("commands");
+            base.remove("__aitui_denied_operations");
             let mut calls = Vec::with_capacity(batch.len());
             for item in batch {
                 let item = item
@@ -418,6 +438,7 @@ impl ToolCall {
                 .ok_or("'paths' must be an array of file or directory paths")?;
             let mut base = parent.clone();
             base.remove("paths");
+            base.remove("__aitui_denied_operations");
             let mut calls = Vec::with_capacity(paths.len());
             for path in paths {
                 let path = path.as_str().ok_or("Every 'paths' item must be a string")?;
@@ -434,6 +455,7 @@ impl ToolCall {
                 .ok_or("'commands' must be an array of shell command strings")?;
             let mut base = parent.clone();
             base.remove("commands");
+            base.remove("__aitui_denied_operations");
             let mut calls = Vec::with_capacity(commands.len());
             for command in commands {
                 let command = command
@@ -526,6 +548,16 @@ impl ToolCall {
                     if slides == 1 { "" } else { "s" }
                 )
             }
+            Some(ToolKind::Video) => format!(
+                "video({} → {} · {}ms · {}fps)",
+                s("entry_file").unwrap_or("?"),
+                s("output_path").unwrap_or("?"),
+                self.args
+                    .get("duration_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(5000),
+                self.args.get("fps").and_then(|v| v.as_u64()).unwrap_or(30)
+            ),
             Some(ToolKind::Todo) => {
                 let n = self
                     .args
@@ -606,6 +638,14 @@ impl ToolCall {
             Some(ToolKind::WebFetch) => &["url"],
             Some(ToolKind::Download) => &["url", "path"],
             Some(ToolKind::PowerPoint) => &["operation", "input_path", "output_path"],
+            Some(ToolKind::Video) => &[
+                "entry_file",
+                "output_path",
+                "width",
+                "height",
+                "duration_ms",
+                "fps",
+            ],
             _ => &[],
         }
     }
@@ -658,6 +698,161 @@ pub fn normalize_lexical(p: &std::path::Path) -> PathBuf {
         }
     }
     out
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccessMode {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccessScope {
+    Exact,
+    Tree,
+}
+
+struct ToolAccess {
+    path: PathBuf,
+    mode: AccessMode,
+    scope: AccessScope,
+}
+
+/// Number of calls at the front of `calls` that can execute concurrently.
+///
+/// Calls are kept in contiguous waves so tool results remain in model-call order.
+/// A path overlap is a dependency whenever either side mutates; opaque operations
+/// such as shell and interactive/workflow controls are exclusive barriers.
+pub(crate) fn execution_wave_len(calls: &[ToolCall], cwd: &Path, max: usize) -> usize {
+    let Some(first) = calls.first() else {
+        return 0;
+    };
+    let mut selected = vec![first];
+    for call in calls.iter().skip(1).take(max.saturating_sub(1)) {
+        if selected
+            .iter()
+            .any(|prior| tool_calls_conflict(prior, call, cwd))
+        {
+            break;
+        }
+        selected.push(call);
+    }
+    selected.len()
+}
+
+fn tool_calls_conflict(left: &ToolCall, right: &ToolCall, cwd: &Path) -> bool {
+    let (Some(left), Some(right)) = (tool_accesses(left, cwd), tool_accesses(right, cwd)) else {
+        return true;
+    };
+    left.iter().any(|a| {
+        right.iter().any(|b| {
+            (a.mode == AccessMode::Write || b.mode == AccessMode::Write)
+                && access_paths_overlap(a, b)
+        })
+    })
+}
+
+fn access_paths_overlap(left: &ToolAccess, right: &ToolAccess) -> bool {
+    match (left.scope, right.scope) {
+        (AccessScope::Exact, AccessScope::Exact) => left.path == right.path,
+        (AccessScope::Tree, AccessScope::Exact) => right.path.starts_with(&left.path),
+        (AccessScope::Exact, AccessScope::Tree) => left.path.starts_with(&right.path),
+        (AccessScope::Tree, AccessScope::Tree) => {
+            left.path.starts_with(&right.path) || right.path.starts_with(&left.path)
+        }
+    }
+}
+
+fn tool_accesses(call: &ToolCall, cwd: &Path) -> Option<Vec<ToolAccess>> {
+    if let Some(expanded) = call.expanded_calls().ok()? {
+        let mut accesses = Vec::new();
+        for item in expanded {
+            accesses.extend(tool_accesses(&item, cwd)?);
+        }
+        return Some(accesses);
+    }
+
+    let resolve = |raw: &str| {
+        let path = Path::new(raw);
+        normalize_lexical(&if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        })
+    };
+    let access = |raw: &str, mode, scope| ToolAccess {
+        path: resolve(raw),
+        mode,
+        scope,
+    };
+    let arg = |key: &str| call.args.get(key).and_then(serde_json::Value::as_str);
+    let exact_read = |key| {
+        Some(vec![access(
+            arg(key)?,
+            AccessMode::Read,
+            AccessScope::Exact,
+        )])
+    };
+    let exact_write = |key| {
+        Some(vec![access(
+            arg(key)?,
+            AccessMode::Write,
+            AccessScope::Exact,
+        )])
+    };
+
+    match call.kind()? {
+        ToolKind::Read => exact_read("path"),
+        ToolKind::Write | ToolKind::Edit | ToolKind::Download => exact_write("path"),
+        ToolKind::List => Some(vec![access(
+            arg("path").unwrap_or("."),
+            AccessMode::Read,
+            AccessScope::Tree,
+        )]),
+        ToolKind::Search => Some(vec![access(
+            arg("path").unwrap_or("."),
+            AccessMode::Read,
+            AccessScope::Tree,
+        )]),
+        ToolKind::MakeDir | ToolKind::Delete => Some(vec![access(
+            arg("path")?,
+            AccessMode::Write,
+            AccessScope::Tree,
+        )]),
+        ToolKind::Move => Some(vec![
+            access(arg("from")?, AccessMode::Write, AccessScope::Tree),
+            access(arg("to")?, AccessMode::Write, AccessScope::Tree),
+        ]),
+        ToolKind::Copy => Some(vec![
+            access(arg("from")?, AccessMode::Read, AccessScope::Tree),
+            access(arg("to")?, AccessMode::Write, AccessScope::Tree),
+        ]),
+        ToolKind::ReverseImage if arg("path").is_some() => exact_read("path"),
+        ToolKind::PowerPoint => {
+            let mut accesses = Vec::new();
+            if let Some(path) = arg("input_path") {
+                accesses.push(access(path, AccessMode::Read, AccessScope::Exact));
+            }
+            if let Some(path) = arg("output_path") {
+                accesses.push(access(path, AccessMode::Write, AccessScope::Exact));
+            }
+            Some(accesses)
+        }
+        ToolKind::Video => Some(vec![
+            access(arg("entry_file")?, AccessMode::Read, AccessScope::Exact),
+            access(arg("output_path")?, AccessMode::Write, AccessScope::Exact),
+        ]),
+        ToolKind::WebSearch | ToolKind::WebImages | ToolKind::ReverseImage | ToolKind::WebFetch => {
+            Some(Vec::new())
+        }
+        ToolKind::Shell
+        | ToolKind::Todo
+        | ToolKind::Ask
+        | ToolKind::Plan
+        | ToolKind::ProposeStep
+        | ToolKind::Task
+        | ToolKind::Finish => None,
+    }
 }
 
 /// Result of executing a tool.
@@ -1010,18 +1205,23 @@ Run `git status` before discarding uncommitted work.
 
 Workflow: a separate task tracker maintains the visible checklist — its current state is
 shown in a read-only system message; never edit it yourself, just work one step at a time.
-Delegate only independent parallel work via `workflow(agent)` — never sequential. Info needed
-AFTER your current step? Schedule a child now; it gathers it in parallel. Hand off to the user
-only after all children complete. `workflow(finish)` ends the autonomous loop when stop
-criteria are met.
+Delegate only independent parallel work via `workflow(agent)` — never sequential. Before every
+agent delegation, ask the user to choose that agent's urgency with `interaction(ask)`: Very urgent,
+Time-sensitive, or Best quality. Pass the resulting category in the agent call; urgency guides
+scope and thoroughness and never creates a time limit. Info needed AFTER your current step?
+Schedule a child now; it gathers it in parallel. Hand off to the user only after all children
+complete. `workflow(finish)` ends the autonomous loop when stop criteria are met.
 
 Plan first, then batch: before your first tool call, state a one-line plan naming every file you
 expect to read or write this step. If the plan names multiple reads (for example A, B, and C),
 read all of them in ONE tool call using `paths` or `batch`; do not emit separate sequential read
 calls. The same rule applies to writes, edits, lists, searches, commands, downloads, and every
 other operation that supports independent batching. Prefer one batch call over many calls: results
-are returned together in item order and rendered like the equivalent individual operations. Only
-split calls when a later operation genuinely depends on an earlier result. Files already read this
+are returned together in item order and rendered like the equivalent individual operations. When
+independent work needs different tools (for example read + list + write on unrelated paths), issue
+those tool calls together in one response; they execute concurrently. Calls with overlapping paths
+or opaque side effects are dependency barriers and execute in safe sequential waves. Only split
+calls when a later operation genuinely depends on an earlier result. Files already read this
 session are served from cache; do not re-read them unless a write or edit changed them.
 
 Report: lead with outcome; cite path:line_number. Keep updates brief.{}
@@ -1063,7 +1263,7 @@ fn operation_schemas() -> serde_json::Value {
     }
 
     let mut schemas = serde_json::json!([
-        f("read", "Read one or many files. When multiple files are planned, use paths or batch in this ONE call rather than separate read calls. Omit offset/limit for whole files; large files return paging guidance.", &[
+        f("read", "Read one or many files. Text returns content with line paging. Images return bounded RGBA8 pixel segments; GIFs return multiple animation frames; videos return sampled frames (offset is zero-based frame/second, limit is frame count, max 8). When multiple files are planned, use paths or batch in this ONE call rather than separate read calls.", &[
             ("path", true, "File path, relative to cwd or absolute"),
             ("offset", false, "1-based first line to read (optional)"),
             ("limit", false, "Number of lines from offset (optional)"),
@@ -1115,7 +1315,7 @@ fn operation_schemas() -> serde_json::Value {
             ("url", false, "Public http(s) image URL"),
             ("path", false, "Local image file path, relative to cwd or absolute"),
         ]),
-        f("web_fetch", "Fetch the readable text of a page. Cite the page as a markdown link when you use its content.", &[
+        f("web_fetch", "Fetch a page as structured Markdown with anchor links and images preserved as absolute URLs. Uses a fast HTTP path first, then waits for and captures browser-rendered DOM when a page is an empty JavaScript shell. Cite the page when using its content; use download to save a discovered image locally.", &[
             ("url", true, "https URL to fetch"),
         ]),
         f("download", "Download a URL to a local file (images, assets).", &[
@@ -1126,7 +1326,7 @@ fn operation_schemas() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "powerpoint",
-                "description": "Create, replace, append to, edit, or inspect a validated .pptx deck from structured JSON. Inspection is read-only and returns native OOXML identities, metadata, capabilities, and preservation warnings.",
+                "description": "Create, replace, append to, edit, or inspect a validated LibreOffice-compatible .pptx deck. Build static hierarchy and spacing first; use a 5% safe area, restrained colors, low information density, consistent grids, and persistent anchors across related slides. Accidental overlaps and likely text overflow are rejected by default. Animate by beat, not by element: animations default to one click for the complete related sequence; use explicit mode only when pedagogically required. Inspection is read-only and returns native OOXML identities, metadata, capabilities, and preservation warnings.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1143,6 +1343,17 @@ fn operation_schemas() -> serde_json::Value {
                         "output_path": {
                             "type": "string",
                             "description": "Destination .pptx path, relative to cwd or absolute"
+                        },
+                        "design": {
+                            "type": "object",
+                            "description": "Deck-wide visual safety rules. Defaults target LibreOffice and conservative cross-suite rendering.",
+                            "properties": {
+                                "profile": { "type": "string", "enum": ["libreoffice_safe"], "default": "libreoffice_safe" },
+                                "safe_margin": { "type": "number", "minimum": 0, "maximum": 1.5, "default": 0.375, "description": "Compatibility safe area in inches; full-slide background shapes are exempt" },
+                                "overlap_policy": { "type": "string", "enum": ["error", "warn", "allow"], "default": "error", "description": "Reject accidental element intersections by default; contained content inside an earlier background/card shape is allowed" },
+                                "continuity_policy": { "type": "string", "enum": ["error", "warn", "off"], "default": "warn", "description": "Check that same-ID anchors stay fixed across slides sharing continuity_group" }
+                            },
+                            "additionalProperties": false
                         },
                         "slides": {
                             "type": "array",
@@ -1167,11 +1378,14 @@ fn operation_schemas() -> serde_json::Value {
                                                 "shape_type": { "type": "string", "enum": ["rectangle", "ellipse", "rounded_rectangle"], "default": "rectangle" },
                                                 "fill_color": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$", "default": "4472C4" },
                                                 "text_color": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$", "default": "FFFFFF" },
-                                                "font_size": { "type": "number", "exclusiveMinimum": 0, "default": 24 }
+                                                "font_size": { "type": "number", "exclusiveMinimum": 0, "default": 24 },
+                                                "allow_overlap": { "type": "boolean", "default": false, "description": "Opt in only for intentional overlays; ordinary collisions are rejected" }
                                             },
                                             "required": ["id", "type", "x", "y", "width", "height"]
                                         }
                                     },
+                                    "continuity_group": { "type": "string", "description": "Related consecutive slides with the same group are checked for stable position and scale of same-ID elements" },
+                                    "animation_mode": { "type": "string", "enum": ["none", "single_click", "explicit"], "default": "single_click", "description": "none suppresses timing; single_click makes one click run the whole ordered beat; explicit honors per-animation triggers" },
                                     "animations": {
                                         "type": "array",
                                         "default": [],
@@ -1183,7 +1397,7 @@ fn operation_schemas() -> serde_json::Value {
                                                 "order": { "type": "integer", "minimum": 0, "description": "Unique sequence order within this slide" },
                                                 "duration_ms": { "type": "integer", "minimum": 1, "maximum": 60000, "default": 500 },
                                                 "delay_ms": { "type": "integer", "minimum": 0, "maximum": 60000, "default": 0 },
-                                                "trigger": { "type": "string", "enum": ["on_click", "with_previous", "after_previous"], "default": "on_click" }
+                                                "trigger": { "type": "string", "enum": ["on_click", "with_previous", "after_previous"], "default": "after_previous", "description": "Honored only in explicit mode; single_click automatically groups the complete ordered sequence behind one click" }
                                             },
                                             "required": ["type", "target", "order"]
                                         }
@@ -1290,6 +1504,25 @@ fn operation_schemas() -> serde_json::Value {
                 }
             }
         }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "video",
+                "description": "Render a local 2D HTML/CSS/JS animation to MP4 or WebM using headless Chrome and ffmpeg. The page is captured frame-by-frame at deterministic times and a six-frame storyboard plus overflow/clipping diagnostics are returned for visual iteration. Author clean video content rather than a player UI: omit controls and progress indicators unless requested, keep production directions off-screen, and use continuous eased motion without hard state jumps. Every movement must be motivated by subject action, physical cause, attention, or narrative transition—never add drift merely to keep the frame moving. Use cinematic 2D camera work when it improves the story: deliberate pans, pushes, pulls, tracking, reveals, reframing, and restrained parallax between flat layers. Do not simulate 3D camera orbit, perspective staging, or 3D object motion; 3D support is outside the current workflow.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "entry_file": { "type": "string", "description": "Local HTML entry point. Keep HTML, CSS, JS, fonts, and assets local so capture is deterministic." },
+                        "output_path": { "type": "string", "description": "Destination .mp4 or .webm path" },
+                        "width": { "type": "integer", "minimum": 320, "maximum": 4096, "default": 1920, "description": "Video width in CSS pixels" },
+                        "height": { "type": "integer", "minimum": 240, "maximum": 4096, "default": 1080, "description": "Video height in CSS pixels" },
+                        "duration_ms": { "type": "integer", "minimum": 100, "maximum": 120000, "default": 5000, "description": "Exact timeline duration. Design a beginning, development, payoff, and resting end frame within this duration." },
+                        "fps": { "type": "integer", "minimum": 1, "maximum": 60, "default": 30, "description": "Frames per second. Use 30 normally and 60 only when fast motion truly benefits." }
+                    },
+                    "required": ["entry_file", "output_path"]
+                }
+            }
+        }),
         // `todo` takes an array param, so it's built directly rather than via `f`.
         serde_json::json!({
             "type": "function",
@@ -1393,13 +1626,18 @@ fn operation_schemas() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "agent",
-                "description": "Delegate an independent branch to a parallel child agent. Consecutive agent calls launch concurrently; the app waits for the whole batch. Never delegate sequential work — do that yourself. Info needed AFTER your current task? Schedule it now to gather in parallel. Give complete scope, constraints, evidence expectations, and final report shape. Children may launch their own bounded agents.",
+                "description": "Delegate an independent branch to a parallel child agent after asking the user to choose this agent's urgency. Consecutive agent calls launch concurrently; the app waits for the whole batch. Urgency guides focus and thoroughness but never imposes a time limit. Never delegate sequential work — do that yourself. Info needed AFTER your current task? Schedule it now to gather in parallel. Give complete scope, constraints, evidence expectations, and final report shape. Children may launch their own bounded agents.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "description": { "type": "string", "description": "Short user-visible label for this child agent" },
                         "agent": { "type": "string", "description": "Optional name of a configured agent (from the [agents] config): use it when the configured description fits the task, so the child gets its role, model, and tool policy. Otherwise omit and describe the role inline in the prompt." },
                         "prompt": { "type": "string", "description": "Detailed instructions for the child agent, including scope, constraints, and expected final report" },
+                        "urgency": {
+                            "type": "string",
+                            "enum": ["very_urgent", "time_sensitive", "best_quality"],
+                            "description": "Required user-selected priority for this agent. Ask with interaction(ask) before delegating: very_urgent = shortest trustworthy path; time_sensitive = efficient but reliable; best_quality = take as much time as needed for the strongest response. This does not set a time limit."
+                        },
                         "task_index": { "type": "integer", "minimum": 1, "description": "Optional one-based index of the main checklist subtask this child agent owns" },
                         "checks": {
                             "type": "array",
@@ -1420,7 +1658,7 @@ fn operation_schemas() -> serde_json::Value {
                         },
                         "cwd": { "type": "string", "description": "Optional working directory for this child agent, relative to current cwd or absolute" }
                     },
-                    "required": ["description", "prompt"]
+                    "required": ["description", "prompt", "urgency"]
                 }
             }
         }),
@@ -1601,7 +1839,7 @@ fn build_tool_schemas(loop_active: bool) -> serde_json::Value {
         category(
             &operations,
             "web",
-            "Web research and downloads. Choose action first: search finds current text sources, images finds reusable Wikimedia Commons assets and metadata, reverse_image finds visually similar images and source links from an image URL or local image, fetch reads one page, and download saves a direct asset URL. Cite sources used in the answer.",
+            "Web research and downloads. Choose action first: search finds current text sources, images finds reusable Wikimedia Commons assets and metadata, reverse_image finds visually similar images and source links from an image URL or local image, fetch converts static or JavaScript-rendered pages to structured Markdown with absolute links and images, and download saves any direct asset URL for local inspection. Cite sources used in the answer.",
             &[
                 ("search", "web_search"),
                 ("images", "web_images"),
@@ -1613,8 +1851,8 @@ fn build_tool_schemas(loop_active: bool) -> serde_json::Value {
         category(
             &operations,
             "specialized",
-            "Specialized artifact-generation tools owned and executed by AiTUI (not shell commands). Choose powerpoint to create an atomically saved, structurally validated animated .pptx deck directly from a structured slide specification.",
-            &[("powerpoint", "powerpoint")],
+            "Specialized artifact-generation tools owned and executed by AiTUI (not shell commands). Choose powerpoint for validated animated .pptx decks, or video to deterministically capture a local 2D HTML/CSS/JS animation with headless Chrome and ffmpeg. For video: first storyboard 3-6 beats; build at the exact target aspect ratio; use a consistent spacing/type/color system and keep critical content inside a 5% safe area; add data-video-role attributes to important elements; treat the user's production directions as off-screen instructions, not captions or labels; never add playback chrome, progress bars, scrubbers, or controls unless explicitly requested; animate continuous properties with overlapping eased transitions and avoid hard per-beat state swaps; require every motion to have a clear physical, attentional, or narrative cause rather than moving elements for visual activity alone; use cinematic 2D camera language—motivated pans, pushes, pulls, tracking, reveals, reframing, and restrained parallax between flat layers—while preserving natural acceleration, settling, weight, and readable holds; vary staging only when it strengthens the story; do not imitate 3D camera orbit, perspective staging, or 3D object motion because the current workflow is 2D-only; expose window.__aitui.seek(timeMs) for JS/canvas animation state, while ordinary CSS/Web Animations are sought automatically; render, inspect the returned storyboard and layout diagnostics, revise, and rerender before presenting the final artifact.",
+            &[("powerpoint", "powerpoint"), ("video", "video")],
         ),
         category(
             &operations,
@@ -1650,6 +1888,13 @@ fn build_tool_schemas(loop_active: bool) -> serde_json::Value {
                     }),
                 );
             }
+            workflow["function"]["parameters"]["allOf"] = serde_json::json!([{
+                "if": {
+                    "properties": {"action": {"const": "agent"}},
+                    "required": ["action"]
+                },
+                "then": {"required": ["urgency"]}
+            }]);
         }
     }
     schemas
@@ -1716,6 +1961,14 @@ mod tests {
             )
             .kind(),
             Some(ToolKind::PowerPoint)
+        );
+        assert_eq!(
+            call(
+                "specialized",
+                serde_json::json!({"action": "video", "entry_file": "scene.html", "output_path": "scene.mp4"})
+            )
+            .kind(),
+            Some(ToolKind::Video)
         );
         assert_eq!(
             call("interaction", serde_json::json!({"action": "propose"})).kind(),
@@ -1802,11 +2055,23 @@ mod tests {
             &serde_json::json!(["search", "images", "reverse_image", "fetch", "download"])
         );
         let specialized = &schemas[3]["function"]["parameters"]["properties"]["action"]["enum"];
-        assert_eq!(specialized, &serde_json::json!(["powerpoint"]));
+        assert_eq!(specialized, &serde_json::json!(["powerpoint", "video"]));
+        let video = &schemas[3]["function"]["parameters"]["properties"];
+        assert_eq!(video["width"]["default"], 1920);
+        assert_eq!(video["fps"]["default"], 30);
         assert!(schemas[3]["function"]["description"]
             .as_str()
             .unwrap()
-            .contains("not shell commands"));
+            .contains("window.__aitui.seek"));
+        let specialized_description = schemas[3]["function"]["description"].as_str().unwrap();
+        assert!(specialized_description.contains("not shell commands"));
+        assert!(specialized_description.contains("never add playback chrome"));
+        assert!(specialized_description.contains("off-screen instructions"));
+        assert!(specialized_description.contains("overlapping eased transitions"));
+        assert!(specialized_description.contains("every motion to have a clear"));
+        assert!(specialized_description.contains("cinematic 2D camera language"));
+        assert!(specialized_description.contains("natural acceleration"));
+        assert!(specialized_description.contains("current workflow is 2D-only"));
         let operations = &schemas[3]["function"]["parameters"]["properties"]["operation"]["enum"];
         assert_eq!(
             operations,
@@ -1818,8 +2083,28 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&serde_json::json!("update_element")));
-        let animation_types = &schemas[3]["function"]["parameters"]["properties"]["slides"]
-            ["items"]["properties"]["animations"]["items"]["properties"]["type"]["enum"];
+        let powerpoint_properties = &schemas[3]["function"]["parameters"]["properties"];
+        assert_eq!(
+            powerpoint_properties["design"]["properties"]["overlap_policy"]["default"],
+            "error"
+        );
+        assert_eq!(
+            powerpoint_properties["slides"]["items"]["properties"]["animation_mode"]["default"],
+            "single_click"
+        );
+        assert_eq!(
+            powerpoint_properties["slides"]["items"]["properties"]["animations"]["items"]
+                ["properties"]["trigger"]["default"],
+            "after_previous"
+        );
+        assert!(
+            powerpoint_properties["slides"]["items"]["properties"]["elements"]["items"]
+                ["properties"]
+                .get("allow_overlap")
+                .is_some()
+        );
+        let animation_types = &powerpoint_properties["slides"]["items"]["properties"]["animations"]
+            ["items"]["properties"]["type"]["enum"];
         assert_eq!(
             animation_types,
             &serde_json::json!([
@@ -1940,6 +2225,32 @@ mod tests {
         assert!(workflow_desc.contains("tracker"));
         assert!(workflow_desc.contains("parallel child agent"));
         assert!(workflow_desc.contains("stop criteria"));
+
+        let urgency = &workflow["function"]["parameters"]["properties"]["urgency"];
+        assert_eq!(
+            urgency["enum"],
+            serde_json::json!(["very_urgent", "time_sensitive", "best_quality"])
+        );
+        assert!(urgency["description"]
+            .as_str()
+            .unwrap()
+            .contains("does not set a time limit"));
+        assert_eq!(
+            workflow["function"]["parameters"]["allOf"][0]["then"]["required"],
+            serde_json::json!(["urgency"])
+        );
+        let operations = operation_schemas();
+        let agent = operations
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|schema| schema["function"]["name"] == "agent")
+            .unwrap();
+        assert!(agent["function"]["parameters"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "urgency"));
     }
 
     #[test]
@@ -2109,6 +2420,68 @@ mod tests {
         assert_eq!(edits[0].get_arg("old"), Some("old a"));
         assert_eq!(edits[0].get_arg("new"), Some("new a"));
         assert_eq!(edits[1].get_arg("path"), Some("b.rs"));
+    }
+
+    #[test]
+    fn execution_waves_parallelize_independent_heterogeneous_calls() {
+        let cwd = PathBuf::from("/project");
+        let calls = vec![
+            call("read", serde_json::json!({"path": "src/main.rs"})),
+            call("list", serde_json::json!({"path": "docs"})),
+            call(
+                "write",
+                serde_json::json!({"path": "generated/out.txt", "content": "ok"}),
+            ),
+        ];
+        assert_eq!(super::execution_wave_len(&calls, &cwd, 16), 3);
+    }
+
+    #[test]
+    fn execution_waves_stop_before_path_dependencies_and_opaque_calls() {
+        let cwd = PathBuf::from("/project");
+        let dependent = vec![
+            call("read", serde_json::json!({"path": "src/main.rs"})),
+            call(
+                "write",
+                serde_json::json!({"path": "src/main.rs", "content": "new"}),
+            ),
+            call("list", serde_json::json!({"path": "docs"})),
+        ];
+        assert_eq!(super::execution_wave_len(&dependent, &cwd, 16), 1);
+
+        let tree_conflict = vec![
+            call("list", serde_json::json!({"path": "src"})),
+            call(
+                "write",
+                serde_json::json!({"path": "src/generated.rs", "content": "new"}),
+            ),
+        ];
+        assert_eq!(super::execution_wave_len(&tree_conflict, &cwd, 16), 1);
+
+        let shell_barrier = vec![
+            call("read", serde_json::json!({"path": "README.md"})),
+            call("shell", serde_json::json!({"command": "cargo test"})),
+        ];
+        assert_eq!(super::execution_wave_len(&shell_barrier, &cwd, 16), 1);
+    }
+
+    #[test]
+    fn expanded_calls_participate_in_dependency_detection() {
+        let cwd = PathBuf::from("/project");
+        let calls = vec![
+            call(
+                "file_management",
+                serde_json::json!({
+                    "action": "read",
+                    "paths": ["a.txt", "b.txt"]
+                }),
+            ),
+            call(
+                "write",
+                serde_json::json!({"path": "b.txt", "content": "changed"}),
+            ),
+        ];
+        assert_eq!(super::execution_wave_len(&calls, &cwd, 16), 1);
     }
 
     #[test]

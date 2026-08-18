@@ -193,10 +193,10 @@ impl App {
                         crate::app::notify::DesktopAction::Review => {
                             self.set_status("Review the pending request in AiTUI");
                         }
-                        crate::app::notify::DesktopAction::AllowOnce
+                        crate::app::notify::DesktopAction::AllowAll
                             if matches!(self.overlay, Overlay::Permission(_)) =>
                         {
-                            return self.resolve_permission(Permission::Allow, None);
+                            return self.resolve_all_permission_operations();
                         }
                         crate::app::notify::DesktopAction::DenyOnce
                             if matches!(self.overlay, Overlay::Permission(_)) =>
@@ -432,6 +432,22 @@ impl App {
                     self.update_mention();
                 }
             }
+            Action::PasteClipboard => match crate::app::clipboard::read() {
+                Ok(crate::app::clipboard::ClipboardContent::Image(path)) => {
+                    let name = path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("clipboard-image.png")
+                        .to_string();
+                    self.replace_attachment(Some(path));
+                    self.set_status(format!("Attached clipboard image: {}", name));
+                }
+                Ok(crate::app::clipboard::ClipboardContent::Text(text)) => self.smart_paste(text),
+                Err(error) => crate::app::toast::warning(format!(
+                    "Could not paste from system clipboard: {}",
+                    error
+                )),
+            },
             Action::PasteText(t) => self.smart_paste(t),
             Action::Move(dir) => {
                 let normal = self.vim != VimMode::Insert;
@@ -461,6 +477,34 @@ impl App {
 
             // ── Submission / streaming ──────────────────────────────────────
             Action::Submit => return self.submit(),
+            Action::PromptDuringRunUp => {
+                if let Overlay::PromptDuringRun(prompt) = &mut self.overlay {
+                    prompt.up();
+                    self.touch();
+                }
+            }
+            Action::PromptDuringRunDown => {
+                if let Overlay::PromptDuringRun(prompt) = &mut self.overlay {
+                    prompt.down();
+                    self.touch();
+                }
+            }
+            Action::PromptDuringRunResolve => {
+                let selected = match &self.overlay {
+                    Overlay::PromptDuringRun(prompt) => prompt.selected,
+                    _ => return None,
+                };
+                self.overlay = Overlay::None;
+                match selected {
+                    0 => return self.queue_current_prompt(),
+                    1 => {
+                        self.apply(Action::AgentCancel);
+                        return self.submit();
+                    }
+                    _ => self.set_status("Prompt kept in the composer — send when ready"),
+                }
+            }
+            Action::SendQueuedPrompt(sid) => return self.send_queued_prompt(sid),
             Action::RetryLast => return self.retry_last(),
             Action::EditLast => self.edit_last(),
             Action::CopyLastReply => self.copy_last_reply(),
@@ -524,7 +568,7 @@ impl App {
                     session.finalize_assistant_stream();
                 }
                 self.streams.retain(|handle| handle.session_id != sid);
-                self.set_status(format!("Image request failed: {}", error));
+                crate::app::toast::error(format!("Image request failed: {}", error));
                 self.sessions.save();
                 self.touch();
             }
@@ -589,11 +633,11 @@ impl App {
                         self.touch();
                         return self.begin_stream_for(sid);
                     }
-                    self.set_status(
+                    crate::app::toast::error(
                         "Context full and this turn alone is too large — shorten it or :clear.",
                     );
                 } else {
-                    self.set_status(format!("Stream error: {}", e));
+                    crate::app::toast::error(format!("Stream error: {}", e));
                 }
                 self.sessions.save();
                 self.touch();
@@ -660,6 +704,19 @@ impl App {
                 self.show_output = !self.show_output;
                 self.chat.stick_bottom = true;
                 self.touch();
+            }
+            Action::ChatPress(col, row) => {
+                if !matches!(self.overlay, Overlay::None) {
+                    self.mouse_select = None;
+                    return None;
+                }
+                self.mouse_select = Some(MouseSelection {
+                    anchor_col: col,
+                    anchor_row: row,
+                    drag_row: row,
+                    active: false,
+                    dragged: false,
+                });
             }
             Action::ChatClick(col, row) => {
                 if !matches!(self.overlay, Overlay::None) {
@@ -830,12 +887,6 @@ impl App {
                         }
                     }
                     let vp_row = (row - area.y) as usize;
-                    // Record the click position for drag selection.
-                    self.mouse_select = Some(MouseSelection {
-                        anchor_row: row,
-                        drag_row: row,
-                        active: false,
-                    });
                     // Toggle collapsible blocks: match the header directly, or
                     // walk backwards to find the enclosing toggle when clicking
                     // on a content row.
@@ -859,18 +910,23 @@ impl App {
             }
             Action::ChatDrag(col, row) => {
                 if let Some(sel) = &mut self.mouse_select {
+                    sel.dragged = true;
                     let area = self.layout.chat;
+                    let anchor_inside = sel.anchor_col >= area.x
+                        && sel.anchor_col < area.x + area.width
+                        && sel.anchor_row >= area.y
+                        && sel.anchor_row < area.y + area.height;
                     let inside = col >= area.x
                         && col < area.x + area.width
                         && row >= area.y
                         && row < area.y + area.height;
-                    if inside {
+                    if anchor_inside && inside {
                         sel.active = true;
                         sel.drag_row = row;
                     }
                 }
             }
-            Action::ChatRelease => {
+            Action::ChatRelease(col, row) => {
                 if let Some(sel) = self.mouse_select.take() {
                     if sel.active && self.config.ui.auto_copy_selection {
                         let area = self.layout.chat;
@@ -894,7 +950,13 @@ impl App {
                             self.pending_clipboard = Some(text);
                         }
                     }
+                    // Any drag, including one outside the transcript or with
+                    // auto-copy disabled, must not activate the row beneath it.
+                    if sel.dragged {
+                        return None;
+                    }
                 }
+                return self.apply(Action::ChatClick(col, row));
             }
             Action::DismissNotice => {
                 if matches!(
@@ -1024,7 +1086,6 @@ impl App {
                 self.stash_active_permissions();
                 self.sessions.new_session();
                 self.load_active_permissions();
-                self.sessions.active_mut().agent_mode = true;
                 self.sessions.save();
                 self.chat.stick_bottom = true;
                 self.touch();
@@ -1296,14 +1357,14 @@ impl App {
                         .and_then(|n| n.to_str())
                         .unwrap_or("?")
                         .to_string();
-                    self.attachment = Some(path);
+                    self.replace_attachment(Some(path));
                     self.set_status(format!("Attached: {}", name));
                 } else {
-                    self.set_status(format!("Not found: {}", path.display()));
+                    crate::app::toast::error(format!("Attachment not found: {}", path.display()));
                 }
             }
             Action::ClearAttachment => {
-                self.attachment = None;
+                self.replace_attachment(None);
                 self.set_status("Attachment cleared");
             }
 
@@ -1403,13 +1464,28 @@ impl App {
                 }
                 return self.resolve_permission(perm, reason);
             }
-            Action::AgentQuickAllow => return self.resolve_permission(Permission::Allow, None),
-            Action::AgentQuickDeny => return self.begin_deny(Permission::Deny),
+            Action::AgentQuickAllow => {
+                let multi =
+                    matches!(&self.overlay, Overlay::Permission(r) if r.has_multiple_operations());
+                if multi {
+                    return self.resolve_permission_operation(PermissionDecision::Allow);
+                }
+                return self.resolve_permission(Permission::Allow, None);
+            }
+            Action::AgentQuickAllowAll => return self.resolve_all_permission_operations(),
+            Action::AgentQuickDeny => {
+                let multi =
+                    matches!(&self.overlay, Overlay::Permission(r) if r.has_multiple_operations());
+                if multi {
+                    return self.resolve_permission_operation(PermissionDecision::Deny);
+                }
+                return self.begin_deny(Permission::Deny);
+            }
             Action::AgentDenyCancel => {
                 if let Overlay::Permission(r) = &mut self.overlay {
                     r.cancel_deny();
                     self.set_status(
-                        "Access — ↑↓ option · ←→ phrase · a allow · d deny · e edit · p policy · ⏎ model review · Esc cancel",
+                        "Access — a allow current · A allow all · d deny current · e edit · p policy · ⏎ model review · Esc cancel",
                     );
                     self.touch();
                 }
@@ -1437,7 +1513,7 @@ impl App {
                     if std::fs::write(&path, text).is_ok() {
                         self.pending_external = Some(PendingExternal::DecisionReadback(path));
                     } else {
-                        self.set_status("Couldn't edit option — temp file write failed");
+                        crate::app::toast::error("Couldn't edit option — temp file write failed");
                     }
                 }
             }
@@ -1477,6 +1553,18 @@ impl App {
                     self.touch();
                 }
             }
+            Action::AgentPermissionOperationPrev => {
+                if let Overlay::Permission(r) = &mut self.overlay {
+                    r.previous_operation();
+                    self.touch();
+                }
+            }
+            Action::AgentPermissionOperationNext => {
+                if let Overlay::Permission(r) = &mut self.overlay {
+                    r.next_operation();
+                    self.touch();
+                }
+            }
             Action::AgentPermissionSelector => {
                 if let Overlay::Permission(r) = &mut self.overlay {
                     r.toggle_selector();
@@ -1510,7 +1598,7 @@ impl App {
                     if std::fs::write(&path, r.edit_buffer()).is_ok() {
                         self.pending_external = Some(PendingExternal::EditReadback(path));
                     } else {
-                        self.set_status("Couldn't open editor — temp file write failed");
+                        crate::app::toast::error("Couldn't open editor — temp file write failed");
                     }
                 }
             }
@@ -1555,7 +1643,7 @@ impl App {
                 if std::fs::write(&path, seed).is_ok() {
                     self.pending_external = Some(PendingExternal::PolicyReadback(path));
                 } else {
-                    self.set_status("Couldn't open editor — temp file write failed");
+                    crate::app::toast::error("Couldn't open editor — temp file write failed");
                 }
             }
             Action::AccessJudged(sid, verdicts) => {
@@ -1582,7 +1670,7 @@ impl App {
                 if std::fs::write(&path, seed).is_ok() {
                     self.pending_external = Some(PendingExternal::LoopReadback(path));
                 } else {
-                    self.set_status("Couldn't open editor — temp file write failed");
+                    crate::app::toast::error("Couldn't open editor — temp file write failed");
                 }
             }
             Action::StopLoop => self.stop_loop(),
@@ -1609,6 +1697,20 @@ impl App {
             Action::SubtaskEvent(event) => return self.handle_subtask_event(event),
             Action::AgentCancel => {
                 self.overlay = Overlay::None;
+                // Stop model generation for the active session as part of the same
+                // cancellation path used for tools/children. This makes Ctrl-C a
+                // two-stage gesture: interrupt first, quit only once already idle.
+                let active = self.sessions.active_id();
+                self.streams.retain(|stream| stream.session_id != active);
+                if self
+                    .preparing_tool
+                    .as_ref()
+                    .is_some_and(|(session_id, _, _)| *session_id == active)
+                {
+                    self.preparing_tool = None;
+                }
+                self.sessions.active_mut().finalize_assistant_stream();
+                self.stop_loop();
                 // Kill the in-flight tool round: shells are terminated at their
                 // process group; the result (if it still lands) is dropped below.
                 if let Some(abort) = self.agent_abort.take() {
@@ -1616,6 +1718,9 @@ impl App {
                 }
                 self.pending_tools.clear();
                 self.approved.clear();
+                for request in self.child_access_queue.drain(..) {
+                    let _ = request.response.send(Err("Cancelled by user".into()));
+                }
                 self.judging = None;
                 self.judge_rx = None;
                 if let Some(task) = self.judge_task.take() {
@@ -1679,6 +1784,7 @@ impl App {
             }
             Overlay::Permission(r) => r.selector_up(),
             Overlay::Decision(r) => r.up(),
+            Overlay::PromptDuringRun(r) => r.up(),
             Overlay::ApiSetup(a) => a.next_field(),
             Overlay::CommandLine(_)
             | Overlay::ToolRequest(_)
@@ -1700,6 +1806,7 @@ impl App {
             }
             Overlay::Permission(r) => r.selector_down(),
             Overlay::Decision(r) => r.down(),
+            Overlay::PromptDuringRun(r) => r.down(),
             Overlay::ApiSetup(a) => a.next_field(),
             Overlay::CommandLine(_)
             | Overlay::ToolRequest(_)
@@ -1771,7 +1878,7 @@ impl App {
         self.overlay = Overlay::None;
         self.config.api.endpoint = ep.clone();
         self.config.api.api_key = key.clone();
-        let _ = self.config.save();
+        self.save_config();
         self.api = crate::api::ApiClient::new(&ep, &key).ok();
         if ep.is_empty() {
             self.select_mock_model();
@@ -1995,7 +2102,7 @@ impl App {
         request.decision = rule.decision;
         request.tool_index = rule
             .kind
-            .or_else(|| match rule.scope {
+            .or(match rule.scope {
                 crate::agent::PermissionScope::Kind(kind) => Some(kind),
                 _ => None,
             })
@@ -2009,7 +2116,7 @@ impl App {
         request.custom_directory = rule
             .directory
             .as_ref()
-            .or_else(|| match &rule.scope {
+            .or(match &rule.scope {
                 crate::agent::PermissionScope::Directory(directory) => Some(directory),
                 _ => None,
             })
@@ -2142,6 +2249,10 @@ impl App {
                 self.overlay = Overlay::Decision(r);
                 self.resolve_decision()
             }
+            Overlay::PromptDuringRun(r) => {
+                self.overlay = Overlay::PromptDuringRun(r);
+                Some(Action::PromptDuringRunResolve)
+            }
             Overlay::Plan(r) => {
                 self.overlay = Overlay::Plan(r);
                 self.resolve_plan(true)
@@ -2190,13 +2301,13 @@ impl App {
                             self.reasoning_effort = reasoning_value(&value);
                             self.config.api.reasoning_effort =
                                 self.reasoning_effort.clone().unwrap_or_default();
-                            let _ = self.config.save();
+                            self.save_config();
                         }
                         Some(SettingsRow::ReasoningMode) => {
                             self.reasoning_mode = reasoning_value(&value);
                             self.config.api.reasoning_mode =
                                 self.reasoning_mode.clone().unwrap_or_default();
-                            let _ = self.config.save();
+                            self.save_config();
                         }
                         Some(SettingsRow::SystemPrompt) => {
                             let prompt = match value.trim() {
@@ -2269,7 +2380,7 @@ impl App {
             | SettingsRow::ReasoningMode
             | SettingsRow::SystemPrompt => {}
         }
-        let _ = self.config.save();
+        self.save_config();
     }
 
     // ── : commands ──────────────────────────────────────────────────────────
@@ -2343,7 +2454,7 @@ impl App {
             "sticky" | "stickyskills" => {
                 self.config.ui.sticky_skills = !self.config.ui.sticky_skills;
                 let on = self.config.ui.sticky_skills;
-                let _ = self.config.save();
+                self.save_config();
                 if on {
                     crate::skills::save_active(&self.skills);
                 }
@@ -2394,7 +2505,7 @@ impl App {
                 self.reasoning_effort = reasoning_value(value);
                 self.config.api.reasoning_effort =
                     self.reasoning_effort.clone().unwrap_or_default();
-                let _ = self.config.save();
+                self.save_config();
                 self.set_status(format!(
                     "Reasoning › effort: {}",
                     self.reasoning_effort.as_deref().unwrap_or("off")
@@ -2416,7 +2527,7 @@ impl App {
                     .trim();
                 self.reasoning_mode = reasoning_value(value);
                 self.config.api.reasoning_mode = self.reasoning_mode.clone().unwrap_or_default();
-                let _ = self.config.save();
+                self.save_config();
                 self.set_status(format!(
                     "Reasoning › mode: {}",
                     self.reasoning_mode.as_deref().unwrap_or("off")
@@ -2616,6 +2727,7 @@ mod tests {
             model_load: crate::app::state::ModelLoad::Loaded,
             attachment: None,
             status: None,
+            toasts: VecDeque::new(),
             focused: true,
             notification_tx,
             notification_rx,
@@ -2653,6 +2765,7 @@ mod tests {
             streams: Vec::new(),
             agent_session: None,
             agent_queue: VecDeque::new(),
+            queued_prompts: std::collections::HashMap::new(),
             agent_tool_rx: None,
             agent_tool_batch_rx: None,
             subtasks: Vec::new(),
@@ -2662,6 +2775,7 @@ mod tests {
             task_barrier: None,
             subtask_tx,
             subtask_rx,
+            child_access_queue: VecDeque::new(),
             active_tool: None,
             preparing_tool: None,
             models_rx: None,
@@ -2721,7 +2835,7 @@ mod tests {
         app.apply(Action::DesktopNotification(
             crate::app::notify::DesktopResponse {
                 generation: 1,
-                action: crate::app::notify::DesktopAction::AllowOnce,
+                action: crate::app::notify::DesktopAction::AllowAll,
             },
         ));
         assert!(matches!(app.overlay, Overlay::Permission(_)));
@@ -2729,6 +2843,61 @@ mod tests {
             app.status.as_deref(),
             Some("That notification is no longer current")
         );
+    }
+
+    #[tokio::test]
+    async fn desktop_allow_all_executes_every_operation_and_overrides_prior_denial() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir().join(format!(
+            "aitui_notification_allow_all_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.notification_generation = 4;
+        app.agent_session = Some(app.sessions.active_id());
+        app.sessions.active_mut().cwd = Some(dir.clone());
+        let mut request = crate::app::overlay::PermissionRequest::new(
+            vec![tool_call(
+                "file_management",
+                serde_json::json!({
+                    "action": "write",
+                    "batch": [
+                        {"path": "first.txt", "content": "one"},
+                        {"path": "second.txt", "content": "two"}
+                    ]
+                }),
+            )],
+            dir.clone(),
+        );
+        assert!(!request.decide_operation(PermissionDecision::Deny));
+        app.overlay = Overlay::Permission(request);
+
+        app.apply(Action::DesktopNotification(
+            crate::app::notify::DesktopResponse {
+                generation: 4,
+                action: crate::app::notify::DesktopAction::AllowAll,
+            },
+        ));
+
+        assert!(!matches!(app.overlay, Overlay::Permission(_)));
+        let result = app
+            .agent_tool_rx
+            .as_mut()
+            .expect("notification allow-all starts the full batch")
+            .recv()
+            .await
+            .expect("tool result");
+        assert!(result.output.is_ok());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("first.txt")).unwrap(),
+            "one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("second.txt")).unwrap(),
+            "two"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2763,6 +2932,39 @@ mod tests {
 
         assert_eq!(app.notification_generation, 10);
         assert!(!matches!(app.overlay, Overlay::Permission(_)));
+    }
+
+    #[test]
+    fn full_frame_renders_first_composer_line_before_any_newline() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = test_app();
+        app.vim = VimMode::Insert;
+        for character in "first line".chars() {
+            app.apply(Action::InsertChar(character));
+        }
+        assert_eq!(app.input.lines, ["first line"]);
+        assert_eq!(app.input.cursor(), (0, 10));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+
+        let rendered = (0..24)
+            .map(|y| {
+                (0..80)
+                    .map(|x| terminal.backend().buffer().cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rendered.iter().any(|line| line.contains("first line")),
+            "first composer line missing from full frame: {:?}",
+            rendered
+        );
     }
 
     #[test]
@@ -2901,9 +3103,9 @@ mod tests {
         let area = app.layout.chat;
         assert!(app.chat.doc().len() < area.height as usize);
         let blank_row = area.y + app.chat.doc().len() as u16;
-        app.apply(Action::ChatClick(area.x, blank_row));
+        app.apply(Action::ChatPress(area.x, blank_row));
         app.apply(Action::ChatDrag(area.x + 1, blank_row));
-        app.apply(Action::ChatRelease);
+        app.apply(Action::ChatRelease(area.x + 1, blank_row));
 
         assert!(app.pending_clipboard.is_none());
     }
@@ -2920,10 +3122,13 @@ mod tests {
             sid,
             "provider rejected prompt".into(),
         ));
-        assert_eq!(
-            app.status.as_deref(),
-            Some("Image request failed: provider rejected prompt")
-        );
+        assert!(app.status.is_none());
+        assert!(crate::app::toast::drain_messages()
+            .iter()
+            .any(|(level, message)| {
+                *level == crate::app::toast::ToastLevel::Error
+                    && message == "Image request failed: provider rejected prompt"
+            }));
         assert!(app
             .sessions
             .by_id(sid)
@@ -3828,6 +4033,26 @@ mod tests {
     }
 
     #[test]
+    fn prompt_preview_activates_only_on_undragged_release() {
+        let mut app = test_app();
+        app.layout.chat = ratatui::layout::Rect::new(0, 5, 80, 10);
+        app.layout.prompt = Some(crate::app::state::PromptHitbox {
+            area: ratatui::layout::Rect::new(0, 2, 80, 1),
+            msg: None,
+        });
+
+        app.apply(Action::ChatPress(12, 2));
+        assert!(!app.show_last_prompt);
+        app.apply(Action::ChatRelease(12, 2));
+        assert!(app.show_last_prompt);
+
+        app.apply(Action::ChatPress(12, 2));
+        app.apply(Action::ChatDrag(12, 3));
+        app.apply(Action::ChatRelease(12, 3));
+        assert!(app.show_last_prompt);
+    }
+
+    #[test]
     fn prompt_preview_click_toggles_expansion() {
         let mut app = test_app();
         app.layout.prompt = Some(crate::app::state::PromptHitbox {
@@ -4000,7 +4225,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_blocked_while_busy_keeps_input_and_shows_notice() {
+    fn submit_while_main_agent_busy_keeps_input_and_shows_prompt_choices() {
         let mut app = test_app();
         app.input.set_text("hello");
         // Simulate an in-flight stream for the active session → busy.
@@ -4014,8 +4239,8 @@ mod tests {
         let out = app.submit();
         assert!(out.is_none(), "must not start a new stream while busy");
         assert!(
-            matches!(app.overlay, Overlay::Notice { .. }),
-            "a busy notice should show"
+            matches!(app.overlay, Overlay::PromptDuringRun(_)),
+            "queue/interrupt/wait choices should show"
         );
         assert_eq!(
             app.input.take(),
@@ -4288,6 +4513,68 @@ mod tests {
     }
 
     #[test]
+    fn shell_output_updates_running_subtask_tool_in_place() {
+        use crate::app::state::{
+            SubtaskEvent, SubtaskLogEntry, SubtaskProgress, SubtaskStatus, SubtaskToolStatus,
+        };
+
+        let mut app = test_app();
+        let sid = app.sessions.active_id();
+        let call = tool_call("shell", serde_json::json!({"command": "cargo test"}));
+        app.subtasks.push(Subtask {
+            id: 8,
+            session_id: sid,
+            parent_id: None,
+            call: tool_call(
+                "workflow",
+                serde_json::json!({"action": "agent", "description": "test", "prompt": "run"}),
+            ),
+            description: "test".into(),
+            todo_index: None,
+            prompt: "run".into(),
+            cwd: PathBuf::from("."),
+            status: SubtaskStatus::Running,
+            activity: None,
+            log: Vec::new(),
+            transcript: Vec::new(),
+            output: None,
+            message_index: usize::MAX,
+            started_at: std::time::Instant::now(),
+            duration_ms: None,
+            abort: None,
+            agent: None,
+        });
+        app.handle_subtask_event(SubtaskEvent::Progress {
+            id: 8,
+            progress: SubtaskProgress::ToolStarted {
+                name: "shell".into(),
+                summary: "cargo test".into(),
+                call,
+            },
+        });
+        app.handle_subtask_event(SubtaskEvent::Progress {
+            id: 8,
+            progress: SubtaskProgress::ToolOutput {
+                name: "shell".into(),
+                summary: "cargo test".into(),
+                chunk: "running 10 tests\n".into(),
+            },
+        });
+        assert!(matches!(
+            app.subtasks[0].log.as_slice(),
+            [SubtaskLogEntry::Tool {
+                status: SubtaskToolStatus::Running,
+                output: Some(output),
+                ..
+            }] if output == "running 10 tests\n"
+        ));
+        assert_eq!(
+            app.subtasks[0].activity.as_deref(),
+            Some("Running cargo test · live output")
+        );
+    }
+
+    #[test]
     fn clicking_subtask_row_opens_live_detail_overlay() {
         use crate::app::state::{Subtask, SubtaskHitbox, SubtaskStatus};
         use ratatui::layout::Rect;
@@ -4543,7 +4830,17 @@ mod tests {
                 .all(|m| m.role != "user"),
             "no continuation prompt injected while a child still runs"
         );
-        assert!(app.status.is_some());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Waiting for 1 parallel child agent(s) to complete")
+        );
+        let child = &app.subtasks[0];
+        assert_eq!(child.status, SubtaskStatus::Running);
+        assert!(
+            child.activity.is_none(),
+            "waiting must not interrupt child work"
+        );
+        assert!(child.log.is_empty(), "waiting must not fake a child phase");
     }
 
     #[tokio::test]
@@ -4593,8 +4890,7 @@ mod tests {
         let messages = &app.sessions.active().messages;
         let injected = messages
             .iter()
-            .filter(|m| m.role == "user")
-            .last()
+            .rfind(|m| m.role == "user")
             .expect("continuation prompt injected");
         let text = match &injected.content {
             crate::api::models::MessageContent::Text(text) => text.clone(),
@@ -4602,7 +4898,8 @@ mod tests {
         };
         assert!(text.contains("agent (completed)"));
         assert!(text.contains("found the bug in parser.rs"));
-        assert!(text.contains("Synthesize your final response now"));
+        assert!(text.contains("These reports answer the earlier delegation request"));
+        assert!(text.contains("address every intervening user prompt"));
     }
 
     #[test]
@@ -4782,6 +5079,69 @@ mod tests {
 
         app.apply(Action::ChatClick(2, 0));
         assert!(!app.show_last_prompt);
+    }
+
+    #[test]
+    fn failed_child_event_is_stored_as_unresolved_without_raw_provider_dump() {
+        use crate::app::state::{SubtaskEvent, SubtaskStatus, TaskBarrier};
+
+        let mut app = test_app();
+        let sid = app.sessions.active_id();
+        app.subtasks.push(Subtask {
+            id: 22,
+            session_id: sid,
+            parent_id: None,
+            call: tool_call(
+                "workflow",
+                serde_json::json!({"action": "agent", "description": "review", "prompt": "check"}),
+            ),
+            description: "review".into(),
+            todo_index: None,
+            prompt: "check".into(),
+            cwd: PathBuf::from("."),
+            status: SubtaskStatus::Running,
+            activity: None,
+            log: Vec::new(),
+            transcript: Vec::new(),
+            output: None,
+            message_index: usize::MAX,
+            started_at: std::time::Instant::now(),
+            duration_ms: None,
+            abort: None,
+            agent: None,
+        });
+        app.task_barrier = Some(TaskBarrier {
+            session_id: sid,
+            task_ids: vec![22],
+        });
+
+        let raw = r#"API error 400 Bad Request: {"error":{"message":"No tool output found for function call call_private.","type":"invalid_request_error"}}"#;
+        let _ = app.handle_subtask_event(SubtaskEvent::Finished {
+            id: 22,
+            output: Err(raw.into()),
+            duration_ms: 15,
+        });
+
+        let task = &app.subtasks[0];
+        assert_eq!(task.status, SubtaskStatus::Unresolved);
+        let report = task.output.as_deref().unwrap();
+        assert!(report.contains("required tool result was missing"));
+        assert!(!report.contains("call_private"));
+        assert!(!report.contains("invalid_request_error"));
+        let transcript = app
+            .sessions
+            .active()
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .map(|message| match &message.content {
+                crate::api::models::MessageContent::Text(text) => text.as_str(),
+                _ => "",
+            })
+            .find(|text| text.contains("[agent-id:22]"))
+            .expect("child transcript message");
+        assert!(transcript.contains("\"status\":\"unresolved\""));
+        assert!(!transcript.contains("call_private"));
     }
 
     #[tokio::test]
@@ -5019,6 +5379,293 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[tokio::test]
+    async fn independent_heterogeneous_tools_run_in_parallel_and_keep_result_order() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir().join(format!(
+            "aitui_parallel_tools_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("input.txt"), "input").unwrap();
+        let sid = app.sessions.active_id();
+        app.agent_session = Some(sid);
+        app.sessions.active_mut().cwd = Some(dir.clone());
+        for kind in [
+            crate::agent::ToolKind::Read,
+            crate::agent::ToolKind::List,
+            crate::agent::ToolKind::Write,
+        ] {
+            app.permissions.remember_allow(kind);
+        }
+        app.pending_tools.extend([
+            tool_call("read", serde_json::json!({"path": "input.txt"})),
+            tool_call("list", serde_json::json!({"path": "docs"})),
+            tool_call(
+                "write",
+                serde_json::json!({"path": "output.txt", "content": "written"}),
+            ),
+        ]);
+
+        let _ = app.process_next_tool();
+        assert!(app.agent_tool_rx.is_none());
+        let results = app
+            .agent_tool_batch_rx
+            .as_mut()
+            .expect("heterogeneous batch receiver")
+            .recv()
+            .await
+            .expect("heterogeneous batch results");
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.call.kind().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                crate::agent::ToolKind::Read,
+                crate::agent::ToolKind::List,
+                crate::agent::ToolKind::Write,
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("output.txt")).unwrap(),
+            "written"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn conflicting_tools_execute_in_sequential_waves_after_approval() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir().join(format!(
+            "aitui_conflicting_tools_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shared.txt"), "before").unwrap();
+        let sid = app.sessions.active_id();
+        app.agent_session = Some(sid);
+        app.sessions.active_mut().cwd = Some(dir.clone());
+        app.permissions.remember_allow(crate::agent::ToolKind::Read);
+        app.permissions
+            .remember_allow(crate::agent::ToolKind::Write);
+        app.pending_tools.extend([
+            tool_call("read", serde_json::json!({"path": "shared.txt"})),
+            tool_call(
+                "write",
+                serde_json::json!({"path": "shared.txt", "content": "after"}),
+            ),
+        ]);
+
+        let _ = app.process_next_tool();
+        assert!(app.agent_tool_batch_rx.is_none());
+        assert_eq!(app.approved.len(), 1, "conflicting write waits for read");
+        let read = app
+            .agent_tool_rx
+            .as_mut()
+            .expect("read receiver")
+            .recv()
+            .await
+            .expect("read result");
+        assert!(read.output.as_ref().unwrap().contains("before"));
+        let _ = app.apply(Action::AgentToolResult(read));
+        assert!(
+            app.agent_tool_rx.is_some(),
+            "write starts only after read result"
+        );
+        let write = app.agent_tool_rx.as_mut().unwrap().recv().await.unwrap();
+        let _ = app.apply(Action::AgentToolResult(write));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("shared.txt")).unwrap(),
+            "after"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn batch_permission_allow_runs_independent_heterogeneous_calls_together() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir().join(format!(
+            "aitui_parallel_permission_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("input.txt"), "input").unwrap();
+        app.agent_session = Some(app.sessions.active_id());
+        app.sessions.active_mut().cwd = Some(dir.clone());
+        let calls = vec![
+            tool_call("read", serde_json::json!({"path": "input.txt"})),
+            tool_call("list", serde_json::json!({"path": "docs"})),
+            tool_call(
+                "write",
+                serde_json::json!({"path": "output.txt", "content": "approved"}),
+            ),
+        ];
+        app.overlay = Overlay::Permission(crate::app::overlay::PermissionRequest::new(
+            calls,
+            dir.clone(),
+        ));
+
+        let _ = app.resolve_permission(crate::agent::Permission::Allow, None);
+
+        assert!(app.agent_tool_rx.is_none());
+        assert!(app.agent_tool_batch_rx.is_some());
+        let results = app
+            .agent_tool_batch_rx
+            .as_mut()
+            .unwrap()
+            .recv()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("output.txt")).unwrap(),
+            "approved"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_permission_executes_only_accepted_operations() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir().join(format!(
+            "aitui_mixed_batch_permission_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.agent_session = Some(app.sessions.active_id());
+        app.sessions.active_mut().cwd = Some(dir.clone());
+        app.overlay = Overlay::Permission(crate::app::overlay::PermissionRequest::new(
+            vec![tool_call(
+                "file_management",
+                serde_json::json!({
+                    "action": "write",
+                    "batch": [
+                        {"path": "accepted.txt", "content": "yes"},
+                        {"path": "denied.txt", "content": "no"}
+                    ]
+                }),
+            )],
+            dir.clone(),
+        ));
+
+        let _ = app.resolve_permission_operation(PermissionDecision::Allow);
+        assert!(matches!(app.overlay, Overlay::Permission(_)));
+        let _ = app.resolve_permission_operation(PermissionDecision::Deny);
+
+        let result = app
+            .agent_tool_rx
+            .as_mut()
+            .expect("mixed batch starts as one tool call")
+            .recv()
+            .await
+            .expect("tool result");
+        let output = result.output.expect("mixed batch succeeds");
+        assert!(output.contains("accepted.txt"));
+        assert!(output.contains("denied\nDenied by user"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("accepted.txt")).unwrap(),
+            "yes"
+        );
+        assert!(!dir.join("denied.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn uppercase_allow_executes_all_operations_after_lowercase_current_choice() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir().join(format!(
+            "aitui_allow_all_permission_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.agent_session = Some(app.sessions.active_id());
+        app.sessions.active_mut().cwd = Some(dir.clone());
+        app.overlay = Overlay::Permission(crate::app::overlay::PermissionRequest::new(
+            vec![tool_call(
+                "file_management",
+                serde_json::json!({
+                    "action": "write",
+                    "batch": [
+                        {"path": "first.txt", "content": "one"},
+                        {"path": "second.txt", "content": "two"}
+                    ]
+                }),
+            )],
+            dir.clone(),
+        ));
+
+        let _ = app.apply(Action::AgentQuickAllow);
+        let Overlay::Permission(request) = &app.overlay else {
+            panic!("lowercase a must leave remaining operations for review");
+        };
+        assert_eq!(
+            request.operation_decisions,
+            vec![Some(PermissionDecision::Allow), None]
+        );
+
+        let _ = app.apply(Action::AgentQuickAllowAll);
+        assert!(!matches!(app.overlay, Overlay::Permission(_)));
+        let result = app
+            .agent_tool_rx
+            .as_mut()
+            .expect("allow-all starts the approved batch")
+            .recv()
+            .await
+            .expect("tool result");
+        assert!(result
+            .output
+            .expect("batch succeeds")
+            .contains("second.txt"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("first.txt")).unwrap(),
+            "one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("second.txt")).unwrap(),
+            "two"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn permission_batch_stops_before_workflow_controls() {
+        let mut app = test_app();
+        app.pending_tools.extend([
+            tool_call(
+                "write",
+                serde_json::json!({"path": "x.txt", "content": "x"}),
+            ),
+            tool_call(
+                "workflow",
+                serde_json::json!({
+                    "action": "agent",
+                    "description": "inspect",
+                    "prompt": "inspect only",
+                    "items": []
+                }),
+            ),
+        ]);
+
+        let _ = app.process_next_tool();
+
+        let Overlay::Permission(request) = &app.overlay else {
+            panic!("write should open permission prompt");
+        };
+        assert_eq!(request.calls.len(), 1);
+        assert_eq!(request.calls[0].kind(), Some(crate::agent::ToolKind::Write));
+        assert_eq!(app.pending_tools.len(), 1);
+        assert_eq!(
+            app.pending_tools[0].kind(),
+            Some(crate::agent::ToolKind::Task)
+        );
+    }
+
     #[test]
     fn non_read_tool_raises_permission_popup() {
         // A write is not auto-approved → process_next_tool must raise a Permission
@@ -5119,7 +5766,10 @@ mod tests {
         if let Some(a) = follow {
             app.apply(a);
         }
-        assert!(app.status.as_deref().unwrap().contains("Not found"));
+        assert!(app.status.is_none());
+        assert!(crate::app::toast::drain_messages()
+            .iter()
+            .any(|(_, message)| message.contains("Attachment not found")));
     }
 
     // ── Agent ──────────────────────────────────────────────────────────────────
@@ -5323,6 +5973,17 @@ mod tests {
         assert!(app.show_help);
         app.apply(Action::ToggleHelp);
         assert!(!app.show_help);
+    }
+
+    #[test]
+    fn agent_cancel_finalizes_generation_without_quitting() {
+        let mut app = test_app();
+        app.sessions.active_mut().begin_assistant_stream();
+        push_active_stream(&mut app);
+        app.apply(Action::AgentCancel);
+        assert!(app.streams.is_empty());
+        assert!(!app.sessions.active().is_streaming());
+        assert!(!app.should_quit);
     }
 
     #[test]
@@ -5543,7 +6204,20 @@ mod tests {
             "/must/not/exist/xyz",
         )));
         assert!(app.attachment.is_none());
-        assert!(app.status.as_deref().unwrap().contains("Not found"));
+        assert!(app.status.is_none());
+        assert!(crate::app::toast::drain_messages()
+            .iter()
+            .any(|(_, message)| message.contains("Attachment not found")));
+    }
+
+    #[test]
+    fn clearing_managed_clipboard_attachment_removes_temp_file() {
+        let path = crate::app::clipboard::save_test_image();
+        let mut app = test_app();
+        app.attachment = Some(path.clone());
+        app.apply(Action::ClearAttachment);
+        assert!(app.attachment.is_none());
+        assert!(!path.exists());
     }
 
     #[test]
@@ -5708,7 +6382,7 @@ mod tests {
         let sid = app.sessions.active_id();
         push_active_stream(&mut app);
 
-        let call_json = r#"{"args":{"action":"agent","agent":"reviewer","description":"review diff","prompt":"Review the pending diff for correctness"},"id":"call_9","name":"workflow"}"#;
+        let call_json = r#"{"args":{"action":"agent","agent":"reviewer","description":"review diff","prompt":"Review the pending diff for correctness","urgency":"time_sensitive"},"id":"call_9","name":"workflow"}"#;
         app.apply(Action::StreamToken(
             sid,
             format!("<thinking>\n<tool>\n{}\n</tool>\n</thinking>", call_json),
@@ -5718,6 +6392,10 @@ mod tests {
         assert_eq!(app.subtasks.len(), 1);
         assert_eq!(app.subtasks[0].agent.as_deref(), Some("reviewer"));
         assert_eq!(app.subtasks[0].description, "review diff");
+        assert_eq!(
+            app.subtasks[0].call.args["urgency"].as_str(),
+            Some("time_sensitive")
+        );
 
         // Unknown names still spawn; they fall back to the inline role prompt.
         let mut app = test_app();
@@ -5765,7 +6443,8 @@ mod tests {
 
     #[test]
     fn non_agent_stream_is_not_cut() {
-        let mut app = test_app(); // agent mode off
+        let mut app = test_app();
+        app.sessions.active_mut().agent_mode = false;
         app.sessions.active_mut().begin_assistant_stream();
         let sid = app.sessions.active_id();
         push_active_stream(&mut app);

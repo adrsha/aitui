@@ -145,6 +145,10 @@ pub struct JudgeBatch {
 pub enum SubtaskStatus {
     Running,
     Completed,
+    /// The child returned no trustworthy review, but did return a bounded,
+    /// user-facing reason instead of leaking a provider or transport error.
+    Unresolved,
+    /// Explicit cancellation or an internal worker failure.
     Failed,
 }
 
@@ -191,6 +195,11 @@ pub enum SubtaskProgress {
         name: String,
         summary: String,
         call: ToolCall,
+    },
+    ToolOutput {
+        name: String,
+        summary: String,
+        chunk: String,
     },
     ToolFinished {
         name: String,
@@ -250,6 +259,16 @@ pub struct Subtask {
 
 #[derive(Debug)]
 pub enum SubtaskEvent {
+    /// A child reached a call outside its current read-only/named-agent policy.
+    /// The app routes it through the ordinary access prompt and answers the
+    /// waiter without bypassing the user's session permission rules.
+    AccessRequested {
+        id: u64,
+        request_id: u64,
+        call: ToolCall,
+        cwd: PathBuf,
+        response: tokio::sync::oneshot::Sender<Result<ToolCall, String>>,
+    },
     /// A nested child agent registered itself after being spawned inside another
     /// child agent; the app creates its tree node on receipt.
     Registered {
@@ -282,6 +301,21 @@ pub enum SubtaskEvent {
 pub struct TaskBarrier {
     pub session_id: usize,
     pub task_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuedPrompt {
+    pub text: String,
+    pub attachment: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct ChildAccessRequest {
+    pub request_id: u64,
+    pub task_id: u64,
+    pub call: ToolCall,
+    pub cwd: PathBuf,
+    pub response: tokio::sync::oneshot::Sender<Result<ToolCall, String>>,
 }
 
 /// A model stream tagged with the session it belongs to, so several sessions can
@@ -360,6 +394,9 @@ pub struct App {
 
     pub attachment: Option<PathBuf>,
     pub status: Option<String>,
+    /// Timed, bounded warnings/errors rendered as an overlay without consuming
+    /// transcript or input layout rows.
+    pub toasts: VecDeque<crate::app::toast::Toast>,
     /// Whether the terminal reports AiTUI as focused; desktop notifications are
     /// suppressed while true so permission prompts do not double-notify onscreen.
     pub focused: bool,
@@ -440,6 +477,8 @@ pub struct App {
     /// Sessions whose finished stream has tool calls to run, waiting for the
     /// current agent round to free up (parallel sessions share one tool loop).
     pub agent_queue: std::collections::VecDeque<usize>,
+    /// User prompts explicitly queued while a main-agent turn was running.
+    pub queued_prompts: std::collections::HashMap<usize, VecDeque<QueuedPrompt>>,
 
     /// Concurrent model streams, each tagged with the session it writes to, so a
     /// background session keeps generating while you work in another (parallel).
@@ -463,6 +502,9 @@ pub struct App {
     pub task_barrier: Option<TaskBarrier>,
     pub subtask_tx: mpsc::Sender<SubtaskEvent>,
     pub subtask_rx: mpsc::Receiver<SubtaskEvent>,
+    /// Restricted child calls waiting for the shared permission UI. Only one is
+    /// displayed at a time; the rest remain blocked in launch order.
+    pub child_access_queue: VecDeque<ChildAccessRequest>,
     /// The tool currently executing, for the transcript header animation.
     pub active_tool: Option<(String, std::time::Instant)>,
     /// The tool call the model is currently assembling natively, shown inline
@@ -535,9 +577,13 @@ pub struct App {
 /// Active mouse selection in the transcript (drag-to-select).
 #[derive(Debug, Clone, Copy)]
 pub struct MouseSelection {
+    pub anchor_col: u16,
     pub anchor_row: u16,
     pub drag_row: u16,
     pub active: bool,
+    /// True after any drag event in this press/release gesture. This suppresses
+    /// click activation even when the pointer leaves the transcript.
+    pub dragged: bool,
 }
 
 /// Runaway loop guard. Effectively unlimited: the assistant is free to take as
@@ -641,6 +687,7 @@ impl App {
             } else {
                 "Loading models…".into()
             }),
+            toasts: VecDeque::new(),
             focused: true,
             notification_tx,
             notification_rx,
@@ -678,6 +725,7 @@ impl App {
             streams: Vec::new(),
             agent_session: None,
             agent_queue: std::collections::VecDeque::new(),
+            queued_prompts: std::collections::HashMap::new(),
             agent_tool_rx: None,
             agent_abort: None,
             agent_tool_batch_rx: None,
@@ -688,6 +736,7 @@ impl App {
             task_barrier: None,
             subtask_tx,
             subtask_rx,
+            child_access_queue: VecDeque::new(),
             active_tool: None,
             preparing_tool: None,
             models_rx: Some(models_rx),
@@ -717,8 +766,6 @@ impl App {
             api: Some(api),
         };
 
-        // Agent mode is always on. All sessions use tools.
-        app.sessions.set_agent_mode_all(true);
         sync_auto_approvals(&mut app.permissions, app.config.ui.auto_approve_reads);
 
         // Show the launch screen when there is any non-empty session to resume,
@@ -857,26 +904,49 @@ impl App {
     /// agent tool round, or waiting on a permission prompt. Blocks a second send
     /// *in that session* — but other sessions can stream in parallel, and the input
     /// box stays editable so a follow-up can be composed ahead of time.
-    pub fn is_busy(&self) -> bool {
+    pub fn child_agents_only_busy(&self) -> bool {
         let active = self.sessions.active_id();
-        self.sessions.active().is_streaming()
-            || self.streams.iter().any(|s| s.session_id == active)
+        let children_running = self.task_barrier.as_ref().is_some_and(|barrier| {
+            barrier.session_id == active
+                && barrier.task_ids.iter().any(|id| {
+                    self.subtasks
+                        .iter()
+                        .any(|task| task.id == *id && task.status == SubtaskStatus::Running)
+                })
+        });
+        children_running && !self.main_agent_busy_for(active)
+    }
+
+    pub fn main_agent_busy_for(&self, sid: usize) -> bool {
+        self.sessions
+            .by_id(sid)
+            .is_some_and(|session| session.is_streaming())
+            || self.streams.iter().any(|stream| stream.session_id == sid)
             || self
                 .judging
                 .as_ref()
-                .is_some_and(|j| j.session_id == active)
-            || self
-                .task_barrier
-                .as_ref()
-                .is_some_and(|barrier| barrier.session_id == active)
-            || (self.agent_session == Some(active)
+                .is_some_and(|judge| judge.session_id == sid)
+            || (self.agent_session == Some(sid)
                 && (self.agent_tool_rx.is_some()
+                    || self.agent_tool_batch_rx.is_some()
                     || !self.pending_tools.is_empty()
                     || !self.approved.is_empty()))
             || matches!(
                 self.overlay,
                 Overlay::Permission(_) | Overlay::Decision(_) | Overlay::Plan(_)
             )
+    }
+
+    pub fn session_busy(&self, sid: usize) -> bool {
+        self.main_agent_busy_for(sid)
+            || self
+                .task_barrier
+                .as_ref()
+                .is_some_and(|barrier| barrier.session_id == sid)
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.session_busy(self.sessions.active_id())
     }
 
     /// Invalidate the chat document cache (content or collapse changed).
@@ -886,6 +956,12 @@ impl App {
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status = Some(msg.into());
+    }
+
+    pub fn save_config(&self) {
+        if let Err(error) = self.config.save() {
+            crate::app::toast::error(format!("Failed to save configuration: {}", error));
+        }
     }
 
     pub fn stash_active_permissions(&mut self) {

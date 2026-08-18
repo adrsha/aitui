@@ -1,4 +1,4 @@
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
@@ -49,6 +49,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         .style(panel);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    render_attachment_badge(f, app, area, theme);
 
     let inner_h = inner.height as usize;
     if inner_h == 0 {
@@ -87,7 +88,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
                 ghost.unwrap_or_default(),
                 theme,
             )));
-        } else if vi == cursor_vi {
+        } else if vi == cursor_vi && app.vim != VimMode::Insert {
             rendered.push(Line::from(render_input_line(line_text, cursor_vc, theme)));
         } else {
             rendered.push(Line::from(Span::styled(
@@ -102,10 +103,67 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
 
     f.render_widget(Paragraph::new(rendered).style(panel), inner);
 
+    // Insert mode uses the terminal's real cursor. Keeping cursor placement
+    // separate from text painting ensures the active first line cannot disappear
+    // because of terminal-specific reverse-video/cell styling.
+    if app.vim == VimMode::Insert && cursor_vi >= start_row && cursor_vi < start_row + input_h {
+        let (_, cursor_cell) =
+            crate::app::input_layout::cursor(&visual, app.input.row, app.input.col);
+        let x = inner
+            .x
+            .saturating_add(cursor_cell.min(inner.width.saturating_sub(1) as usize) as u16);
+        let y = inner.y.saturating_add((cursor_vi - start_row) as u16);
+        f.set_cursor_position(Position::new(x, y));
+    }
+
     // ── @mention popup ──────────────────────────────────────────────────
     if app.mention.active && !app.mention.matches.is_empty() {
         render_mention_popup(f, app, inner, theme);
     }
+}
+
+fn render_attachment_badge(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    let Some(path) = app.attachment.as_ref() else {
+        return;
+    };
+    if area.width <= 4 || area.height == 0 {
+        return;
+    }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let label = format!(
+        "📎 {}",
+        truncate_label(name, area.width.saturating_sub(5) as usize)
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .style(theme.surface()),
+        Rect {
+            x: area.x.saturating_add(2),
+            y: area.y,
+            width: area.width.saturating_sub(4),
+            height: 1,
+        },
+    );
+}
+
+fn truncate_label(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".chars().take(max_chars).collect();
+    }
+    let mut shortened: String = value.chars().take(max_chars - 1).collect();
+    shortened.push('…');
+    shortened
 }
 
 fn ghost_suggestion(app: &App) -> Option<&str> {
@@ -253,5 +311,75 @@ fn render_mention_popup(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
                 },
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render, truncate_label};
+    use crate::app::state::App;
+    use crate::config::Config;
+    use crate::input::vim::VimMode;
+    use crate::render::theme::Theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::{Position, Rect};
+    use ratatui::Terminal;
+
+    fn rendered(app: &App) -> (Vec<String>, Position) {
+        use ratatui::backend::Backend;
+
+        let backend = TestBackend::new(40, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, app, Rect::new(0, 0, 40, 3), &Theme::default()))
+            .unwrap();
+        let rows = (0..3)
+            .map(|row| {
+                (0..40)
+                    .map(|x| terminal.backend().buffer().cell((x, row)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+        (rows, cursor)
+    }
+
+    fn rendered_row(app: &App, row: u16) -> String {
+        rendered(app).0[row as usize].clone()
+    }
+
+    #[test]
+    fn one_line_composer_paints_text_and_cursor_without_waiting_for_newline() {
+        let mut app = App::new(Config::default()).unwrap();
+        app.vim = VimMode::Insert;
+        app.input.set_text("hello");
+        app.input.col = 5;
+
+        let (rows, cursor) = rendered(&app);
+        assert!(rows[1].contains("hello"));
+        assert_eq!(cursor, Position::new(7, 1));
+    }
+
+    #[test]
+    fn attachment_badge_does_not_hide_first_composer_line() {
+        let mut app = App::new(Config::default()).unwrap();
+        app.vim = VimMode::Insert;
+        app.input.set_text("visible immediately");
+        app.input.col = app.input.current_line().chars().count();
+        app.attachment = Some("clipboard-image.png".into());
+
+        assert!(rendered_row(&app, 0).contains("clipboard-image.png"));
+        assert!(rendered_row(&app, 1).contains("visible immediately"));
+    }
+
+    #[test]
+    fn attachment_label_is_bounded_without_splitting_unicode() {
+        assert_eq!(truncate_label("image.png", 20), "image.png");
+        assert_eq!(
+            truncate_label("clipboard-📷-capture.png", 12),
+            "clipboard-📷…"
+        );
+        assert_eq!(truncate_label("image.png", 1), "…");
+        assert_eq!(truncate_label("image.png", 0), "");
     }
 }

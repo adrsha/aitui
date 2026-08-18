@@ -4,14 +4,14 @@
 //! `notify-send`, but failure or unsupported actions remain a silent no-op and
 //! never block the TUI.
 
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc::Sender, Mutex, OnceLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopAction {
     Review,
-    AllowOnce,
+    AllowAll,
     DenyOnce,
     AcceptPlan,
     RejectPlan,
@@ -21,7 +21,7 @@ impl DesktopAction {
     fn id(self) -> &'static str {
         match self {
             Self::Review => "review",
-            Self::AllowOnce => "allow_once",
+            Self::AllowAll => "allow_all",
             Self::DenyOnce => "deny_once",
             Self::AcceptPlan => "accept_plan",
             Self::RejectPlan => "reject_plan",
@@ -31,7 +31,7 @@ impl DesktopAction {
     fn label(self) -> &'static str {
         match self {
             Self::Review => "Review in AiTUI",
-            Self::AllowOnce => "Allow once",
+            Self::AllowAll => "Allow all",
             Self::DenyOnce => "Deny once",
             Self::AcceptPlan => "Accept",
             Self::RejectPlan => "Reject",
@@ -41,7 +41,8 @@ impl DesktopAction {
     fn parse(id: &str) -> Option<Self> {
         match id.trim() {
             "review" | "default" => Some(Self::Review),
-            "allow_once" => Some(Self::AllowOnce),
+            // Accept the old ID for notifications delivered before an upgrade.
+            "allow_all" | "allow_once" => Some(Self::AllowAll),
             "deny_once" => Some(Self::DenyOnce),
             "accept_plan" => Some(Self::AcceptPlan),
             "reject_plan" => Some(Self::RejectPlan),
@@ -115,6 +116,32 @@ fn clear_notification(generation: u64, id: u32) {
     }
 }
 
+fn finish_notification(mut child: Child, stderr: Option<std::thread::JoinHandle<String>>) {
+    let status = child.wait();
+    let stderr = stderr
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    match status {
+        Ok(status) if !status.success() || !stderr.trim().is_empty() => {
+            report_notification_failure(&stderr)
+        }
+        Err(error) => {
+            crate::app::toast::warning(format!("Desktop notification process failed: {}", error))
+        }
+        Ok(_) => {}
+    }
+}
+
+fn report_notification_failure(stderr: &str) {
+    let detail = stderr.trim();
+    let detail = if detail.is_empty() {
+        "notification helper exited unsuccessfully"
+    } else {
+        detail
+    };
+    crate::app::toast::warning(format!("Desktop notification failed: {}", detail));
+}
+
 pub fn desktop(
     title: impl Into<String>,
     body: impl Into<String>,
@@ -148,36 +175,46 @@ pub fn desktop(
             .arg("--expire-time=30000")
             .arg("--print-id")
             .arg("--wait")
-            .stdout(Stdio::piped());
+            .stdout(Stdio::piped())
+            // Never let a background helper inherit the alternate screen. Some
+            // notify-send implementations print "Wait timeout expired" here.
+            .stderr(Stdio::piped());
         for action in actions {
             command.arg(format!("--action={}={}", action.id(), action.label()));
         }
-        let Ok(mut child) = command.arg(title).arg(body).spawn() else {
-            return;
-        };
-        let Some(stdout) = child.stdout.take() else {
-            let _ = child.wait();
-            return;
-        };
-        let mut lines = BufReader::new(stdout).lines();
-        let Some(Ok(id_line)) = lines.next() else {
-            let _ = child.wait();
-            return;
-        };
-        let Ok(id) = id_line.trim().parse::<u32>() else {
-            let _ = child.wait();
-            return;
-        };
-        register_notification(generation, id);
-
-        for line in lines.map_while(Result::ok) {
-            if let Some(action) = DesktopAction::parse(&line) {
-                let _ = sender.send(DesktopResponse { generation, action });
-                break;
+        let mut child = match command.arg(title).arg(body).spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                crate::app::toast::warning(format!(
+                    "Desktop notification could not start: {}",
+                    error
+                ));
+                return;
             }
+        };
+        let stderr = child.stderr.take().map(|mut stderr| {
+            std::thread::spawn(move || {
+                let mut output = String::new();
+                let _ = stderr.read_to_string(&mut output);
+                output
+            })
+        });
+        let id = child.stdout.take().and_then(|stdout| {
+            let mut lines = BufReader::new(stdout).lines();
+            let id = lines.next()?.ok()?.trim().parse::<u32>().ok()?;
+            register_notification(generation, id);
+            for line in lines.map_while(Result::ok) {
+                if let Some(action) = DesktopAction::parse(&line) {
+                    let _ = sender.send(DesktopResponse { generation, action });
+                    break;
+                }
+            }
+            Some(id)
+        });
+        finish_notification(child, stderr);
+        if let Some(id) = id {
+            clear_notification(generation, id);
         }
-        let _ = child.wait();
-        clear_notification(generation, id);
     });
 }
 
@@ -195,16 +232,33 @@ pub fn dismiss() {
 
 #[cfg(test)]
 mod tests {
-    use super::DesktopAction;
+    use super::{report_notification_failure, DesktopAction};
 
     #[test]
     fn notification_action_ids_are_stable_and_unknown_values_are_ignored() {
         assert_eq!(
-            DesktopAction::parse("allow_once\n"),
-            Some(DesktopAction::AllowOnce)
+            DesktopAction::parse("allow_all\n"),
+            Some(DesktopAction::AllowAll)
         );
+        assert_eq!(
+            DesktopAction::parse("allow_once\n"),
+            Some(DesktopAction::AllowAll)
+        );
+        assert_eq!(DesktopAction::AllowAll.id(), "allow_all");
+        assert_eq!(DesktopAction::AllowAll.label(), "Allow all");
         assert_eq!(DesktopAction::parse("default"), Some(DesktopAction::Review));
         assert_eq!(DesktopAction::parse("closed"), None);
         assert_eq!(DesktopAction::parse("42"), None);
+    }
+
+    #[test]
+    fn notification_stderr_is_queued_as_a_toast() {
+        report_notification_failure("Wait timeout expired\n");
+        assert!(crate::app::toast::drain_messages()
+            .iter()
+            .any(|(level, message)| {
+                *level == crate::app::toast::ToastLevel::Warning
+                    && message == "Desktop notification failed: Wait timeout expired"
+            }));
     }
 }

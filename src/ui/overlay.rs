@@ -22,6 +22,7 @@ pub fn height(overlay: &Overlay, width: u16, available: u16) -> Option<u16> {
         Overlay::Settings(_) => 14,
         Overlay::Permission(request) => permission_height(request, width),
         Overlay::Decision(_) => 20,
+        Overlay::PromptDuringRun(_) => 14,
         Overlay::Plan(_) | Overlay::ToolRequest(_) => 12,
         Overlay::ApiSetup(_) => 11,
         Overlay::SubtaskDetail { .. } => available.min(24),
@@ -49,14 +50,21 @@ fn permission_height(request: &crate::app::overlay::PermissionRequest, width: u1
         std::path::Path::new("."),
         inner_width as usize,
         request.horizontal_scroll,
+        Some(request.operation_index),
+        &request.operation_decisions,
     )
     .len()
     .max(3) as u16;
     let statement_height = access_statement_height(request, inner_width);
-    let body_overhead = if request.deny.is_some() {
-        statement_height.saturating_add(8)
+    let child_overhead = if request.child_agent_label.is_some() {
+        2
     } else {
-        statement_height.saturating_add(6)
+        0
+    };
+    let body_overhead = if request.deny.is_some() {
+        statement_height.saturating_add(8 + child_overhead)
+    } else {
+        statement_height.saturating_add(6 + child_overhead)
     };
     body_lines.saturating_add(body_overhead)
 }
@@ -91,6 +99,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, theme: &Theme) -> Option<usi
         }
         Overlay::Decision(r) => {
             render_decision(f, r, area, theme);
+            None
+        }
+        Overlay::PromptDuringRun(r) => {
+            render_prompt_during_run(f, r, area, theme);
             None
         }
         Overlay::Plan(r) => {
@@ -138,6 +150,7 @@ fn render_subtask_detail(
     let state = match task.status {
         crate::app::state::SubtaskStatus::Running => "RUNNING",
         crate::app::state::SubtaskStatus::Completed => "COMPLETED",
+        crate::app::state::SubtaskStatus::Unresolved => "UNRESOLVED",
         crate::app::state::SubtaskStatus::Failed => "FAILED",
     };
     let duration = task
@@ -361,43 +374,80 @@ fn render_picker(f: &mut Frame, _app: &App, picker: &Picker, area: Rect, theme: 
     let match_hl = Style::default()
         .fg(theme.warning)
         .add_modifier(Modifier::BOLD);
-    let items: Vec<ListItem> = picker
-        .filtered
+    let row_height = if picker.kind == PickerKind::Session {
+        2
+    } else {
+        1
+    };
+    let capacity = (list_area.height as usize / row_height).max(1);
+    let (start, end) = picker_window(picker.filtered.len(), picker.selected, capacity);
+    let items: Vec<ListItem> = picker.filtered[start..end]
         .iter()
         .enumerate()
-        .map(|(i, &idx)| {
+        .map(|(visible_i, &idx)| {
+            let i = start + visible_i;
             let item = &picker.items[idx];
             let style = if i == picker.selected {
                 theme.selection()
             } else {
                 Style::default().fg(theme.text)
             };
-            let line = match picker.kind {
-                PickerKind::Session => session_picker_line(
+            match picker.kind {
+                PickerKind::Session => ListItem::new(session_picker_lines(
                     item,
-                    style,
+                    list_area.width as usize,
                     i == picker.selected,
                     &picker.query,
                     match_hl,
                     theme,
-                ),
-                PickerKind::Access => {
-                    access_picker_line(item, i == picker.selected, &picker.query, match_hl, theme)
-                }
+                )),
+                PickerKind::Access => ListItem::new(access_picker_line(
+                    item,
+                    i == picker.selected,
+                    &picker.query,
+                    match_hl,
+                    theme,
+                )),
                 _ => {
                     let mut spans = vec![Span::raw(" ")];
                     spans.extend(highlight_query_match(item, &picker.query, style, match_hl));
-                    Line::from(spans)
+                    ListItem::new(Line::from(spans))
                 }
-            };
-            ListItem::new(line)
+            }
         })
         .collect();
     f.render_widget(List::new(items), list_area);
 
+    if picker.kind == PickerKind::Session && picker.filtered.len() > capacity {
+        let indicator = format!(
+            " {}–{} of {}{}{} ",
+            start + 1,
+            end,
+            picker.filtered.len(),
+            if start > 0 { "  ↑ more" } else { "" },
+            if end < picker.filtered.len() {
+                "  ↓ more"
+            } else {
+                ""
+            }
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                indicator,
+                Style::default().fg(theme.muted),
+            ))),
+            Rect::new(
+                list_area.x,
+                list_area.y + list_area.height,
+                list_area.width,
+                1,
+            ),
+        );
+    }
+
     let hint = match picker.kind {
         PickerKind::Session => {
-            " j/k move · ⏎/l open · n new · d delete · r rename · type search · Esc close "
+            " ↑↓/j k move · PgUp/PgDn jump · ⏎ open · n new · d delete · r rename · Esc close "
         }
         PickerKind::Model | PickerKind::Skill => " ↑↓ move · ⏎ select · type search · Esc close ",
         PickerKind::Access => {
@@ -484,38 +534,115 @@ fn access_picker_line(
     Line::from(spans)
 }
 
-fn session_picker_line(
+fn picker_window(total: usize, selected: usize, capacity: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    let capacity = capacity.max(1).min(total);
+    let selected = selected.min(total - 1);
+    let start = selected
+        .saturating_sub(capacity / 2)
+        .min(total.saturating_sub(capacity));
+    (start, start + capacity)
+}
+
+fn session_picker_lines(
     item: &str,
-    base: Style,
+    width: usize,
     selected: bool,
     query: &str,
     match_hl: Style,
     theme: &Theme,
-) -> Line<'static> {
-    if selected || item.starts_with('＋') {
-        let mut spans = vec![Span::raw(" ")];
-        spans.extend(highlight_query_match(item, query, base, match_hl));
-        return Line::from(spans);
+) -> Vec<Line<'static>> {
+    let selected_bg = if selected {
+        theme.selection().bg.unwrap_or(theme.subtle_pill)
+    } else {
+        Color::Reset
+    };
+    let base = Style::default().bg(selected_bg).fg(theme.text);
+    if item.starts_with('＋') {
+        let (title, detail) = item.split_once("  ·  ").unwrap_or((item, ""));
+        let mut first = vec![Span::styled(
+            if selected { " ▸ " } else { "   " },
+            base.fg(if selected { theme.accent } else { theme.muted }),
+        )];
+        first.extend(highlight_query_match(
+            title.trim(),
+            query,
+            base.add_modifier(Modifier::BOLD),
+            match_hl.bg(selected_bg),
+        ));
+        return vec![
+            padded_line(first, width, selected_bg),
+            padded_line(
+                vec![Span::styled(
+                    format!("     {}", detail),
+                    base.fg(theme.muted),
+                )],
+                width,
+                selected_bg,
+            ),
+        ];
     }
-    let mut spans = vec![Span::raw(" ")];
-    for (index, part) in item.split("  ·  ").enumerate() {
-        if index > 0 {
-            spans.push(Span::styled("  ·  ", Style::default().fg(theme.muted)));
-        }
-        let style = if part.starts_with("RUNNING") {
-            Style::default()
-                .fg(theme.warning)
-                .add_modifier(Modifier::BOLD)
-        } else if part.starts_with("cwd ") || part.starts_with("last ") || part.ends_with(" msg") {
-            Style::default().fg(theme.muted)
+
+    let parts: Vec<&str> = item.split("  ·  ").collect();
+    let heading = parts.first().copied().unwrap_or(item);
+    let (marker, name) = heading.split_once("  ").unwrap_or(("○", heading));
+    let state = parts.get(1).copied().unwrap_or("idle");
+    let metadata = parts
+        .iter()
+        .skip(2)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("  ·  ");
+    let state_style = if state.starts_with("RUNNING") {
+        base.fg(theme.warning).add_modifier(Modifier::BOLD)
+    } else {
+        base.fg(theme.muted)
+    };
+    let mut first = vec![Span::styled(
+        if selected { " ▸ " } else { "   " },
+        base.fg(if selected { theme.accent } else { theme.muted }),
+    )];
+    first.push(Span::styled(
+        format!("{} ", marker),
+        base.fg(if marker == "●" {
+            theme.success
         } else {
-            base
-        };
-        if index == 0 {
-            spans.extend(highlight_query_match(part, query, style, match_hl));
-        } else {
-            spans.push(Span::styled(part.to_string(), style));
-        }
+            theme.muted
+        }),
+    ));
+    first.extend(highlight_query_match(
+        name,
+        query,
+        base.add_modifier(Modifier::BOLD),
+        match_hl.bg(selected_bg),
+    ));
+    first.push(Span::styled("   ", base));
+    first.push(Span::styled(state.to_string(), state_style));
+    vec![
+        padded_line(first, width, selected_bg),
+        padded_line(
+            vec![Span::styled(
+                format!("     {}", metadata),
+                base.fg(theme.muted),
+            )],
+            width,
+            selected_bg,
+        ),
+    ]
+}
+
+fn padded_line(mut spans: Vec<Span<'static>>, width: usize, bg: Color) -> Line<'static> {
+    let used = spans
+        .iter()
+        .map(|span| span.content.as_ref().width())
+        .sum::<usize>();
+    if used < width {
+        spans.push(Span::styled(
+            " ".repeat(width - used),
+            Style::default().bg(bg),
+        ));
     }
     Line::from(spans)
 }
@@ -547,12 +674,9 @@ fn render_completion_popup(
     };
     let visible_end = (scroll + max_visible).min(items.len());
 
-    let mut y = inner.y;
-    for i in scroll..visible_end {
-        if y >= inner.y + inner.height {
-            break;
-        }
-        let (icon, label) = items[i];
+    for (offset, &(icon, label)) in items[scroll..visible_end].iter().enumerate() {
+        let i = scroll + offset;
+        let y = inner.y + offset as u16;
         let is_sel = i == selected;
         let style = if is_sel {
             theme.selection()
@@ -586,7 +710,6 @@ fn render_completion_popup(
                 height: 1,
             },
         );
-        y += 1;
     }
 
     render_scrollbar(f, scroll, visible_end, items.len(), inner, theme);
@@ -815,26 +938,34 @@ fn render_permission(
 ) {
     let title = if req.editing_access.is_some() {
         " Edit Access "
+    } else if req.child_agent_label.is_some() {
+        " Subagent Access Request "
     } else {
         " Access Request "
     };
     let inner = panel(f, area, title, theme);
     let footer_h = if req.deny.is_some() { 4 } else { 2 }.min(inner.height);
     let body_bottom = inner.y + inner.height.saturating_sub(footer_h);
+    let statement_y = if let Some(label) = req.child_agent_label.as_deref() {
+        render_child_access_banner(f, label, inner, theme);
+        inner.y.saturating_add(2)
+    } else {
+        inner.y
+    };
     let statement_h =
-        access_statement_height(req, inner.width).min(body_bottom.saturating_sub(inner.y));
+        access_statement_height(req, inner.width).min(body_bottom.saturating_sub(statement_y));
     render_access_statement(
         f,
         req,
         Rect {
             x: inner.x,
-            y: inner.y,
+            y: statement_y,
             width: inner.width,
             height: statement_h,
         },
         theme,
     );
-    let list_y = (inner.y + statement_h.saturating_add(1)).min(body_bottom);
+    let list_y = (statement_y + statement_h.saturating_add(1)).min(body_bottom);
     let list_h = body_bottom.saturating_sub(list_y);
     let all_lines = command_lines(
         &req.calls,
@@ -842,6 +973,8 @@ fn render_permission(
         &req.cwd,
         inner.width as usize,
         req.horizontal_scroll,
+        req.has_multiple_operations().then_some(req.operation_index),
+        &req.operation_decisions,
     );
     let total = all_lines.len();
     let max_start = total.saturating_sub(list_h as usize);
@@ -930,9 +1063,17 @@ fn render_permission(
             height: 1,
         },
     );
+    let operation_hint = if req.has_multiple_operations() {
+        " · [/] or n/N operation · a allow current · A allow all · d deny current"
+    } else {
+        " · a/A allow once · d deny"
+    };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "←/→ field · Enter choose/review · Space choose · a allow once · d deny · e edit commands · PgUp/PgDn calls",
+            format!(
+                "←/→ field · Enter choose/review · Space choose{} · e edit commands · PgUp/PgDn calls",
+                operation_hint
+            ),
             Style::default().fg(theme.accent),
         ))),
         Rect {
@@ -946,7 +1087,7 @@ fn render_permission(
     // can never paint over them.
     let statement_area = Rect {
         x: inner.x,
-        y: inner.y,
+        y: statement_y,
         width: inner.width,
         height: statement_h,
     };
@@ -955,6 +1096,28 @@ fn render_permission(
     } else if req.selecting {
         render_access_selector_popup(f, req, statement_area, theme);
     }
+}
+
+fn render_child_access_banner(f: &mut Frame, label: &str, inner: Rect, theme: &Theme) {
+    if inner.height == 0 {
+        return;
+    }
+    let text = format!("  ◉ Requested by subagent: {}", label);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(Color::Magenta)
+                .bg(theme.subtle_pill)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
+    );
 }
 
 fn access_statement_height(req: &crate::app::overlay::PermissionRequest, width: u16) -> u16 {
@@ -1405,6 +1568,8 @@ fn command_lines(
     cwd: &std::path::Path,
     width: usize,
     horizontal_scroll: usize,
+    selected_operation: Option<usize>,
+    operation_decisions: &[Option<crate::agent::PermissionDecision>],
 ) -> Vec<Line<'static>> {
     let mut concrete = Vec::new();
     for call in calls {
@@ -1420,10 +1585,27 @@ fn command_lines(
         let icon = kind.map(|kind| kind.icon()).unwrap_or("tool");
         let risk = kind.map(|kind| kind.risk().label()).unwrap_or("UNKNOWN");
         let name = kind.map(|kind| kind.name()).unwrap_or(call.name.as_str());
+        let decision = operation_decisions.get(index).copied().flatten();
+        let marker = match decision {
+            Some(crate::agent::PermissionDecision::Allow) => "✓",
+            Some(crate::agent::PermissionDecision::Deny) => "✗",
+            None if selected_operation == Some(index) => "▶",
+            None => "○",
+        };
+        let header_style = match decision {
+            Some(crate::agent::PermissionDecision::Allow) => Style::default()
+                .fg(theme.success)
+                .add_modifier(Modifier::BOLD),
+            Some(crate::agent::PermissionDecision::Deny) => Style::default()
+                .fg(theme.danger)
+                .add_modifier(Modifier::BOLD),
+            None if selected_operation == Some(index) => theme.selection(),
+            None => Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        };
         out.push(Line::from(vec![
             Span::styled(
-                format!("▸ {} {}. {}", icon, index + 1, name),
-                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                format!("{} {} {}. {}", marker, icon, index + 1, name),
+                header_style,
             ),
             Span::styled(format!("   {} risk", risk), theme.subtle()),
         ]));
@@ -2033,6 +2215,57 @@ fn render_decision(f: &mut Frame, req: &DecisionRequest, area: Rect, theme: &The
     );
 }
 
+fn render_prompt_during_run(
+    f: &mut Frame,
+    req: &crate::app::overlay::PromptDuringRun,
+    area: Rect,
+    theme: &Theme,
+) {
+    let inner = panel(f, area, " Assistant is working ", theme);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Send this prompt while the current main-agent turn is still running?",
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for (index, option) in crate::app::overlay::PromptDuringRun::OPTIONS
+        .iter()
+        .enumerate()
+    {
+        let selected = index == req.selected;
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} {}. {}",
+                if selected { "›" } else { " " },
+                index + 1,
+                option
+            ),
+            if selected {
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            },
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑↓ choose · 1/2/3 direct · Enter confirm · Esc wait",
+        Style::default().fg(theme.muted),
+    )));
+    f.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }),
+        inner,
+    );
+}
+
 fn render_decision_options(f: &mut Frame, req: &DecisionRequest, theme: &Theme, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -2352,7 +2585,9 @@ fn panel_padding(area: Rect) -> Padding {
 }
 
 fn overlay_accent(title: &str, theme: &Theme) -> Color {
-    if title.contains("Access") {
+    if title.contains("Subagent Access") {
+        Color::Magenta
+    } else if title.contains("Access") {
         theme.warning
     } else if title.contains("Decision") || title.contains("Question") {
         theme.link
@@ -2379,7 +2614,8 @@ fn overlay_accent(title: &str, theme: &Theme) -> Color {
 mod tests {
     use super::{
         access_statement_height, command_lines, decision_scroll_start, height, horizontal_thumb,
-        panel_padding, permission_code_card, permission_edit_start_line, PermissionCard,
+        panel_padding, permission_code_card, permission_edit_start_line, picker_window,
+        session_picker_lines, PermissionCard,
     };
     use crate::app::overlay::Overlay;
     use crate::render::theme::Theme;
@@ -2398,6 +2634,53 @@ mod tests {
         };
         assert_eq!(height(&notice, 80, 30), Some(11));
         assert_eq!(height(&notice, 80, 6), Some(6));
+    }
+
+    #[test]
+    fn subagent_access_prompt_names_requester_and_has_distinct_height() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut root = crate::app::overlay::PermissionRequest::single(crate::agent::ToolCall {
+            name: "write".into(),
+            args: serde_json::json!({"path": "src/main.rs", "content": "fn main() {}"}),
+            id: None,
+        });
+        let root_height = height(&Overlay::Permission(root.clone()), 80, 30).unwrap();
+        root.child_request_id = Some(42);
+        root.child_agent_label = Some("security-reviewer — audit auth flow".into());
+        let child_overlay = Overlay::Permission(root);
+        assert_eq!(
+            height(&child_overlay, 80, 30).unwrap(),
+            root_height.saturating_add(2)
+        );
+
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+        terminal
+            .draw(|frame| {
+                super::render_permission(
+                    frame,
+                    match &child_overlay {
+                        Overlay::Permission(request) => request,
+                        _ => unreachable!(),
+                    },
+                    frame.area(),
+                    &theme,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..30)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Subagent Access Request"), "{screen}");
+        assert!(
+            screen.contains("Requested by subagent: security-reviewer — audit auth flow"),
+            "{screen}"
+        );
     }
 
     #[test]
@@ -2448,6 +2731,39 @@ mod tests {
         assert!(list_height < 24);
         assert!(edit_height > list_height);
         assert_eq!(height(&edit, 100, 12), Some(12));
+    }
+
+    #[test]
+    fn picker_window_keeps_selection_visible_and_centers_when_possible() {
+        assert_eq!(picker_window(20, 0, 5), (0, 5));
+        assert_eq!(picker_window(20, 10, 5), (8, 13));
+        assert_eq!(picker_window(20, 19, 5), (15, 20));
+        assert_eq!(picker_window(3, 2, 8), (0, 3));
+        assert_eq!(picker_window(0, 0, 5), (0, 0));
+    }
+
+    #[test]
+    fn selected_session_card_has_two_readable_lines_and_clear_cursor() {
+        let theme = Theme::default();
+        let lines = session_picker_lines(
+            "●  Fix picker  ·  RUNNING here  ·  last just now  ·  cwd ~/src  ·  12 msg",
+            80,
+            true,
+            "picker",
+            ratatui::style::Style::default().fg(Color::Yellow),
+            &theme,
+        );
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].to_string().contains("▸ ● Fix picker"));
+        assert!(lines[0].to_string().contains("RUNNING here"));
+        assert!(lines[1].to_string().contains("last just now"));
+        assert!(lines[1].to_string().contains("cwd ~/src"));
+        assert!(lines[1].to_string().contains("12 msg"));
+        let selected_bg = theme.selection().bg.unwrap_or(theme.subtle_pill);
+        assert!(lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .all(|span| span.style.bg == Some(selected_bg)));
     }
 
     #[test]
@@ -2550,7 +2866,7 @@ mod tests {
             id: None,
         };
         let theme = Theme::default();
-        let lines = command_lines(&[call], &theme, Path::new("."), 80, 0);
+        let lines = command_lines(&[call], &theme, Path::new("."), 80, 0, None, &[]);
         assert!(lines.iter().any(|line| line
             .spans
             .iter()
@@ -2611,7 +2927,7 @@ mod tests {
                 id: None,
             },
         ];
-        let lines = command_lines(&calls, &Theme::default(), Path::new("."), 80, 0);
+        let lines = command_lines(&calls, &Theme::default(), Path::new("."), 80, 0, None, &[]);
         let text = lines
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -2640,7 +2956,7 @@ mod tests {
             id: None,
         };
         let theme = Theme::default();
-        let lines = command_lines(&[call], &theme, Path::new("."), 80, 0);
+        let lines = command_lines(&[call], &theme, Path::new("."), 80, 0, None, &[]);
         let text: Vec<_> = lines
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -2665,7 +2981,7 @@ mod tests {
             id: None,
         };
         let theme = Theme::default();
-        let lines = command_lines(&[call], &theme, Path::new("."), 80, 0);
+        let lines = command_lines(&[call], &theme, Path::new("."), 80, 0, None, &[]);
         let text: Vec<_> = lines
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -2686,7 +3002,7 @@ mod tests {
             id: None,
         };
         let theme = Theme::default();
-        let lines = command_lines(&[call], &theme, Path::new("."), 80, 0);
+        let lines = command_lines(&[call], &theme, Path::new("."), 80, 0, None, &[]);
         let text: Vec<_> = lines
             .iter()
             .flat_map(|line| line.spans.iter())

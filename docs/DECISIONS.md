@@ -117,6 +117,30 @@ and improves reliability without letting the producing agent grade itself.
 
 ---
 
+## D-024 — User-selected urgency replaces child orchestration time limits
+**Date:** 2026-07-06 · **Status:** accepted; supersedes D-021 time-bound execution policy
+
+Every `workflow(agent)` delegation carries a user-selected urgency category. The main
+agent asks before delegating: `very_urgent` chooses the shortest trustworthy path,
+`time_sensitive` favors efficient but sufficient verification, and `best_quality` allows
+as much investigation as needed for the strongest supported response. Nested agents may
+inherit their parent's urgency or receive an explicit category.
+
+Urgency is behavioral guidance, not a duration mapping. Child model streams, child tool
+calls, nested-agent joins, verification replicas, and final synthesis have no
+child-orchestration wall-clock deadline, progress lease, or operation timeout. Explicit
+user cancellation and lower-level safety supervision for concrete subprocesses remain in
+force. Round and depth ceilings remain deterministic request/cost guards; at the soft
+round ceiling, the child receives one final no-tools synthesis request.
+
+This policy is intended to make `unresolved` primarily describe unavailable or
+insufficient evidence, provider failures, cancellation, or irreconcilable verification—not
+an arbitrary child wall-clock cutoff. Legacy agent calls without urgency are interpreted
+as `best_quality`, while the current schema and system prompt require asking the user and
+passing the selected category.
+
+---
+
 ## D-021 — Child agents use renewable progress leases with graceful budget finalization
 **Date:** 2026-07-04 · **Status:** accepted; refines D-020
 

@@ -6,11 +6,13 @@ mod app;
 mod config;
 mod domain;
 mod files;
+mod headless;
 mod input;
 mod render;
 mod skills;
 mod tui;
 mod ui;
+pub mod video;
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -18,8 +20,17 @@ use std::time::Duration;
 use app::Action;
 
 fn main() -> anyhow::Result<()> {
+    let invocation = headless::Invocation::parse(std::env::args().skip(1))?;
+    if matches!(invocation, headless::Invocation::Help) {
+        print!("{}", headless::help());
+        return Ok(());
+    }
+
     let rt = tokio::runtime::Runtime::new()?;
     let _guard = rt.enter();
+    if let headless::Invocation::Run(options) = invocation {
+        return rt.block_on(headless::run(options));
+    }
 
     // Restore the terminal on panic *before* the default hook prints, so a crash
     // anywhere in the loop can't leave the user's shell in raw mode.
@@ -30,12 +41,24 @@ fn main() -> anyhow::Result<()> {
     let mut terminal = tui::init()?;
 
     let result = run(&mut terminal, &mut app, &rt);
+    report_runtime_failure(&mut terminal, &mut app, result);
     tui::restore()?;
+    Ok(())
+}
 
-    if let Err(ref e) = result {
-        eprintln!("AiTUI error: {e}");
-    }
-    result
+fn report_runtime_failure(terminal: &mut tui::Tui, app: &mut app::App, result: anyhow::Result<()>) {
+    let Err(error) = result else {
+        return;
+    };
+    queue_runtime_failure(error);
+    crate::app::toast::drain_into(&mut app.toasts, std::time::Instant::now());
+    // Best-effort final frame: if rendering itself is what failed, never fall back
+    // to stdout/stderr and risk corrupting the terminal contents.
+    let _ = terminal.draw(|frame| ui::render(frame, app));
+}
+
+fn queue_runtime_failure(error: anyhow::Error) {
+    crate::app::toast::error(format!("AiTUI runtime error: {}", error));
 }
 
 fn run(
@@ -49,9 +72,12 @@ fn run(
     let mut last_session_sync = std::time::Instant::now();
     app.sessions.publish_presence(&app.running_session_ids());
     loop {
-        // Animations (streaming spinner, "working" indicator) need periodic
-        // redraws even without new events; a busy state forces a fast repaint.
-        let animating = !app.streams.is_empty() || app.is_busy();
+        // Animations (streaming spinner, "working" indicator) and timed toast
+        // expiry need periodic redraws even without new terminal events.
+        let toast_changed =
+            crate::app::toast::drain_into(&mut app.toasts, std::time::Instant::now());
+        dirty |= toast_changed;
+        let animating = !app.streams.is_empty() || app.is_busy() || !app.toasts.is_empty();
 
         // ── 1. Render (ui::render owns layout + chat-doc sync) ───────────
         if dirty || animating {
@@ -61,9 +87,12 @@ fn run(
 
         // ── 1b. Pending external program: suspend TUI, run it, restore ───
         if let Some(ext) = app.pending_external.take() {
-            let follow_up = run_external(terminal, ext)?;
-            if let Some(action) = follow_up {
-                dispatch(app, vec![action]);
+            match run_external(terminal, ext) {
+                Ok(Some(action)) => dispatch(app, vec![action]),
+                Ok(None) => {}
+                Err(error) => {
+                    crate::app::toast::error(format!("External program failed: {}", error))
+                }
             }
             app.touch();
             dirty = true;
@@ -96,12 +125,19 @@ fn run(
                     app.models_rx = None;
                     dirty = true;
                 }
-                Ok(Err(_)) => {
+                Ok(Err(error)) => {
+                    crate::app::toast::warning(format!("Failed to load models: {}", error));
                     dispatch(app, vec![Action::ModelsFailed]);
                     app.models_rx = None;
                     dirty = true;
                 }
-                Err(_) => {}
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    crate::app::toast::warning("Model loading task ended without a result");
+                    dispatch(app, vec![Action::ModelsFailed]);
+                    app.models_rx = None;
+                    dirty = true;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
         }
 
@@ -250,6 +286,12 @@ fn run(
             dirty = true;
         }
 
+        // ── 5f. Send prompts explicitly queued behind completed turns ───
+        if let Some(sid) = app.next_ready_queued_prompt() {
+            dispatch(app, vec![Action::SendQueuedPrompt(sid)]);
+            dirty = true;
+        }
+
         // ── 6. Check quit flag ─────────────────────────────────────────
         if app.should_quit {
             break;
@@ -266,7 +308,10 @@ fn display_pending_image(app: &mut app::App) -> bool {
     };
     let area = app.layout.chat;
     if area.width < 8 || area.height < 4 {
-        app.set_status(format!("Image saved: {}", path.display()));
+        crate::app::toast::warning(format!(
+            "Image preview unavailable in this terminal size; saved to {}",
+            path.display()
+        ));
         return true;
     }
     let cols = area.width.saturating_sub(4).min(80);
@@ -278,7 +323,11 @@ fn display_pending_image(app: &mut app::App) -> bool {
         cols,
         rows,
     ) {
-        app.set_status(format!("Image saved: {} · {}", path.display(), error));
+        crate::app::toast::warning(format!(
+            "Image preview failed; saved to {}: {}",
+            path.display(),
+            error
+        ));
         return true;
     }
     false
@@ -429,4 +478,20 @@ fn run_external_inner(ext: app::state::PendingExternal) -> anyhow::Result<Option
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_failures_are_queued_as_error_toasts() {
+        queue_runtime_failure(anyhow::anyhow!("render pipeline failed"));
+        assert!(crate::app::toast::drain_messages()
+            .iter()
+            .any(|(level, message)| {
+                *level == crate::app::toast::ToastLevel::Error
+                    && message == "AiTUI runtime error: render pipeline failed"
+            }));
+    }
 }

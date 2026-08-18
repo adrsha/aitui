@@ -70,7 +70,7 @@ pub struct ChildReport {
     pub uncertainties: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ConsensusFinding {
     pub check_id: String,
     pub answer: FindingAnswer,
@@ -90,6 +90,60 @@ pub struct VerificationSummary {
     pub diagnostics: Vec<String>,
 }
 
+/// Owned, display-oriented form of a final replicated-verification report.
+/// Unlike `VerificationSummary`, this is deserialized from persisted/model text.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct VerificationDisplayReport {
+    pub schema: String,
+    pub status: String,
+    #[serde(default)]
+    pub findings: Vec<ConsensusFinding>,
+    #[serde(default)]
+    pub unresolved: Vec<String>,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationReportMatch {
+    pub start: usize,
+    pub end: usize,
+    pub report: VerificationDisplayReport,
+}
+
+/// Find final verification-summary JSON objects embedded in prose (including
+/// the `agent N (completed):\n{...}` hand-off sent back to the parent agent).
+pub fn verification_reports(text: &str) -> Vec<VerificationReportMatch> {
+    let mut reports = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative) = text[search_from..].find('{') {
+        let start = search_from + relative;
+        let slice = &text[start..];
+        let mut stream =
+            serde_json::Deserializer::from_str(slice).into_iter::<VerificationDisplayReport>();
+        match stream.next() {
+            Some(Ok(report)) if report.schema == "aitui.verification-summary.v1" => {
+                let end = start + stream.byte_offset();
+                reports.push(VerificationReportMatch { start, end, report });
+                search_from = end.max(start + 1);
+            }
+            _ => search_from = start + 1,
+        }
+    }
+    reports
+}
+
+pub fn verification_report(text: &str) -> Option<VerificationDisplayReport> {
+    verification_reports(text)
+        .into_iter()
+        .next()
+        .map(|matched| matched.report)
+}
+
+#[allow(
+    dead_code,
+    reason = "kept as the simple validation API used by tests and external callers"
+)]
 pub fn parse_and_validate(
     text: &str,
     checks: &[CheckSpec],
@@ -502,6 +556,50 @@ mod tests {
             assert_eq!(summary.status, "verified");
             assert_eq!(summary.findings[0].answer, answer);
         }
+    }
+
+    #[test]
+    fn finds_embedded_verification_summaries_and_preserves_boundaries() {
+        let text = concat!(
+            "agent 1 (completed):\n",
+            "{\"schema\":\"aitui.verification-summary.v1\",\"status\":\"verified\",",
+            "\"findings\":[{\"check_id\":\"latency\",\"answer\":\"yes\",",
+            "\"statement\":\"Budgets are generous.\",\"support\":\"2/2 replicas\",",
+            "\"evidence\":[\"src/agent/subtask.rs:1-2\"]}],\"unresolved\":[],",
+            "\"diagnostics\":[]}\n\n---\n\nagent 2 (unresolved):\n",
+            "{\"schema\":\"aitui.verification-summary.v1\",\"status\":\"unresolved\",",
+            "\"findings\":[],\"unresolved\":[\"access\"],\"diagnostics\":[\"invalid report\"]}"
+        );
+        let reports = verification_reports(text);
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].report.status, "verified");
+        assert_eq!(reports[0].report.findings[0].answer, FindingAnswer::Yes);
+        assert_eq!(reports[1].report.status, "unresolved");
+        assert_eq!(reports[1].report.unresolved, vec!["access"]);
+        let extracted: serde_json::Value =
+            serde_json::from_str(&text[reports[0].start..reports[0].end]).unwrap();
+        assert_eq!(
+            extracted,
+            serde_json::json!({
+                "schema": "aitui.verification-summary.v1",
+                "status": "verified",
+                "findings": [{
+                    "check_id": "latency",
+                    "answer": "yes",
+                    "statement": "Budgets are generous.",
+                    "support": "2/2 replicas",
+                    "evidence": ["src/agent/subtask.rs:1-2"]
+                }],
+                "unresolved": [],
+                "diagnostics": []
+            })
+        );
+    }
+
+    #[test]
+    fn ignores_unrelated_json_objects() {
+        assert!(verification_reports("before {\"status\":\"verified\"} after").is_empty());
+        assert!(verification_report("{\"schema\":\"other\",\"status\":\"verified\"}").is_none());
     }
 
     #[test]

@@ -57,6 +57,9 @@ pub enum Action {
     RedoInput,
     YankLine,
     Paste,
+    /// Read the system clipboard directly. Images become pending chat attachments;
+    /// text falls through the normal smart-paste pipeline.
+    PasteClipboard,
     /// A bracketed paste from the terminal. Large → saved to a file and attached;
     /// medium → stored and shown as a compact `[PASTED#N-…]` chip; small → inserted.
     PasteText(String),
@@ -74,6 +77,12 @@ pub enum Action {
 
     // Submission / streaming
     Submit,
+    /// Resolve a submit attempted while the main agent is still working.
+    PromptDuringRunUp,
+    PromptDuringRunDown,
+    PromptDuringRunResolve,
+    /// Send the oldest queued prompt for a session once that session becomes idle.
+    SendQueuedPrompt(usize),
     /// Regenerate the last assistant reply: drop it and resend the last user turn.
     RetryLast,
     /// Pull the last user message back into the composer for editing (removing that
@@ -84,6 +93,10 @@ pub enum Action {
     /// Copy the last fenced code block from the last assistant reply to the clipboard.
     CopyLastCode,
     /// Cancel the active session's in-flight stream.
+    #[allow(
+        dead_code,
+        reason = "retained as the action API for explicit stream cancellation"
+    )]
     CancelStream,
     /// Attach a new stream for the given session id.
     AttachStream(usize, mpsc::Receiver<StreamEvent>),
@@ -123,13 +136,17 @@ pub enum Action {
     SelectSidebarTab(SidebarTab),
     /// Expand / collapse the full output of executed tools.
     ToggleOutput,
-    /// A left-click in the transcript at (column, row) — toggles the individual
-    /// tool output whose collapsible header sits on that row.
+    /// Left mouse press at (column, row) — arms transcript text selection without
+    /// activating any clickable control until the button is released.
+    ChatPress(u16, u16),
+    /// Activate the clickable control at (column, row). Mouse input dispatches this
+    /// only from an undragged release; tests and keyboard-like callers may use it directly.
     ChatClick(u16, u16),
     /// Mouse drag in the transcript — updates the text selection.
     ChatDrag(u16, u16),
-    /// Mouse button release — finalises the text selection and copies to clipboard.
-    ChatRelease,
+    /// Mouse button release at (column, row) — copies an active selection, or
+    /// activates the released control when no drag occurred.
+    ChatRelease(u16, u16),
     /// Dismiss a notice or child-agent detail dialog.
     DismissNotice,
     PrevSubtask,
@@ -239,9 +256,11 @@ pub enum Action {
     AgentReviewPermission,
     /// Apply the currently-highlighted option in the permission menu directly.
     AgentResolvePermission,
-    /// Quick keys: allow / deny this one call without opening the full menu.
-    /// A deny opens the optional-reason box rather than resolving immediately.
+    /// Quick keys: allow the current operation, allow every operation, or deny
+    /// the current operation without opening the full menu. A deny opens the
+    /// optional-reason box rather than resolving immediately for single calls.
     AgentQuickAllow,
+    AgentQuickAllowAll,
     AgentQuickDeny,
     /// Back out of the deny reason box, returning to the permission menu.
     AgentDenyCancel,
@@ -251,6 +270,9 @@ pub enum Action {
     AgentPermScrollDown,
     AgentPermScrollLeft,
     AgentPermScrollRight,
+    /// Move between concrete operations in a multi-operation permission request.
+    AgentPermissionOperationPrev,
+    AgentPermissionOperationNext,
     /// Toggle typing for a custom directory, duration, or request count.
     /// Open or accept the popup selector for the highlighted access-rule phrase.
     AgentPermissionSelector,

@@ -23,20 +23,14 @@ executor → transcript result. The model does not invoke Python, a CLI, or the
 
 The implementation belongs to AiTUI and lives under:
 
-- `src/agent/powerpoint.rs` — Rust integration and embedded-package loader.
-- `src/agent/powerpoint/animated_pptx/` — Python builder, fixed OOXML animation
-  templates, validator, and the private JSON process bridge.
+- `src/agent/powerpoint.rs` — the small Rust module boundary exported to the executor.
+- `src/agent/powerpoint/native.rs` — presentation construction, OOXML animation and
+  transition templates, package inspection, validation, preservation checks, and
+  atomic file replacement.
 
-The Python files are compiled into the AiTUI binary with `include_str!`. At tool
-execution time AiTUI materializes its bundled package in a process-local temporary
-directory and invokes the private bridge itself. It therefore does **not** depend
-on the current project containing an `animated_pptx` module, and users/models do
-not call `python -m animated_pptx.cli` directly.
-
-The host still needs Python 3 with `python-pptx` and `lxml`; these libraries
-provide PowerPoint construction and XML handling. Interpreter discovery checks
-`AITUI_POWERPOINT_PYTHON`, the session CWD's `.venv/bin/python`, the directory
-where AiTUI was launched from, then `python3` and `python`.
+The runtime is entirely Rust-based. It uses the `pptx` crate for the presentation
+and OPC model and `quick-xml` for XML inspection. It does not spawn an interpreter,
+materialize a Python package, inspect `PYTHONPATH`, or require `python-pptx`/`lxml`.
 
 ## Tool schema
 
@@ -59,14 +53,31 @@ Common fields:
 - `input_path` — existing source deck for append/edit; optional for in-place work.
 - `slides` — ordered slide specifications for create/replace/append.
 
+## Default design and motion policy
+
+The generator defaults to a conservative `libreoffice_safe` profile:
+
+- A 0.375-inch compatibility safe area (5% of slide height) is checked on every edge; full-slide background shapes are exempt.
+- Elements extending outside the slide are rejected.
+- Accidental intersections are rejected. A background/card shape may contain later content, and an intentional overlay must explicitly set `allow_overlap: true`.
+- Text boxes are transparent by default, use Liberation Sans, conservative internal padding, explicit wrapping, and a dark default text color.
+- A text-fit estimate rejects boxes that are likely to clip or wrap beyond their height. This is deliberately conservative because PowerPoint and LibreOffice measure text differently.
+- Slides sharing `continuity_group` are checked so same-ID persistent anchors retain position and scale. This borrows the video tool's principle of preserving one visual anchor while a beat changes.
+- `animation_mode` defaults to `single_click`: the first ordered effect waits for one click and the rest of the beat runs automatically. `explicit` is opt-in for pedagogically necessary step-by-step reveals; `none` suppresses timing entirely.
+- Motion is authored by beat rather than by element. Related reveals should complete in roughly 800 ms, use restrained fades/wipes, and end in a stable readable frame.
+
+Deck-wide overrides are available under `design`: `safe_margin`, `overlap_policy` (`error`, `warn`, `allow`), and `continuity_policy` (`error`, `warn`, `off`). The default policies are `error` for overlaps and `warn` for continuity drift.
+
 Each slide may contain:
 
 - `elements`: objects requiring `id`, `type`, `x`, `y`, `width`, and `height`.
   - `type`: `text`, `image`, or `shape`.
   - Optional fields: `text`, `image_path`, `shape_type`, `fill_color`,
-    `text_color`, and `font_size`.
+    `text_color`, `font_size`, and `allow_overlap`.
   - Shape types: `rectangle`, `ellipse`, `rounded_rectangle`.
   - Coordinates and dimensions are inches on a 16:9 slide.
+- `continuity_group`: optional label for related slides whose same-ID anchors should remain fixed.
+- `animation_mode`: `none`, `single_click` (default), or `explicit`.
 - `animations`: objects requiring `type`, `target`, and unique `order`.
   - Types: `fade_in`, `fly_in_left`, `fly_in_right`, `fly_in_bottom`, `wipe`,
     `zoom`, `fade_out`.
@@ -140,11 +151,10 @@ legacy zero-based indices and shape names remain available for compatibility.
 
 ## Advanced OPC/OOXML escape hatch
 
-`package_modifiers` is an ordered, atomic expert interface for controls not yet
-represented by the high-level API. Prefer high-level modifiers whenever possible.
-It is accepted alongside create/replace/append/edit, and an edit may contain only
-`package_modifiers`; package-only edits do not round-trip the deck through
-`python-pptx` before patching.
+`package_modifiers` remains in the public schema as the planned expert escape
+hatch, but the Rust migration currently rejects non-empty package modifier arrays
+rather than silently falling back to Python. Extend `native.rs` with a guarded OPC
+operation before relying on one of these operations in production.
 
 Supported operations:
 
@@ -198,15 +208,14 @@ the feature-specific OOXML semantics.
 
 ## Validation and safety
 
-Generation and editing are atomic: the result is written to a temporary sibling
-and replaces the destination only after validation. Validation reopens the deck
-with `python-pptx`, tests ZIP integrity, rejects duplicate ZIP members, parses
-every `.xml` and `.rels` member with `lxml`, verifies content-type coverage, and
-checks the complete internal relationship graph for malformed, duplicate, or
-dangling relationships. Typed generation additionally verifies slide/shape/text
-counts plus required timing and transition nodes. The executor invalidates AiTUI's
-file cache only after success. The operation is medium-risk because it writes a
-file and uses the destination's normal directory-scoped permission flow.
+Generation and editing are atomic: Rust serializes to memory, reopens the package
+with the `pptx` crate, verifies slide and shape counts for typed generation, writes
+a temporary sibling, syncs it, and only then replaces the destination. Read-only
+inspection never saves or rewrites its source. Preservation-checked open/save also
+compares every loaded part payload and relationship before commit. The executor
+invalidates AiTUI's file cache only after success. The operation is medium-risk
+because it writes a file and uses the destination's normal directory-scoped
+permission flow.
 
 ## Example tool call
 
@@ -278,10 +287,8 @@ file and uses the destination's normal directory-scoped permission flow.
 
 ## Tests
 
-- Rust tests verify schema routing, permission/executor integration, bundled
-  package materialization, and generation of a real deck through the
-  `specialized` call.
-- Python tests under `tests/test_animated_pptx.py` cover empty slides, zero-slide
-  decks, missing targets, the JSON bridge, mixed-animation decks, append,
-  slide/element/animation/transition edit modifiers, native-ID inspection,
-  duplicate-name warnings, and byte-for-byte zero-mutation inspection.
+- Rust tests verify schema routing, permission/executor integration, creation of a
+  real deck, animation/transition preservation, read-only inspection, append,
+  ordered edit dispatch, and atomic preservation-checked open/save.
+- The old Python test package is legacy migration material and is not executed by
+  the PowerPoint tool or required at runtime.
