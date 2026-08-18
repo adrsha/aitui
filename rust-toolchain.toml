@@ -1,0 +1,7 @@
+[toolchain]
+# Track the installed stable toolchain instead of creating a second version-named
+# 1.96.0 toolchain. On rustup installations where stable already owns cargo-fmt,
+# the duplicate toolchain could fail with a rustfmt-preview/bin/cargo-fmt conflict.
+channel = "stable"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
